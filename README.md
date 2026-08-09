@@ -4,6 +4,29 @@ A system performance metrics collection library for Rust. One unified,
 serializable data model; collection fully decoupled from output; collection
 cost tunable down to tray-app levels.
 
+## Install
+
+Requires Rust **1.85+** (edition 2024).
+
+```bash
+# from crates.io (after the crate is published)
+cargo install zstats
+
+# from git
+cargo install --git https://github.com/vicanso/zstats
+
+# from a local checkout
+cargo install --path .
+```
+
+This installs the `zstats` binary to `~/.cargo/bin` (keep that directory on
+your `PATH`). Default features include `cli`; do not pass
+`--no-default-features` unless you only want the library built without the
+binary.
+
+Upgrade later with `cargo install zstats --force` (or re-run the git/path
+form with `--force`).
+
 ## Design
 
 ```

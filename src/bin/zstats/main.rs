@@ -706,7 +706,9 @@ fn main() -> ExitCode {
                 return detach_self();
             }
             let mut extra_sinks: Vec<Arc<dyn MetricSink>> = Vec::new();
-            // Alert settings: CLI flags > config file > builtin defaults
+            // Alert settings: CLI flags > config file > builtin defaults.
+            // The file is loaded fail-fast here and then hot-reloaded by
+            // the sink on mtime change (every 30 collects)
             let file = match settings::load() {
                 Ok(file) => file,
                 Err(e) => {
@@ -714,44 +716,14 @@ fn main() -> ExitCode {
                     return ExitCode::FAILURE;
                 }
             };
-            let saved = file.alerts;
-
-            let cpu_default = match args.alert_cpu {
-                Some(explicit) => explicit,
-                None => match saved.cpu {
-                    Some(p) if p > 0.0 => Some(p),
-                    Some(_) => None,
-                    None => Some(30.0),
-                },
+            let cli_options = alerts::AlertCliOptions {
+                cpu: args.alert_cpu,
+                cpu_overrides: args.alert_cpu_overrides,
+                mem: args.alert_mem_fraction,
+                mem_overrides: args.alert_mem_overrides,
+                cooldown: args.alert_cooldown,
             };
-            let mem_default = match args.alert_mem_fraction {
-                Some(explicit) => explicit,
-                None => match saved.mem {
-                    Some(p) if p > 0.0 => Some(p / 100.0),
-                    Some(_) => None,
-                    None => Some(0.25),
-                },
-            };
-            let cooldown = args
-                .alert_cooldown
-                .unwrap_or_else(|| Duration::from_secs(saved.cooldown_secs.unwrap_or(600)));
-
-            // CLI overrides go first: Thresholds returns the first name match
-            let mut cpu = alerts::Thresholds::new(cpu_default);
-            for (name, value) in args.alert_cpu_overrides {
-                cpu = cpu.with_override(name, value);
-            }
-            for (name, pct) in saved.cpu_overrides {
-                cpu = cpu.with_override(name, (pct > 0.0).then_some(pct));
-            }
-            let mut mem = alerts::Thresholds::new(mem_default);
-            for (name, value) in args.alert_mem_overrides {
-                mem = mem.with_override(name, value);
-            }
-            for (name, pct) in saved.mem_overrides {
-                mem = mem.with_override(name, (pct > 0.0).then_some(pct / 100.0));
-            }
-            let alert_sink = alerts::AlertSink::new(cpu, mem, cooldown);
+            let alert_sink = alerts::AlertSink::from_options(cli_options, &file.alerts);
             if alert_sink.enabled() {
                 extra_sinks.push(Arc::new(alert_sink));
             }

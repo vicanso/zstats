@@ -19,9 +19,11 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use zstats::{MetricSink, SinkError, SystemSnapshot, async_trait};
+
+use crate::settings;
 
 /// Averaging window for both rules
 const WINDOW: Duration = Duration::from_secs(60);
@@ -29,6 +31,9 @@ const WINDOW: Duration = Duration::from_secs(60);
 /// transient spikes (a brief legitimate memory burst, a startup CPU blip)
 /// never alert — only sustained behavior does
 const MIN_SPAN: Duration = Duration::from_secs(50);
+/// Stat the config file's mtime once every this many collects (about a
+/// minute at the default 2s interval) and hot-reload thresholds on change
+const RELOAD_CHECK_EVERY: u32 = 30;
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 enum AlertKind {
@@ -81,6 +86,82 @@ impl<T: Copy> Thresholds<T> {
     }
 }
 
+/// Alert settings the CLI provided at startup, kept so hot reloads can
+/// re-run the "CLI flags > config file > builtin defaults" merge
+pub struct AlertCliOptions {
+    /// Outer None = flag not given; inner None = disabled with 0
+    pub cpu: Option<Option<f32>>,
+    pub cpu_overrides: Vec<(String, Option<f32>)>,
+    pub mem: Option<Option<f64>>,
+    pub mem_overrides: Vec<(String, Option<f64>)>,
+    pub cooldown: Option<Duration>,
+}
+
+/// The currently effective, merged settings
+struct ActiveThresholds {
+    cpu: Thresholds<f32>,
+    memory: Thresholds<f64>,
+    /// Per (process, rule) re-alert cooldown while a condition persists
+    cooldown: Duration,
+}
+
+/// Merge CLI options over the config file over builtin defaults
+fn merge_thresholds(cli: &AlertCliOptions, file: &settings::AlertsConfig) -> ActiveThresholds {
+    let cpu_default = match cli.cpu {
+        Some(explicit) => explicit,
+        None => match file.cpu {
+            Some(p) if p > 0.0 => Some(p),
+            Some(_) => None,
+            None => Some(30.0),
+        },
+    };
+    let mem_default = match cli.mem {
+        Some(explicit) => explicit,
+        None => match file.mem {
+            Some(p) if p > 0.0 => Some(p / 100.0),
+            Some(_) => None,
+            None => Some(0.25),
+        },
+    };
+    let cooldown = cli
+        .cooldown
+        .unwrap_or_else(|| Duration::from_secs(file.cooldown_secs.unwrap_or(600)));
+
+    // CLI overrides go first: Thresholds returns the first name match
+    let mut cpu = Thresholds::new(cpu_default);
+    for (name, value) in &cli.cpu_overrides {
+        cpu = cpu.with_override(name.clone(), *value);
+    }
+    for (name, pct) in &file.cpu_overrides {
+        cpu = cpu.with_override(name.clone(), (*pct > 0.0).then_some(*pct));
+    }
+    let mut memory = Thresholds::new(mem_default);
+    for (name, value) in &cli.mem_overrides {
+        memory = memory.with_override(name.clone(), *value);
+    }
+    for (name, pct) in &file.mem_overrides {
+        memory = memory.with_override(name.clone(), (*pct > 0.0).then_some(*pct / 100.0));
+    }
+
+    ActiveThresholds {
+        cpu,
+        memory,
+        cooldown,
+    }
+}
+
+fn config_mtime() -> Option<SystemTime> {
+    std::fs::metadata(settings::path())
+        .ok()
+        .and_then(|m| m.modified().ok())
+}
+
+/// Hot-reload bookkeeping
+struct ReloadState {
+    rounds_since_check: u32,
+    last_mtime: Option<SystemTime>,
+}
+
 /// Sink that watches snapshots and fires desktop notifications.
 ///
 /// Both rules evaluate 1-minute averages, so only sustained behavior
@@ -90,27 +171,97 @@ impl<T: Copy> Thresholds<T> {
 /// - Memory rule: average share of total system memory at or above the
 ///   given fraction.
 pub struct AlertSink {
-    cpu: Thresholds<f32>,
-    memory: Thresholds<f64>,
-    /// Per (process, rule) re-alert cooldown while a condition persists
-    cooldown: Duration,
+    active: Mutex<ActiveThresholds>,
+    /// Present when built from CLI options: enables config hot reload
+    cli: Option<AlertCliOptions>,
+    reload: Mutex<ReloadState>,
     history: Mutex<HashMap<u32, VecDeque<Sample>>>,
     last_alert: Mutex<HashMap<(u32, AlertKind), Instant>>,
 }
 
 impl AlertSink {
-    pub fn new(cpu: Thresholds<f32>, memory: Thresholds<f64>, cooldown: Duration) -> Self {
+    /// Fixed thresholds, no config-file reloading (test constructor)
+    #[cfg(test)]
+    fn new(cpu: Thresholds<f32>, memory: Thresholds<f64>, cooldown: Duration) -> Self {
         Self {
-            cpu,
-            memory,
-            cooldown,
+            active: Mutex::new(ActiveThresholds {
+                cpu,
+                memory,
+                cooldown,
+            }),
+            cli: None,
+            reload: Mutex::new(ReloadState {
+                rounds_since_check: 0,
+                last_mtime: None,
+            }),
+            history: Mutex::new(HashMap::new()),
+            last_alert: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Build from CLI options merged over the config file; the file is
+    /// then re-checked every [`RELOAD_CHECK_EVERY`] collects and reloaded
+    /// on mtime change
+    pub fn from_options(cli: AlertCliOptions, file: &settings::AlertsConfig) -> Self {
+        let active = merge_thresholds(&cli, file);
+        Self {
+            active: Mutex::new(active),
+            cli: Some(cli),
+            reload: Mutex::new(ReloadState {
+                rounds_since_check: 0,
+                last_mtime: config_mtime(),
+            }),
             history: Mutex::new(HashMap::new()),
             last_alert: Mutex::new(HashMap::new()),
         }
     }
 
     pub fn enabled(&self) -> bool {
-        self.cpu.any_enabled() || self.memory.any_enabled()
+        let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
+        active.cpu.any_enabled() || active.memory.any_enabled()
+    }
+
+    /// Every [`RELOAD_CHECK_EVERY`] rounds, stat the config file and
+    /// re-merge thresholds when its mtime changed. A file that fails to
+    /// parse keeps the previous settings (unlike startup, a running
+    /// daemon should not die over a config typo)
+    fn maybe_reload(&self) {
+        let Some(cli) = &self.cli else {
+            return;
+        };
+
+        let mut reload = self.reload.lock().unwrap_or_else(|e| e.into_inner());
+        reload.rounds_since_check += 1;
+        if reload.rounds_since_check < RELOAD_CHECK_EVERY {
+            return;
+        }
+        reload.rounds_since_check = 0;
+
+        let mtime = config_mtime();
+        if std::env::var_os("ZSTATS_ALERT_DEBUG").is_some() {
+            eprintln!(
+                "[alert-debug] reload check: mtime={mtime:?} last={:?}",
+                reload.last_mtime
+            );
+        }
+        if mtime == reload.last_mtime {
+            return;
+        }
+        reload.last_mtime = mtime;
+
+        match settings::load() {
+            Ok(file) => {
+                *self.active.lock().unwrap_or_else(|e| e.into_inner()) =
+                    merge_thresholds(cli, &file.alerts);
+                eprintln!(
+                    "[zstats alert] reloaded config from {}",
+                    settings::path().display()
+                );
+            }
+            Err(e) => {
+                eprintln!("[zstats alert] config reload failed, keeping previous settings: {e}");
+            }
+        }
     }
 
     /// Record the snapshot and return the alerts that should fire now.
@@ -126,6 +277,7 @@ impl AlertSink {
         let total_memory = snapshot.memory.total_bytes;
         let mut events = Vec::new();
 
+        let active = self.active.lock().unwrap_or_else(|e| e.into_inner());
         let mut history = self.history.lock().unwrap_or_else(|e| e.into_inner());
         let mut last_alert = self.last_alert.lock().unwrap_or_else(|e| e.into_inner());
 
@@ -165,14 +317,14 @@ impl AlertSink {
             }
             let count = samples.len() as f64;
 
-            if let Some(threshold) = self.cpu.for_process(&p.name) {
+            if let Some(threshold) = active.cpu.for_process(&p.name) {
                 let avg = samples.iter().map(|(_, c, _)| f64::from(*c)).sum::<f64>() / count;
                 if avg >= f64::from(threshold)
                     && cooldown_elapsed(
                         &mut last_alert,
                         (p.pid, AlertKind::Cpu),
                         now,
-                        self.cooldown,
+                        active.cooldown,
                     )
                 {
                     events.push(AlertEvent {
@@ -185,7 +337,7 @@ impl AlertSink {
                 }
             }
 
-            if let Some(fraction) = self.memory.for_process(&p.name)
+            if let Some(fraction) = active.memory.for_process(&p.name)
                 && total_memory > 0
             {
                 let avg_bytes = samples.iter().map(|(.., m)| *m as f64).sum::<f64>() / count;
@@ -195,7 +347,7 @@ impl AlertSink {
                         &mut last_alert,
                         (p.pid, AlertKind::Memory),
                         now,
-                        self.cooldown,
+                        active.cooldown,
                     )
                 {
                     events.push(AlertEvent {
@@ -273,6 +425,7 @@ fn escape_applescript(s: &str) -> String {
 #[async_trait]
 impl MetricSink for AlertSink {
     async fn write(&self, snapshot: &SystemSnapshot) -> Result<(), SinkError> {
+        self.maybe_reload();
         for event in self.record_and_evaluate(Instant::now(), snapshot) {
             // Also log to stderr: visible when serve runs in the foreground,
             // and it separates "rule fired" from "notification displayed"
@@ -474,6 +627,66 @@ mod tests {
             100,
         );
         assert_eq!(fired, 0);
+    }
+
+    fn empty_cli() -> AlertCliOptions {
+        AlertCliOptions {
+            cpu: None,
+            cpu_overrides: Vec::new(),
+            mem: None,
+            mem_overrides: Vec::new(),
+            cooldown: None,
+        }
+    }
+
+    #[test]
+    fn merge_uses_builtin_defaults_when_nothing_is_set() {
+        let merged = merge_thresholds(&empty_cli(), &settings::AlertsConfig::default());
+        assert_eq!(merged.cpu.for_process("any"), Some(30.0));
+        assert_eq!(merged.memory.for_process("any"), Some(0.25));
+        assert_eq!(merged.cooldown, Duration::from_secs(600));
+    }
+
+    #[test]
+    fn merge_file_beats_builtin_and_cli_beats_file() {
+        let mut file = settings::AlertsConfig {
+            cpu: Some(50.0),
+            cooldown_secs: Some(300),
+            ..Default::default()
+        };
+        file.cpu_overrides.insert("ghostty".into(), 100.0);
+
+        // File over builtin
+        let merged = merge_thresholds(&empty_cli(), &file);
+        assert_eq!(merged.cpu.for_process("other"), Some(50.0));
+        assert_eq!(merged.cpu.for_process("Ghostty"), Some(100.0));
+        assert_eq!(merged.cooldown, Duration::from_secs(300));
+
+        // CLI over file, including a same-name override
+        let cli = AlertCliOptions {
+            cpu: Some(Some(40.0)),
+            cpu_overrides: vec![("ghostty".into(), Some(120.0))],
+            cooldown: Some(Duration::from_secs(60)),
+            ..empty_cli()
+        };
+        let merged = merge_thresholds(&cli, &file);
+        assert_eq!(merged.cpu.for_process("other"), Some(40.0));
+        assert_eq!(merged.cpu.for_process("ghostty"), Some(120.0));
+        assert_eq!(merged.cooldown, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn merge_zero_in_file_disables() {
+        let mut file = settings::AlertsConfig {
+            mem: Some(0.0),
+            ..Default::default()
+        };
+        file.cpu_overrides.insert("chrome".into(), 0.0);
+
+        let merged = merge_thresholds(&empty_cli(), &file);
+        assert_eq!(merged.memory.for_process("any"), None);
+        assert_eq!(merged.cpu.for_process("chrome"), None);
+        assert_eq!(merged.cpu.for_process("other"), Some(30.0));
     }
 
     #[test]

@@ -218,11 +218,12 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
 
     let _ = writeln!(
         out,
-        "HOST  {}  {} {} ({})  {}",
+        "HOST  {}  {} {} ({})  up {}  {}",
         s.host.hostname,
         s.host.os_name,
         s.host.os_version,
         s.host.arch,
+        human_uptime(s.host.uptime_secs),
         s.timestamp
             .to_zoned(TimeZone::system())
             .strftime("%Y-%m-%d %H:%M:%S"),
@@ -295,8 +296,14 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
                 };
                 // Highlight disks over 90% usage in bold red
                 let color = level_color(fraction, 0.7, 0.9);
+                let kind = if d.kind.is_empty() {
+                    "-".to_string()
+                } else {
+                    d.kind.clone()
+                };
                 vec![
                     d.mount_point.clone(),
+                    kind,
                     theme.paint(color, &gauge(fraction, DISK_GAUGE_WIDTH)),
                     theme.paint(color, &format!("{:.1}%", fraction * 100.0)),
                     human_bytes(d.available_bytes),
@@ -309,8 +316,11 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
         write_table(
             &mut out,
             "DISK",
-            &["MOUNT", "USED", "USE%", "FREE", "TOTAL", "READ", "WRITE"],
             &[
+                "MOUNT", "KIND", "USED", "USE%", "FREE", "TOTAL", "READ", "WRITE",
+            ],
+            &[
+                Align::Left,
                 Align::Left,
                 Align::Left,
                 Align::Right,
@@ -325,15 +335,29 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
     }
 
     if let Some(networks) = &s.networks {
-        // Only show interfaces with traffic to avoid a wall of idle utun/lo entries
+        // Only show interfaces with traffic (or errors) to avoid a wall of
+        // idle utun/lo entries
         let rows: Vec<Vec<String>> = networks
             .iter()
-            .filter(|n| n.received_bytes_per_sec > 0 || n.transmitted_bytes_per_sec > 0)
+            .filter(|n| {
+                n.received_bytes_per_sec > 0
+                    || n.transmitted_bytes_per_sec > 0
+                    || n.received_errors_per_sec.unwrap_or(0) > 0
+                    || n.transmitted_errors_per_sec.unwrap_or(0) > 0
+            })
             .map(|n| {
+                let err_rx = n.received_errors_per_sec.unwrap_or(0);
+                let err_tx = n.transmitted_errors_per_sec.unwrap_or(0);
+                let errs = if err_rx > 0 || err_tx > 0 {
+                    format!("{err_rx}/{err_tx}")
+                } else {
+                    "-".to_string()
+                };
                 vec![
                     n.interface.clone(),
                     human_rate(Some(n.received_bytes_per_sec)),
                     human_rate(Some(n.transmitted_bytes_per_sec)),
+                    errs,
                 ]
             })
             .collect();
@@ -343,8 +367,8 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
             write_table(
                 &mut out,
                 "NET",
-                &["IFACE", "RX↓", "TX↑"],
-                &[Align::Left, Align::Right, Align::Right],
+                &["IFACE", "RX↓", "TX↑", "ERR↓/↑"],
+                &[Align::Left, Align::Right, Align::Right, Align::Right],
                 &rows,
                 theme,
             );
@@ -459,6 +483,23 @@ fn human_bytes(bytes: u64) -> String {
         format!("{bytes} B")
     } else {
         format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// Compact uptime: `3d4h`, `5h12m`, `42m`, or `17s`
+fn human_uptime(secs: u64) -> String {
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3_600;
+    let mins = (secs % 3_600) / 60;
+    let rem = secs % 60;
+    if days > 0 {
+        format!("{days}d{hours}h")
+    } else if hours > 0 {
+        format!("{hours}h{mins}m")
+    } else if mins > 0 {
+        format!("{mins}m")
+    } else {
+        format!("{rem}s")
     }
 }
 
@@ -611,6 +652,19 @@ mod tests {
     }
 
     #[test]
+    fn human_uptime_picks_two_leading_units() {
+        assert_eq!(human_uptime(0), "0s");
+        assert_eq!(human_uptime(17), "17s");
+        assert_eq!(human_uptime(59), "59s");
+        assert_eq!(human_uptime(60), "1m");
+        assert_eq!(human_uptime(42 * 60), "42m");
+        assert_eq!(human_uptime(3600), "1h0m");
+        assert_eq!(human_uptime(5 * 3600 + 12 * 60 + 40), "5h12m");
+        assert_eq!(human_uptime(86_400), "1d0h");
+        assert_eq!(human_uptime(3 * 86_400 + 4 * 3600 + 59 * 60), "3d4h");
+    }
+
+    #[test]
     fn gauge_renders_fill_levels() {
         assert_eq!(gauge(0.0, 4), "░░░░");
         assert_eq!(gauge(0.5, 4), "██░░");
@@ -731,8 +785,12 @@ TOP   NAME            MEM
             cmd: String::new(),
             cpu_usage_percent: cpu,
             memory_bytes: mem,
+            virtual_memory_bytes: mem,
+            run_time_secs: 0,
             parent_pid: None,
             status: "Runnable".into(),
+            read_bytes_per_sec: None,
+            write_bytes_per_sec: None,
         }
     }
 

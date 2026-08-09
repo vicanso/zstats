@@ -49,8 +49,19 @@ pub struct CollectorConfig {
     /// meaningful; the returned list is sorted by CPU desc
     pub max_processes: usize,
 
+    /// Also collect per-process disk read/write byte rates. Off by default
+    /// because it requires an extra refresh kind on every process pass.
+    /// When disabled, `ProcessSnapshot::{read,write}_bytes_per_sec` stay
+    /// `None`.
+    pub collect_process_disk_io: bool,
+
     /// Whether to collect per-core CPU usage
     pub per_core_cpu: bool,
+
+    /// How often to refresh CPU frequency. Frequency changes slowly relative
+    /// to usage; refreshing it every collect is wasted work. Usage is still
+    /// refreshed on every collect. Zero refreshes frequency every collect.
+    pub cpu_frequency_refresh_interval: Duration,
 
     /// Whether to collect disk metrics
     pub collect_disks: bool,
@@ -62,6 +73,11 @@ pub struct CollectorConfig {
     /// still refresh on every collect. Capacity values between refreshes
     /// are the last known ones
     pub disk_storage_refresh_interval: Duration,
+
+    /// When true, keep a single entry per disk device name (preferring the
+    /// shortest mount point). Collapses APFS synthetic mounts such as `/`
+    /// and `/System/Volumes/Data` that report the same underlying volume.
+    pub dedupe_disks: bool,
 
     /// Whether to collect network interface metrics
     pub collect_networks: bool,
@@ -80,9 +96,12 @@ impl Default for CollectorConfig {
             process_refresh_interval: Duration::ZERO,
             process_boost_cpu_percent: Some(15.0),
             max_processes: 50,
+            collect_process_disk_io: false,
             per_core_cpu: true,
+            cpu_frequency_refresh_interval: Duration::from_secs(30),
             collect_disks: true,
             disk_storage_refresh_interval: Duration::from_secs(60),
+            dedupe_disks: true,
             collect_networks: true,
             labels: HashMap::new(),
             collect_timeout: Duration::from_secs(2),

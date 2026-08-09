@@ -15,11 +15,13 @@
 //! Local machine collector implementation (based on sysinfo).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
 use sysinfo::{
-    DiskRefreshKind, Disks, Networks, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind,
+    CpuRefreshKind, DiskRefreshKind, Disks, Networks, Pid, ProcessRefreshKind, ProcessesToUpdate,
+    System, UpdateKind,
 };
 
 use crate::collector::Collector;
@@ -43,6 +45,16 @@ struct NetCounters {
     transmitted_bytes: u64,
     received_packets: u64,
     transmitted_packets: u64,
+    received_errors: u64,
+    transmitted_errors: u64,
+}
+
+/// Lightweight rank key: select top-N before materializing expensive strings
+#[derive(Debug, Clone, Copy)]
+struct ProcKey {
+    pid: u32,
+    cpu: f32,
+    mem: u64,
 }
 
 pub struct LocalCollector {
@@ -50,24 +62,28 @@ pub struct LocalCollector {
     system: System,
     disks: Disks,
     networks: Networks,
-    /// Static host info, gathered once at construction
+    /// Static host identity (uptime is filled in at collect time)
     host: HostInfo,
     // Internal state: the previous sample used for rate calculation
     last_disk_counters: HashMap<String, DiskCounters>,
     last_net_counters: HashMap<String, NetCounters>,
+    last_process_disk_counters: HashMap<u32, DiskCounters>,
     last_collect_time: Option<Instant>,
     last_disk_storage_refresh: Option<Instant>,
     last_process_refresh: Option<Instant>,
+    last_cpu_frequency_refresh: Option<Instant>,
     /// Last collected process list, reused between process refreshes when
-    /// `process_refresh_interval` is non-zero
-    cached_processes: Option<Vec<ProcessSnapshot>>,
+    /// `process_refresh_interval` is non-zero. Arc so cache hits and
+    /// snapshot clones share the same allocation.
+    cached_processes: Option<Arc<Vec<ProcessSnapshot>>>,
 }
 
 impl LocalCollector {
     pub fn new(config: CollectorConfig) -> Self {
         let mut system = System::new();
         // Refresh once up front so the first collect has a baseline for CPU usage
-        system.refresh_cpu_all();
+        // and an initial frequency reading.
+        system.refresh_cpu_specifics(CpuRefreshKind::everything());
         system.refresh_memory();
 
         let host = HostInfo {
@@ -76,6 +92,7 @@ impl LocalCollector {
             os_version: System::os_version().unwrap_or_default(),
             kernel_version: System::kernel_version(),
             arch: std::env::consts::ARCH.to_string(),
+            uptime_secs: System::uptime(),
             labels: config.labels.clone(),
         };
 
@@ -103,31 +120,57 @@ impl LocalCollector {
             host,
             last_disk_counters: HashMap::new(),
             last_net_counters: HashMap::new(),
+            last_process_disk_counters: HashMap::new(),
             last_collect_time: None,
             last_disk_storage_refresh,
             last_process_refresh: None,
+            // Frequency was just refreshed above
+            last_cpu_frequency_refresh: Some(Instant::now()),
             cached_processes: None,
         }
     }
 
+    /// Refresh CPU usage every round; frequency only on its own cadence
+    fn refresh_cpu(&mut self) {
+        let freq_due = self.config.cpu_frequency_refresh_interval.is_zero()
+            || self
+                .last_cpu_frequency_refresh
+                .is_none_or(|t| t.elapsed() >= self.config.cpu_frequency_refresh_interval);
+        let mut kind = CpuRefreshKind::nothing().with_cpu_usage();
+        if freq_due {
+            kind = kind.with_frequency();
+            self.last_cpu_frequency_refresh = Some(Instant::now());
+        }
+        self.system.refresh_cpu_specifics(kind);
+    }
+
     /// Refresh the throttleable subsystems (CPU/memory are refreshed
-    /// directly in `collect`, before this runs)
-    fn refresh(&mut self, refresh_processes: bool) {
-        if refresh_processes {
+    /// directly in `collect`, before this runs).
+    ///
+    /// Returns the elapsed time since the previous process refresh when
+    /// processes were refreshed this round (for process disk IO rates).
+    fn refresh(&mut self, refresh_processes: bool) -> Option<Duration> {
+        let process_elapsed = if refresh_processes {
+            let elapsed = self.last_process_refresh.map(|t| t.elapsed());
             // Explicit refresh kind: the `refresh_processes` shortcut does
             // NOT fetch cmd (and wastes time on disk_usage/exe we don't
-            // expose). cmd is immutable per process, so OnlyIfNotSet
-            // fetches it exactly once per process
-            self.system.refresh_processes_specifics(
-                ProcessesToUpdate::All,
-                true,
-                ProcessRefreshKind::nothing()
-                    .with_memory()
-                    .with_cpu()
-                    .with_cmd(UpdateKind::OnlyIfNotSet),
-            );
+            // always need). cmd is immutable per process, so OnlyIfNotSet
+            // fetches it exactly once per process.
+            let mut kind = ProcessRefreshKind::nothing()
+                .with_memory()
+                .with_cpu()
+                .with_cmd(UpdateKind::OnlyIfNotSet);
+            if self.config.collect_process_disk_io {
+                kind = kind.with_disk_usage();
+            }
+            self.system
+                .refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
             self.last_process_refresh = Some(Instant::now());
-        }
+            elapsed
+        } else {
+            None
+        };
+
         if self.config.collect_disks {
             // IO counters are cheap and refresh every round; the capacity
             // query costs ~25x more and barely changes, so it runs on the
@@ -145,6 +188,7 @@ impl LocalCollector {
         if self.config.collect_networks {
             self.networks.refresh(true);
         }
+        process_elapsed
     }
 
     fn collect_cpu(&self) -> CpuSnapshot {
@@ -217,6 +261,8 @@ impl LocalCollector {
                 name,
                 mount_point,
                 file_system: disk.file_system().to_string_lossy().to_string(),
+                kind: disk.kind().to_string(),
+                is_removable: disk.is_removable(),
                 total_bytes: disk.total_space(),
                 available_bytes: disk.available_space(),
                 read_bytes_per_sec,
@@ -226,6 +272,11 @@ impl LocalCollector {
 
         // Replace wholesale so counters of removed disks are pruned automatically
         self.last_disk_counters = counters;
+
+        if self.config.dedupe_disks {
+            snapshots = dedupe_disks_by_name(snapshots);
+        }
+
         Some(snapshots)
     }
 
@@ -243,6 +294,8 @@ impl LocalCollector {
                 transmitted_bytes: data.total_transmitted(),
                 received_packets: data.total_packets_received(),
                 transmitted_packets: data.total_packets_transmitted(),
+                received_errors: data.total_errors_on_received(),
+                transmitted_errors: data.total_errors_on_transmitted(),
             };
 
             let snapshot = match (elapsed, self.last_net_counters.get(interface)) {
@@ -268,6 +321,16 @@ impl LocalCollector {
                         current.transmitted_packets,
                         elapsed,
                     )),
+                    received_errors_per_sec: Some(rate_per_sec(
+                        prev.received_errors,
+                        current.received_errors,
+                        elapsed,
+                    )),
+                    transmitted_errors_per_sec: Some(rate_per_sec(
+                        prev.transmitted_errors,
+                        current.transmitted_errors,
+                        elapsed,
+                    )),
                 },
                 _ => NetworkSnapshot {
                     interface: interface.clone(),
@@ -275,6 +338,8 @@ impl LocalCollector {
                     transmitted_bytes_per_sec: 0,
                     received_packets_per_sec: None,
                     transmitted_packets_per_sec: None,
+                    received_errors_per_sec: None,
+                    transmitted_errors_per_sec: None,
                 },
             };
 
@@ -286,7 +351,11 @@ impl LocalCollector {
         Some(snapshots)
     }
 
-    fn collect_processes(&mut self, refreshed: bool) -> Option<Vec<ProcessSnapshot>> {
+    fn collect_processes(
+        &mut self,
+        refreshed: bool,
+        process_elapsed: Option<Duration>,
+    ) -> Option<Arc<Vec<ProcessSnapshot>>> {
         if !self.config.collect_processes {
             return None;
         }
@@ -295,12 +364,70 @@ impl LocalCollector {
             return self.cached_processes.clone();
         }
 
-        let processes: Vec<ProcessSnapshot> = self
-            .system
-            .processes()
-            .values()
-            .map(|p| ProcessSnapshot {
-                pid: p.pid().as_u32(),
+        // Pass 1: rank by cpu/mem only — no string materialization yet
+        let mut keys: Vec<ProcKey> = Vec::with_capacity(self.system.processes().len());
+        let mut disk_counters = if self.config.collect_process_disk_io {
+            HashMap::with_capacity(self.system.processes().len())
+        } else {
+            HashMap::new()
+        };
+
+        for p in self.system.processes().values() {
+            let pid = p.pid().as_u32();
+            keys.push(ProcKey {
+                pid,
+                cpu: p.cpu_usage(),
+                mem: p.memory(),
+            });
+            if self.config.collect_process_disk_io {
+                let usage = p.disk_usage();
+                disk_counters.insert(
+                    pid,
+                    DiskCounters {
+                        total_read_bytes: usage.total_read_bytes,
+                        total_written_bytes: usage.total_written_bytes,
+                    },
+                );
+            }
+        }
+
+        let selected_pids = select_top_pids(keys, self.config.max_processes);
+
+        // Pass 2: materialize only the selected processes
+        let mut selected = Vec::with_capacity(selected_pids.len());
+        for pid in selected_pids {
+            let Some(p) = self.system.process(Pid::from(pid as usize)) else {
+                continue;
+            };
+
+            let (read_bytes_per_sec, write_bytes_per_sec) = if self.config.collect_process_disk_io {
+                match (process_elapsed, self.last_process_disk_counters.get(&pid)) {
+                    (Some(elapsed), Some(prev)) => {
+                        let current = disk_counters.get(&pid).copied().unwrap_or(DiskCounters {
+                            total_read_bytes: 0,
+                            total_written_bytes: 0,
+                        });
+                        (
+                            Some(rate_per_sec(
+                                prev.total_read_bytes,
+                                current.total_read_bytes,
+                                elapsed,
+                            )),
+                            Some(rate_per_sec(
+                                prev.total_written_bytes,
+                                current.total_written_bytes,
+                                elapsed,
+                            )),
+                        )
+                    }
+                    _ => (None, None),
+                }
+            } else {
+                (None, None)
+            };
+
+            selected.push(ProcessSnapshot {
+                pid,
                 name: p.name().to_string_lossy().to_string(),
                 cmd: p
                     .cmd()
@@ -310,13 +437,24 @@ impl LocalCollector {
                     .join(" "),
                 cpu_usage_percent: p.cpu_usage(),
                 memory_bytes: p.memory(),
+                virtual_memory_bytes: p.virtual_memory(),
+                run_time_secs: p.run_time(),
                 parent_pid: p.parent().map(|pp| pp.as_u32()),
                 status: p.status().to_string(),
-            })
-            .collect();
+                read_bytes_per_sec,
+                write_bytes_per_sec,
+            });
+        }
 
-        let selected = select_top_processes(processes, self.config.max_processes);
-        self.cached_processes = Some(selected.clone());
+        // Result stays CPU-sorted (select_top_pids returns that order)
+        if self.config.collect_process_disk_io {
+            self.last_process_disk_counters = disk_counters;
+        } else {
+            self.last_process_disk_counters.clear();
+        }
+
+        let selected = Arc::new(selected);
+        self.cached_processes = Some(Arc::clone(&selected));
         Some(selected)
     }
 
@@ -328,6 +466,11 @@ impl LocalCollector {
             load15: load.fifteen,
         }
     }
+
+    fn collect_host(&mut self) -> HostInfo {
+        self.host.uptime_secs = System::uptime();
+        self.host.clone()
+    }
 }
 
 /// Whether high overall CPU usage should force a process refresh this round
@@ -335,34 +478,52 @@ fn process_boost_active(threshold: Option<f32>, cpu_usage: f32) -> bool {
     threshold.is_some_and(|t| cpu_usage >= t)
 }
 
-fn by_cpu_then_memory(a: &ProcessSnapshot, b: &ProcessSnapshot) -> std::cmp::Ordering {
-    b.cpu_usage_percent
-        .total_cmp(&a.cpu_usage_percent)
-        .then_with(|| b.memory_bytes.cmp(&a.memory_bytes))
+fn by_cpu_then_memory(a: &ProcKey, b: &ProcKey) -> std::cmp::Ordering {
+    b.cpu
+        .total_cmp(&a.cpu)
+        .then_with(|| b.mem.cmp(&a.mem))
+        .then_with(|| a.pid.cmp(&b.pid))
 }
 
-/// Select up to `max` processes, splitting the budget between the
+/// Select up to `max` process pids, splitting the budget between the
 /// top-by-CPU and top-by-memory rankings: a pure CPU cut would let a busy
 /// system (with `max`+ CPU-active processes) push idle memory hogs out
 /// entirely, making any downstream "top by memory" view meaningless.
 /// The result is sorted by CPU desc, then memory desc.
-fn select_top_processes(mut processes: Vec<ProcessSnapshot>, max: usize) -> Vec<ProcessSnapshot> {
-    processes.sort_by(by_cpu_then_memory);
-    if processes.len() > max {
+fn select_top_pids(mut keys: Vec<ProcKey>, max: usize) -> Vec<u32> {
+    keys.sort_by(by_cpu_then_memory);
+    if keys.len() > max {
         let cpu_budget = max / 2;
-        let mut rest = processes.split_off(cpu_budget);
-        rest.sort_by_key(|p| std::cmp::Reverse(p.memory_bytes));
-        processes.extend(rest.into_iter().take(max - cpu_budget));
-        processes.sort_by(by_cpu_then_memory);
+        let mut rest = keys.split_off(cpu_budget);
+        rest.sort_by_key(|k| std::cmp::Reverse(k.mem));
+        keys.extend(rest.into_iter().take(max - cpu_budget));
+        keys.sort_by(by_cpu_then_memory);
     }
-    processes
+    keys.into_iter().map(|k| k.pid).collect()
+}
+
+/// Keep one entry per device name, preferring the shortest mount point
+/// (collapses APFS synthetic mounts that share a volume).
+fn dedupe_disks_by_name(disks: Vec<DiskSnapshot>) -> Vec<DiskSnapshot> {
+    let mut best: HashMap<String, DiskSnapshot> = HashMap::new();
+    for disk in disks {
+        match best.get(&disk.name) {
+            Some(existing) if existing.mount_point.len() <= disk.mount_point.len() => {}
+            _ => {
+                best.insert(disk.name.clone(), disk);
+            }
+        }
+    }
+    let mut out: Vec<_> = best.into_values().collect();
+    out.sort_by(|a, b| a.mount_point.cmp(&b.mount_point));
+    out
 }
 
 impl Collector for LocalCollector {
     fn collect(&mut self) -> Result<SystemSnapshot, CollectError> {
         // CPU and memory refresh first (they cost microseconds): the fresh
         // global CPU usage then decides whether the process boost kicks in
-        self.system.refresh_cpu_all();
+        self.refresh_cpu();
         self.system.refresh_memory();
 
         let boost = process_boost_active(
@@ -374,19 +535,19 @@ impl Collector for LocalCollector {
                 || self
                     .last_process_refresh
                     .is_none_or(|t| t.elapsed() >= self.config.process_refresh_interval));
-        self.refresh(processes_due);
+        let process_elapsed = self.refresh(processes_due);
 
         let elapsed = self.last_collect_time.map(|t| t.elapsed());
         self.last_collect_time = Some(Instant::now());
 
         Ok(SystemSnapshot {
             timestamp: Timestamp::now(),
-            host: self.host.clone(),
+            host: self.collect_host(),
             cpu: self.collect_cpu(),
             memory: self.collect_memory(),
             disks: self.collect_disks(elapsed),
             networks: self.collect_networks(elapsed),
-            processes: self.collect_processes(processes_due),
+            processes: self.collect_processes(processes_due, process_elapsed),
             load: self.collect_load(),
             extras: HashMap::new(),
         })
@@ -401,16 +562,8 @@ impl Collector for LocalCollector {
 mod tests {
     use super::*;
 
-    fn proc(pid: u32, cpu: f32, mem: u64) -> ProcessSnapshot {
-        ProcessSnapshot {
-            pid,
-            name: format!("p{pid}"),
-            cmd: String::new(),
-            cpu_usage_percent: cpu,
-            memory_bytes: mem,
-            parent_pid: None,
-            status: "Runnable".into(),
-        }
+    fn key(pid: u32, cpu: f32, mem: u64) -> ProcKey {
+        ProcKey { pid, cpu, mem }
     }
 
     #[test]
@@ -424,25 +577,69 @@ mod tests {
     #[test]
     fn memory_hogs_survive_cpu_heavy_selection() {
         // 10 CPU-active processes + 1 idle memory hog, budget 4
-        let mut procs: Vec<_> = (0..10).map(|i| proc(i, 10.0 + i as f32, 100)).collect();
-        procs.push(proc(99, 0.0, 1_000_000));
+        let mut keys: Vec<_> = (0..10).map(|i| key(i, 10.0 + i as f32, 100)).collect();
+        keys.push(key(99, 0.0, 1_000_000));
 
-        let selected = select_top_processes(procs, 4);
+        let selected = select_top_pids(keys, 4);
         assert_eq!(selected.len(), 4);
         assert!(
-            selected.iter().any(|p| p.pid == 99),
+            selected.contains(&99),
             "idle memory hog must survive selection"
         );
-        // Result stays CPU-sorted
-        assert!(selected[0].cpu_usage_percent >= selected[1].cpu_usage_percent);
+        // Result stays CPU-sorted: first selected has highest cpu among kept
+        // (we only have pids; re-derive via known inputs)
+        assert_eq!(selected[0], 9); // cpu 19.0
     }
 
     #[test]
     fn under_budget_keeps_all_sorted_by_cpu() {
-        let procs = vec![proc(1, 1.0, 10), proc(2, 5.0, 10), proc(3, 3.0, 10)];
-        let selected = select_top_processes(procs, 50);
-        assert_eq!(selected.len(), 3);
-        assert_eq!(selected[0].pid, 2);
-        assert_eq!(selected[1].pid, 3);
+        let keys = vec![key(1, 1.0, 10), key(2, 5.0, 10), key(3, 3.0, 10)];
+        let selected = select_top_pids(keys, 50);
+        assert_eq!(selected, vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn dedupe_keeps_shortest_mount() {
+        let disks = vec![
+            DiskSnapshot {
+                name: "disk0".into(),
+                mount_point: "/System/Volumes/Data".into(),
+                file_system: "apfs".into(),
+                kind: "SSD".into(),
+                is_removable: false,
+                total_bytes: 100,
+                available_bytes: 40,
+                read_bytes_per_sec: Some(1),
+                write_bytes_per_sec: Some(2),
+            },
+            DiskSnapshot {
+                name: "disk0".into(),
+                mount_point: "/".into(),
+                file_system: "apfs".into(),
+                kind: "SSD".into(),
+                is_removable: false,
+                total_bytes: 100,
+                available_bytes: 40,
+                read_bytes_per_sec: Some(3),
+                write_bytes_per_sec: Some(4),
+            },
+            DiskSnapshot {
+                name: "disk1".into(),
+                mount_point: "/Volumes/X".into(),
+                file_system: "exfat".into(),
+                kind: "HDD".into(),
+                is_removable: true,
+                total_bytes: 50,
+                available_bytes: 10,
+                read_bytes_per_sec: None,
+                write_bytes_per_sec: None,
+            },
+        ];
+        let out = dedupe_disks_by_name(disks);
+        assert_eq!(out.len(), 2);
+        let d0 = out.iter().find(|d| d.name == "disk0").unwrap();
+        assert_eq!(d0.mount_point, "/");
+        assert_eq!(d0.read_bytes_per_sec, Some(3));
+        assert!(out.iter().any(|d| d.name == "disk1"));
     }
 }

@@ -44,6 +44,43 @@ pub struct AlertEvent {
 /// One recorded sample: (when, cpu %, memory bytes)
 type Sample = (Instant, f32, u64);
 
+/// A rule threshold: a default plus per-process-name overrides
+/// (case-insensitive). An override of `None` disables the rule for that
+/// process — so a legitimately busy app (e.g. a terminal rendering
+/// streaming AI output) can get a higher bar without being blind to a
+/// real runaway.
+pub struct Thresholds<T> {
+    default: Option<T>,
+    overrides: Vec<(String, Option<T>)>,
+}
+
+impl<T: Copy> Thresholds<T> {
+    pub fn new(default: Option<T>) -> Self {
+        Self {
+            default,
+            overrides: Vec::new(),
+        }
+    }
+
+    pub fn with_override(mut self, name: String, value: Option<T>) -> Self {
+        self.overrides.push((name, value));
+        self
+    }
+
+    fn for_process(&self, name: &str) -> Option<T> {
+        for (n, value) in &self.overrides {
+            if n.eq_ignore_ascii_case(name) {
+                return *value;
+            }
+        }
+        self.default
+    }
+
+    fn any_enabled(&self) -> bool {
+        self.default.is_some() || self.overrides.iter().any(|(_, v)| v.is_some())
+    }
+}
+
 /// Sink that watches snapshots and fires desktop notifications.
 ///
 /// Both rules evaluate 1-minute averages, so only sustained behavior
@@ -53,8 +90,8 @@ type Sample = (Instant, f32, u64);
 /// - Memory rule: average share of total system memory at or above the
 ///   given fraction.
 pub struct AlertSink {
-    cpu_threshold: Option<f32>,
-    memory_fraction: Option<f64>,
+    cpu: Thresholds<f32>,
+    memory: Thresholds<f64>,
     /// Per (process, rule) re-alert cooldown while a condition persists
     cooldown: Duration,
     history: Mutex<HashMap<u32, VecDeque<Sample>>>,
@@ -62,14 +99,10 @@ pub struct AlertSink {
 }
 
 impl AlertSink {
-    pub fn new(
-        cpu_threshold: Option<f32>,
-        memory_fraction: Option<f64>,
-        cooldown: Duration,
-    ) -> Self {
+    pub fn new(cpu: Thresholds<f32>, memory: Thresholds<f64>, cooldown: Duration) -> Self {
         Self {
-            cpu_threshold,
-            memory_fraction,
+            cpu,
+            memory,
             cooldown,
             history: Mutex::new(HashMap::new()),
             last_alert: Mutex::new(HashMap::new()),
@@ -77,7 +110,7 @@ impl AlertSink {
     }
 
     pub fn enabled(&self) -> bool {
-        self.cpu_threshold.is_some() || self.memory_fraction.is_some()
+        self.cpu.any_enabled() || self.memory.any_enabled()
     }
 
     /// Record the snapshot and return the alerts that should fire now.
@@ -132,7 +165,7 @@ impl AlertSink {
             }
             let count = samples.len() as f64;
 
-            if let Some(threshold) = self.cpu_threshold {
+            if let Some(threshold) = self.cpu.for_process(&p.name) {
                 let avg = samples.iter().map(|(_, c, _)| f64::from(*c)).sum::<f64>() / count;
                 if avg >= f64::from(threshold)
                     && cooldown_elapsed(
@@ -152,7 +185,7 @@ impl AlertSink {
                 }
             }
 
-            if let Some(fraction) = self.memory_fraction
+            if let Some(fraction) = self.memory.for_process(&p.name)
                 && total_memory > 0
             {
                 let avg_bytes = samples.iter().map(|(.., m)| *m as f64).sum::<f64>() / count;
@@ -267,8 +300,12 @@ mod tests {
             cmd: String::new(),
             cpu_usage_percent: cpu,
             memory_bytes: mem,
+            virtual_memory_bytes: mem,
+            run_time_secs: 0,
             parent_pid: None,
             status: "Runnable".into(),
+            read_bytes_per_sec: None,
+            write_bytes_per_sec: None,
         }
     }
 
@@ -281,6 +318,7 @@ mod tests {
                 os_version: String::new(),
                 kernel_version: None,
                 arch: String::new(),
+                uptime_secs: 0,
                 labels: Default::default(),
             },
             cpu: CpuSnapshot {
@@ -299,7 +337,7 @@ mod tests {
             },
             disks: None,
             networks: None,
-            processes: Some(processes),
+            processes: Some(std::sync::Arc::new(processes)),
             load: LoadSnapshot {
                 load1: 0.0,
                 load5: 0.0,
@@ -311,7 +349,11 @@ mod tests {
 
     #[test]
     fn cpu_alert_needs_full_window_then_respects_cooldown() {
-        let sink = AlertSink::new(Some(100.0), None, Duration::from_secs(600));
+        let sink = AlertSink::new(
+            Thresholds::new(Some(100.0)),
+            Thresholds::new(None),
+            Duration::from_secs(600),
+        );
         let base = Instant::now();
         let mut fired = 0;
 
@@ -330,7 +372,11 @@ mod tests {
 
     #[test]
     fn cpu_below_threshold_never_fires() {
-        let sink = AlertSink::new(Some(100.0), None, Duration::from_secs(600));
+        let sink = AlertSink::new(
+            Thresholds::new(Some(100.0)),
+            Thresholds::new(None),
+            Duration::from_secs(600),
+        );
         let base = Instant::now();
         for i in 0..40u64 {
             let now = base + Duration::from_secs(2 * i);
@@ -361,7 +407,11 @@ mod tests {
 
     #[test]
     fn sustained_memory_fires_once_after_window_fills() {
-        let sink = AlertSink::new(None, Some(0.25), Duration::from_secs(600));
+        let sink = AlertSink::new(
+            Thresholds::new(None),
+            Thresholds::new(Some(0.25)),
+            Duration::from_secs(600),
+        );
         let base = Instant::now();
         // 30% of total for 80s: one alert (after the 50s window), then cooldown
         let fired = drive(&sink, base, Duration::ZERO, 40, |_| proc(1, 0.0, 30), 100);
@@ -370,7 +420,11 @@ mod tests {
 
     #[test]
     fn transient_memory_spike_does_not_alert() {
-        let sink = AlertSink::new(None, Some(0.25), Duration::from_secs(600));
+        let sink = AlertSink::new(
+            Thresholds::new(None),
+            Thresholds::new(Some(0.25)),
+            Duration::from_secs(600),
+        );
         let base = Instant::now();
         // 10s at 60% of total, then back to 5%: the 1-minute average never
         // reaches 25%, so a legitimate short burst stays silent
@@ -386,8 +440,49 @@ mod tests {
     }
 
     #[test]
+    fn per_process_override_beats_default() {
+        let cpu = Thresholds::new(Some(30.0)).with_override("Ghostty".into(), Some(100.0));
+        let sink = AlertSink::new(cpu, Thresholds::new(None), Duration::from_secs(600));
+        let base = Instant::now();
+
+        // Two processes both averaging 60%: the default-threshold one fires,
+        // the overridden one stays quiet (60 < 100); name match ignores case
+        let mut messages = Vec::new();
+        for i in 0..40u64 {
+            let now = base + Duration::from_secs(2 * i);
+            let mut ghostty = proc(1, 60.0, 0);
+            ghostty.name = "ghostty".into();
+            let other = proc(2, 60.0, 0);
+            for event in sink.record_and_evaluate(now, &snapshot(vec![ghostty, other], 100)) {
+                messages.push(event.message);
+            }
+        }
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].contains("p2 (pid 2)"), "got: {}", messages[0]);
+    }
+
+    #[test]
+    fn zero_override_disables_rule_for_that_process() {
+        let cpu = Thresholds::new(Some(30.0)).with_override("p1".into(), None);
+        let sink = AlertSink::new(cpu, Thresholds::new(None), Duration::from_secs(600));
+        let fired = drive(
+            &sink,
+            Instant::now(),
+            Duration::ZERO,
+            40,
+            |_| proc(1, 150.0, 0),
+            100,
+        );
+        assert_eq!(fired, 0);
+    }
+
+    #[test]
     fn custom_cooldown_controls_realert_rate() {
-        let sink = AlertSink::new(None, Some(0.25), Duration::from_secs(10));
+        let sink = AlertSink::new(
+            Thresholds::new(None),
+            Thresholds::new(Some(0.25)),
+            Duration::from_secs(10),
+        );
         let base = Instant::now();
         // Sustained hog for 80s at a 2s cadence with a 10s cooldown:
         // fires at 50s (window full), then again at 60s and 70s
@@ -397,7 +492,11 @@ mod tests {
 
     #[test]
     fn dead_process_resets_state() {
-        let sink = AlertSink::new(None, Some(0.25), Duration::from_secs(600));
+        let sink = AlertSink::new(
+            Thresholds::new(None),
+            Thresholds::new(Some(0.25)),
+            Duration::from_secs(600),
+        );
         let base = Instant::now();
         // Sustained hog fires once
         assert_eq!(

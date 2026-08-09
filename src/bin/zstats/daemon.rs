@@ -329,6 +329,7 @@ mod tests {
                 os_version: String::new(),
                 kernel_version: None,
                 arch: String::new(),
+                uptime_secs: 0,
                 labels: Default::default(),
             },
             cpu: CpuSnapshot {

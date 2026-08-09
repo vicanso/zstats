@@ -17,6 +17,7 @@
 //! the module.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
@@ -42,8 +43,10 @@ pub struct SystemSnapshot {
     /// Network metrics; None when network collection is disabled
     pub networks: Option<Vec<NetworkSnapshot>>,
 
-    /// Process list; None when process collection is disabled
-    pub processes: Option<Vec<ProcessSnapshot>>,
+    /// Process list; None when process collection is disabled.
+    /// Wrapped in [`Arc`] so cloning a snapshot (scheduler → sinks,
+    /// daemon history) does not deep-copy the process table.
+    pub processes: Option<Arc<Vec<ProcessSnapshot>>>,
 
     /// Load averages
     pub load: LoadSnapshot,
@@ -60,6 +63,9 @@ pub struct HostInfo {
     pub os_version: String,
     pub kernel_version: Option<String>,
     pub arch: String,
+    /// Seconds since boot
+    #[serde(default)]
+    pub uptime_secs: u64,
     /// User-defined labels for distinguishing multiple machines
     #[serde(default)]
     pub labels: HashMap<String, String>,
@@ -75,7 +81,8 @@ pub struct CpuSnapshot {
     pub logical_cores: u32,
     /// Number of physical cores (if available)
     pub physical_cores: Option<u32>,
-    /// Current frequency (MHz, optional)
+    /// Current frequency (MHz, optional). Refreshed on a slower cadence
+    /// than usage; may lag a few tens of seconds.
     pub frequency_mhz: Option<u64>,
 }
 
@@ -93,6 +100,12 @@ pub struct DiskSnapshot {
     pub name: String,
     pub mount_point: String,
     pub file_system: String,
+    /// Disk kind as reported by the OS: "SSD", "HDD", or "Unknown"
+    #[serde(default)]
+    pub kind: String,
+    /// Whether the volume is removable (USB, etc.)
+    #[serde(default)]
+    pub is_removable: bool,
     pub total_bytes: u64,
     pub available_bytes: u64,
     /// Read/write byte rates since the last sample (computed by diffing
@@ -108,6 +121,11 @@ pub struct NetworkSnapshot {
     pub transmitted_bytes_per_sec: u64,
     pub received_packets_per_sec: Option<u64>,
     pub transmitted_packets_per_sec: Option<u64>,
+    /// Receive/transmit error rates; None on the first sample
+    #[serde(default)]
+    pub received_errors_per_sec: Option<u64>,
+    #[serde(default)]
+    pub transmitted_errors_per_sec: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -117,8 +135,20 @@ pub struct ProcessSnapshot {
     pub cmd: String,
     pub cpu_usage_percent: f32,
     pub memory_bytes: u64,
+    /// Virtual address space size (when available)
+    #[serde(default)]
+    pub virtual_memory_bytes: u64,
+    /// Seconds the process has been running
+    #[serde(default)]
+    pub run_time_secs: u64,
     pub parent_pid: Option<u32>,
     pub status: String,
+    /// Per-process disk IO rates; None when process disk IO collection
+    /// is disabled or on the first sample for that pid
+    #[serde(default)]
+    pub read_bytes_per_sec: Option<u64>,
+    #[serde(default)]
+    pub write_bytes_per_sec: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

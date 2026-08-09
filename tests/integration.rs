@@ -50,18 +50,67 @@ fn local_collector_produces_sane_snapshot() {
     let processes = second.processes.as_ref().expect("processes enabled");
     assert!(!processes.is_empty());
     assert!(processes.len() <= max_processes);
-    // From the second sample on, rate metrics should have values
-    for disk in second.disks.as_ref().expect("disks enabled") {
-        assert!(disk.read_bytes_per_sec.is_some());
-        assert!(disk.write_bytes_per_sec.is_some());
-    }
-    assert!(second.networks.is_some());
+    // From the second sample on, rate metrics should have values. A disk or
+    // interface that appeared between the two samples has no diff baseline
+    // yet (None), so require at least one entry with rates — always true for
+    // pre-existing ones — instead of all
+    let disks = second.disks.as_ref().expect("disks enabled");
+    assert!(
+        disks
+            .iter()
+            .any(|d| d.read_bytes_per_sec.is_some() && d.write_bytes_per_sec.is_some())
+    );
     assert!(second.timestamp >= first.timestamp);
+    assert!(second.host.uptime_secs > 0);
+    let networks = second.networks.as_ref().expect("networks enabled");
+    assert!(networks.iter().any(|n| {
+        // Error rates should be Some (possibly 0) from the second sample on
+        n.received_errors_per_sec.is_some() && n.transmitted_errors_per_sec.is_some()
+    }));
+    for p in processes.iter() {
+        // Disk IO off by default
+        assert!(p.read_bytes_per_sec.is_none());
+        assert!(p.write_bytes_per_sec.is_none());
+    }
 
     // The snapshot round-trips through serialization
     let json = serde_json::to_string(&second).expect("serialize");
     let parsed: SystemSnapshot = serde_json::from_str(&json).expect("deserialize");
     assert_eq!(parsed.memory.total_bytes, second.memory.total_bytes);
+}
+
+#[test]
+fn process_disk_io_opt_in_and_disk_dedupe() {
+    let config = CollectorConfig {
+        collect_process_disk_io: true,
+        dedupe_disks: true,
+        ..Default::default()
+    };
+    let mut collector = LocalCollector::new(config);
+    let _ = collector.collect().expect("first");
+    std::thread::sleep(Duration::from_millis(300));
+    let second = collector.collect().expect("second");
+
+    let processes = second.processes.as_ref().expect("processes");
+    // At least one process should have rate fields (Some after second sample)
+    assert!(
+        processes
+            .iter()
+            .any(|p| p.read_bytes_per_sec.is_some() && p.write_bytes_per_sec.is_some()),
+        "process disk IO rates should be populated when enabled"
+    );
+
+    // Dedupe: no two disks should share the same device name
+    if let Some(disks) = &second.disks {
+        let mut names = std::collections::HashSet::new();
+        for d in disks {
+            assert!(
+                names.insert(d.name.clone()),
+                "duplicate disk name after dedupe: {}",
+                d.name
+            );
+        }
+    }
 }
 
 #[test]

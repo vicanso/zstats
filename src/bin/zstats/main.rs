@@ -17,6 +17,7 @@ mod alerts;
 #[cfg(unix)]
 mod daemon;
 mod render;
+mod settings;
 
 use std::io::IsTerminal;
 use std::process::ExitCode;
@@ -55,13 +56,26 @@ Options:
                            refresh processes every collect (default 15, 0 = off)
   --alert-cpu <pct>        serve: notify when a process averages at least this
                            CPU% (single-core units) over the last minute
-                           (default 30, 0 = off)
+                           (default 30, 0 = off). Repeat with name=pct for
+                           per-process overrides, e.g. --alert-cpu ghostty=100
   --alert-mem <pct>        serve: notify when a process's 1-minute average
                            share of total memory reaches this percentage
-                           (default 25, 0 = off)
+                           (default 25, 0 = off); also supports name=pct
   --alert-cooldown <secs>  serve: minimum time between repeated alerts for
                            the same process and rule (default 600)
+  --add-alert <spec>       Persist a per-process alert override to
+                           ~/.zstats/config.toml and exit. Spec is
+                           [cpu:|mem:]name=pct, e.g. ghostty=100 or
+                           mem:chrome=40; pct 0 disables that process.
+                           serve picks the file up on its next start
+  --remove-alert <spec>    Remove a persisted override ([cpu:|mem:]name;
+                           without a prefix removes both rules) and exit
+  --list-alerts            Show the persisted alert configuration and exit
   --max-processes <n>      Max number of processes to collect (default 50)
+  --process-disk-io        Also collect per-process disk read/write rates
+                           (off by default; adds cost to process refresh)
+  --no-dedupe-disks        Keep every mount point (default collapses APFS
+                           synthetic mounts that share a device name)
   -h, --help               Show this help
 ";
 
@@ -82,11 +96,16 @@ struct CliArgs {
     /// None = mode-dependent default (serve throttles to 10s, others
     /// refresh on every collect)
     process_interval: Option<Duration>,
-    /// Daemon alert thresholds; None disables the rule
-    alert_cpu: Option<f32>,
-    alert_mem_fraction: Option<f64>,
-    /// Minimum time between repeated alerts for the same process and rule
-    alert_cooldown: Duration,
+    /// Daemon alert thresholds. Outer `None` = flag not given (fall back
+    /// to the config file, then the builtin default); inner `None` = rule
+    /// explicitly disabled with 0. Overrides are per-process-name
+    /// exceptions from `name=pct` flag values
+    alert_cpu: Option<Option<f32>>,
+    alert_cpu_overrides: Vec<(String, Option<f32>)>,
+    alert_mem_fraction: Option<Option<f64>>,
+    alert_mem_overrides: Vec<(String, Option<f64>)>,
+    /// Minimum time between repeated alerts; None = not given on the CLI
+    alert_cooldown: Option<Duration>,
 }
 
 fn parse_args(raw: Vec<String>) -> Result<CliArgs, String> {
@@ -98,9 +117,11 @@ fn parse_args(raw: Vec<String>) -> Result<CliArgs, String> {
         history: Duration::from_secs(300),
         detach: false,
         process_interval: None,
-        alert_cpu: Some(30.0),
-        alert_mem_fraction: Some(0.25),
-        alert_cooldown: Duration::from_secs(600),
+        alert_cpu: None,
+        alert_cpu_overrides: Vec::new(),
+        alert_mem_fraction: None,
+        alert_mem_overrides: Vec::new(),
+        alert_cooldown: None,
     };
 
     let mut iter = raw.into_iter();
@@ -116,25 +137,56 @@ fn parse_args(raw: Vec<String>) -> Result<CliArgs, String> {
                 args.history = Duration::from_secs(secs);
             }
             "--alert-cpu" => {
-                let value = iter.next().ok_or("--alert-cpu requires a percentage")?;
-                let pct: f32 = value
-                    .parse()
-                    .map_err(|_| format!("invalid percentage: {value}"))?;
-                args.alert_cpu = if pct <= 0.0 { None } else { Some(pct) };
+                let value = iter
+                    .next()
+                    .ok_or("--alert-cpu requires a percentage or name=pct")?;
+                if let Some((name, pct)) = value.split_once('=') {
+                    let name = name.trim();
+                    if name.is_empty() {
+                        return Err(format!("invalid process name in: {value}"));
+                    }
+                    let pct: f32 = pct
+                        .parse()
+                        .map_err(|_| format!("invalid percentage: {value}"))?;
+                    args.alert_cpu_overrides
+                        .push((name.to_string(), if pct <= 0.0 { None } else { Some(pct) }));
+                } else {
+                    let pct: f32 = value
+                        .parse()
+                        .map_err(|_| format!("invalid percentage: {value}"))?;
+                    args.alert_cpu = Some(if pct <= 0.0 { None } else { Some(pct) });
+                }
             }
             "--alert-mem" => {
-                let value = iter.next().ok_or("--alert-mem requires a percentage")?;
-                let pct: f64 = value
-                    .parse()
-                    .map_err(|_| format!("invalid percentage: {value}"))?;
-                args.alert_mem_fraction = if pct <= 0.0 { None } else { Some(pct / 100.0) };
+                let value = iter
+                    .next()
+                    .ok_or("--alert-mem requires a percentage or name=pct")?;
+                if let Some((name, pct)) = value.split_once('=') {
+                    let name = name.trim();
+                    if name.is_empty() {
+                        return Err(format!("invalid process name in: {value}"));
+                    }
+                    let pct: f64 = pct
+                        .parse()
+                        .map_err(|_| format!("invalid percentage: {value}"))?;
+                    args.alert_mem_overrides.push((
+                        name.to_string(),
+                        if pct <= 0.0 { None } else { Some(pct / 100.0) },
+                    ));
+                } else {
+                    let pct: f64 = value
+                        .parse()
+                        .map_err(|_| format!("invalid percentage: {value}"))?;
+                    args.alert_mem_fraction =
+                        Some(if pct <= 0.0 { None } else { Some(pct / 100.0) });
+                }
             }
             "--alert-cooldown" => {
                 let value = iter.next().ok_or("--alert-cooldown requires seconds")?;
                 let secs: u64 = value
                     .parse()
                     .map_err(|_| format!("invalid cooldown: {value}"))?;
-                args.alert_cooldown = Duration::from_secs(secs);
+                args.alert_cooldown = Some(Duration::from_secs(secs));
             }
             "--process-boost" => {
                 let value = iter.next().ok_or("--process-boost requires a percentage")?;
@@ -179,6 +231,8 @@ fn parse_args(raw: Vec<String>) -> Result<CliArgs, String> {
                     .parse()
                     .map_err(|_| format!("invalid number: {value}"))?;
             }
+            "--process-disk-io" => args.config.collect_process_disk_io = true,
+            "--no-dedupe-disks" => args.config.dedupe_disks = false,
             "-h" | "--help" => {
                 print!("{USAGE}");
                 std::process::exit(0);
@@ -187,6 +241,155 @@ fn parse_args(raw: Vec<String>) -> Result<CliArgs, String> {
         }
     }
     Ok(args)
+}
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum AlertRule {
+    Cpu,
+    Mem,
+}
+
+/// Split an optional `cpu:` / `mem:` prefix off an alert spec; no prefix
+/// means the CPU rule
+fn split_alert_rule(spec: &str) -> (AlertRule, &str) {
+    if let Some(rest) = spec.strip_prefix("mem:") {
+        (AlertRule::Mem, rest)
+    } else if let Some(rest) = spec.strip_prefix("cpu:") {
+        (AlertRule::Cpu, rest)
+    } else {
+        (AlertRule::Cpu, spec)
+    }
+}
+
+/// Parse an `--add-alert` spec: `[cpu:|mem:]name=pct`
+fn parse_alert_spec(spec: &str) -> Result<(AlertRule, String, f64), String> {
+    let (rule, rest) = split_alert_rule(spec);
+    let (name, pct) = rest
+        .split_once('=')
+        .ok_or_else(|| format!("invalid spec: {spec} (expected [cpu:|mem:]name=pct)"))?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(format!("invalid spec: {spec} (empty process name)"));
+    }
+    let pct: f64 = pct
+        .trim()
+        .parse()
+        .map_err(|_| format!("invalid percentage in: {spec}"))?;
+    if pct < 0.0 {
+        return Err(format!("invalid percentage in: {spec} (must be >= 0)"));
+    }
+    Ok((rule, name.to_string(), pct))
+}
+
+/// Handle the persistent-config actions (`--add-alert`, `--remove-alert`,
+/// `--list-alerts`): apply them to ~/.zstats/config.toml and exit
+fn run_alert_config_actions(raw: &[String]) -> ExitCode {
+    let mut config = match settings::load() {
+        Ok(config) => config,
+        Err(e) => {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let mut modified = false;
+    let mut list = false;
+    let mut iter = raw.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--add-alert" => {
+                let Some(spec) = iter.next() else {
+                    eprintln!("--add-alert requires [cpu:|mem:]name=pct");
+                    return ExitCode::FAILURE;
+                };
+                match parse_alert_spec(spec) {
+                    Ok((AlertRule::Cpu, name, pct)) => {
+                        println!("cpu alert for {name}: {pct}%");
+                        config.alerts.cpu_overrides.insert(name, pct as f32);
+                    }
+                    Ok((AlertRule::Mem, name, pct)) => {
+                        println!("mem alert for {name}: {pct}%");
+                        config.alerts.mem_overrides.insert(name, pct);
+                    }
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+                modified = true;
+            }
+            "--remove-alert" => {
+                let Some(spec) = iter.next() else {
+                    eprintln!("--remove-alert requires [cpu:|mem:]name");
+                    return ExitCode::FAILURE;
+                };
+                let (explicit, name) = match spec.split_once(':') {
+                    Some(("cpu", name)) => (Some(AlertRule::Cpu), name),
+                    Some(("mem", name)) => (Some(AlertRule::Mem), name),
+                    _ => (None, spec.as_str()),
+                };
+                let mut removed = false;
+                if explicit != Some(AlertRule::Mem) {
+                    removed |= config.alerts.cpu_overrides.remove(name).is_some();
+                }
+                if explicit != Some(AlertRule::Cpu) {
+                    removed |= config.alerts.mem_overrides.remove(name).is_some();
+                }
+                if removed {
+                    println!("removed alert override for {name}");
+                    modified = true;
+                } else {
+                    println!("no alert override found for {name}");
+                }
+            }
+            "--list-alerts" => list = true,
+            other => {
+                eprintln!("cannot combine {other} with alert config actions (use -h for help)");
+                return ExitCode::FAILURE;
+            }
+        }
+    }
+
+    if modified {
+        if let Err(e) = settings::save(&config) {
+            eprintln!("{e}");
+            return ExitCode::FAILURE;
+        }
+        println!("saved to {}", settings::path().display());
+    }
+    if list {
+        let a = &config.alerts;
+        println!("alerts config ({}):", settings::path().display());
+        match a.cpu {
+            Some(p) if p > 0.0 => println!("  cpu default: {p}%"),
+            Some(_) => println!("  cpu default: off"),
+            None => println!("  cpu default: 30% (builtin)"),
+        }
+        match a.mem {
+            Some(p) if p > 0.0 => println!("  mem default: {p}%"),
+            Some(_) => println!("  mem default: off"),
+            None => println!("  mem default: 25% (builtin)"),
+        }
+        match a.cooldown_secs {
+            Some(s) => println!("  cooldown: {s}s"),
+            None => println!("  cooldown: 600s (builtin)"),
+        }
+        println!("  cpu overrides:");
+        if a.cpu_overrides.is_empty() {
+            println!("    (none)");
+        }
+        for (name, pct) in &a.cpu_overrides {
+            println!("    {name} = {pct}%");
+        }
+        println!("  mem overrides:");
+        if a.mem_overrides.is_empty() {
+            println!("    (none)");
+        }
+        for (name, pct) in &a.mem_overrides {
+            println!("    {name} = {pct}%");
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 fn format_snapshot(snapshot: &SystemSnapshot, format: OutputFormat) -> String {
@@ -459,6 +662,15 @@ fn main() -> ExitCode {
     }
 
     let mut raw: Vec<String> = std::env::args().skip(1).collect();
+
+    // Persistent-config actions are standalone: apply and exit
+    if raw
+        .iter()
+        .any(|a| a == "--add-alert" || a == "--remove-alert" || a == "--list-alerts")
+    {
+        return run_alert_config_actions(&raw);
+    }
+
     let subcommand = raw.first().filter(|a| !a.starts_with('-')).cloned();
     if subcommand.is_some() {
         raw.remove(0);
@@ -494,11 +706,52 @@ fn main() -> ExitCode {
                 return detach_self();
             }
             let mut extra_sinks: Vec<Arc<dyn MetricSink>> = Vec::new();
-            let alert_sink = alerts::AlertSink::new(
-                args.alert_cpu,
-                args.alert_mem_fraction,
-                args.alert_cooldown,
-            );
+            // Alert settings: CLI flags > config file > builtin defaults
+            let file = match settings::load() {
+                Ok(file) => file,
+                Err(e) => {
+                    eprintln!("{e}");
+                    return ExitCode::FAILURE;
+                }
+            };
+            let saved = file.alerts;
+
+            let cpu_default = match args.alert_cpu {
+                Some(explicit) => explicit,
+                None => match saved.cpu {
+                    Some(p) if p > 0.0 => Some(p),
+                    Some(_) => None,
+                    None => Some(30.0),
+                },
+            };
+            let mem_default = match args.alert_mem_fraction {
+                Some(explicit) => explicit,
+                None => match saved.mem {
+                    Some(p) if p > 0.0 => Some(p / 100.0),
+                    Some(_) => None,
+                    None => Some(0.25),
+                },
+            };
+            let cooldown = args
+                .alert_cooldown
+                .unwrap_or_else(|| Duration::from_secs(saved.cooldown_secs.unwrap_or(600)));
+
+            // CLI overrides go first: Thresholds returns the first name match
+            let mut cpu = alerts::Thresholds::new(cpu_default);
+            for (name, value) in args.alert_cpu_overrides {
+                cpu = cpu.with_override(name, value);
+            }
+            for (name, pct) in saved.cpu_overrides {
+                cpu = cpu.with_override(name, (pct > 0.0).then_some(pct));
+            }
+            let mut mem = alerts::Thresholds::new(mem_default);
+            for (name, value) in args.alert_mem_overrides {
+                mem = mem.with_override(name, value);
+            }
+            for (name, pct) in saved.mem_overrides {
+                mem = mem.with_override(name, (pct > 0.0).then_some(pct / 100.0));
+            }
+            let alert_sink = alerts::AlertSink::new(cpu, mem, cooldown);
             if alert_sink.enabled() {
                 extra_sinks.push(Arc::new(alert_sink));
             }

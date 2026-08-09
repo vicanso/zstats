@@ -21,7 +21,11 @@ runtime = [
 # CLI tool (the bin is bound to this feature via required-features)
 cli = [
     "runtime",
+    "dep:libc",
     "dep:unicode-width",
+    "tokio/io-std",
+    "tokio/io-util",
+    "tokio/net",
     "tokio/rt-multi-thread",
     "tokio/signal",
 ]
@@ -36,6 +40,9 @@ sysinfo = "0.39.6"
 tokio = { version = "1.53.1", optional = true }
 tracing = { version = "0.1.44", optional = true }
 unicode-width = { version = "0.2", optional = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

@@ -32,6 +32,18 @@ pub struct CollectorConfig {
     /// averaged over the longer window (smoother rankings)
     pub process_refresh_interval: Duration,
 
+    /// While overall CPU usage is at or above this percentage, the process
+    /// list refreshes on every collect regardless of
+    /// `process_refresh_interval` — busy periods get precise per-process
+    /// attribution, idle periods stay cheap. None disables the boost.
+    ///
+    /// The default (15%) targets personal-device monitoring: on a 12-core
+    /// machine it means roughly two cores' worth of sustained work. For
+    /// server-style monitoring a higher value (e.g. 50%) fits better —
+    /// note the threshold is a share of ALL cores, so the same percentage
+    /// is more sensitive on machines with fewer cores
+    pub process_boost_cpu_percent: Option<f32>,
+
     /// Max number of processes to keep. The budget is split between the
     /// top-by-CPU and top-by-memory rankings so that both views stay
     /// meaningful; the returned list is sorted by CPU desc
@@ -66,6 +78,7 @@ impl Default for CollectorConfig {
         Self {
             collect_processes: true,
             process_refresh_interval: Duration::ZERO,
+            process_boost_cpu_percent: Some(15.0),
             max_processes: 50,
             per_core_cpu: true,
             collect_disks: true,

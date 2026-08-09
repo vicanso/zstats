@@ -110,9 +110,9 @@ impl LocalCollector {
         }
     }
 
+    /// Refresh the throttleable subsystems (CPU/memory are refreshed
+    /// directly in `collect`, before this runs)
     fn refresh(&mut self, refresh_processes: bool) {
-        self.system.refresh_cpu_all();
-        self.system.refresh_memory();
         if refresh_processes {
             // Explicit refresh kind: the `refresh_processes` shortcut does
             // NOT fetch cmd (and wastes time on disk_usage/exe we don't
@@ -330,6 +330,11 @@ impl LocalCollector {
     }
 }
 
+/// Whether high overall CPU usage should force a process refresh this round
+fn process_boost_active(threshold: Option<f32>, cpu_usage: f32) -> bool {
+    threshold.is_some_and(|t| cpu_usage >= t)
+}
+
 fn by_cpu_then_memory(a: &ProcessSnapshot, b: &ProcessSnapshot) -> std::cmp::Ordering {
     b.cpu_usage_percent
         .total_cmp(&a.cpu_usage_percent)
@@ -355,10 +360,20 @@ fn select_top_processes(mut processes: Vec<ProcessSnapshot>, max: usize) -> Vec<
 
 impl Collector for LocalCollector {
     fn collect(&mut self) -> Result<SystemSnapshot, CollectError> {
+        // CPU and memory refresh first (they cost microseconds): the fresh
+        // global CPU usage then decides whether the process boost kicks in
+        self.system.refresh_cpu_all();
+        self.system.refresh_memory();
+
+        let boost = process_boost_active(
+            self.config.process_boost_cpu_percent,
+            self.system.global_cpu_usage(),
+        );
         let processes_due = self.config.collect_processes
-            && self
-                .last_process_refresh
-                .is_none_or(|t| t.elapsed() >= self.config.process_refresh_interval);
+            && (boost
+                || self
+                    .last_process_refresh
+                    .is_none_or(|t| t.elapsed() >= self.config.process_refresh_interval));
         self.refresh(processes_due);
 
         let elapsed = self.last_collect_time.map(|t| t.elapsed());
@@ -396,6 +411,14 @@ mod tests {
             parent_pid: None,
             status: "Runnable".into(),
         }
+    }
+
+    #[test]
+    fn boost_activates_at_threshold() {
+        assert!(process_boost_active(Some(50.0), 62.0));
+        assert!(process_boost_active(Some(50.0), 50.0));
+        assert!(!process_boost_active(Some(50.0), 12.0));
+        assert!(!process_boost_active(None, 99.0));
     }
 
     #[test]

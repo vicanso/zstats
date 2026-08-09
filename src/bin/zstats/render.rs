@@ -190,6 +190,25 @@ fn write_table(
     }
 }
 
+/// Enter the live-view screen (alternate screen + hidden cursor) when
+/// stdout is a TTY; returns whether it did
+pub fn enter_live_screen() -> bool {
+    let interactive = std::io::stdout().is_terminal();
+    if interactive {
+        print!("\x1b[?1049h\x1b[?25l\x1b[H");
+        let _ = std::io::stdout().flush();
+    }
+    interactive
+}
+
+/// Restore the terminal after [`enter_live_screen`]
+pub fn leave_live_screen(entered: bool) {
+    if entered {
+        print!("\x1b[?25h\x1b[?1049l");
+        let _ = std::io::stdout().flush();
+    }
+}
+
 pub fn render(s: &SystemSnapshot) -> String {
     render_with(s, None, Theme::plain())
 }
@@ -482,6 +501,8 @@ pub struct TextSink {
     history: Mutex<HashMap<u32, VecDeque<ProcSample>>>,
     /// On a TTY: enable colors and repaint in place instead of scrolling
     interactive: bool,
+    /// Optional dim footer line (e.g. key hints in watch mode)
+    footer: Option<String>,
 }
 
 impl TextSink {
@@ -489,6 +510,22 @@ impl TextSink {
         Self {
             history: Mutex::new(HashMap::new()),
             interactive: std::io::stdout().is_terminal(),
+            footer: None,
+        }
+    }
+
+    pub fn with_footer(mut self, footer: &str) -> Self {
+        self.footer = Some(footer.to_string());
+        self
+    }
+
+    /// Record a snapshot into the rolling averages without rendering it —
+    /// used to warm up from daemon history on attach. Samples are stamped
+    /// with the absorb time, so a replayed backlog initially counts toward
+    /// the window as if it had just been observed
+    pub fn absorb(&self, snapshot: &SystemSnapshot) {
+        if let Some(processes) = snapshot.processes.as_deref() {
+            let _ = self.averages(processes);
         }
     }
 
@@ -530,7 +567,11 @@ impl MetricSink for TextSink {
         let theme = Theme {
             enabled: self.interactive,
         };
-        let frame = render_with(snapshot, averages.as_ref(), theme);
+        let mut frame = render_with(snapshot, averages.as_ref(), theme);
+        if let Some(footer) = &self.footer {
+            frame.push_str(&theme.paint(DIM, footer));
+            frame.push('\n');
+        }
 
         if self.interactive {
             // Repaint in place: cursor home, clear each line's tail as we

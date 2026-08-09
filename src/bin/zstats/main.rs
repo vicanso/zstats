@@ -54,8 +54,10 @@ Options:
   --no-networks            Skip network collection
   --process-interval <ms>  Process list refresh cadence; 0 = every collect
                            (default: 0, but serve defaults to 10000)
-  --process-boost <pct>    While overall CPU is at or above this percentage,
-                           refresh processes every collect (default 15, 0 = off)
+  --process-boost <cores>  While overall load is at least this many logical
+                           cores of work, refresh processes every collect
+                           (default 1, 0 = off). Scales with CPU count:
+                           1 core ≈ 25% overall on 4U, ~1.6% on 64U
   --alert-cpu <pct>        serve: notify when a process averages at least this
                            CPU% (single-core units) over the last minute
                            (default 30, 0 = off). Repeat with name=pct for
@@ -191,11 +193,13 @@ fn parse_args(raw: Vec<String>) -> Result<CliArgs, String> {
                 args.alert_cooldown = Some(Duration::from_secs(secs));
             }
             "--process-boost" => {
-                let value = iter.next().ok_or("--process-boost requires a percentage")?;
-                let pct: f32 = value
+                let value = iter
+                    .next()
+                    .ok_or("--process-boost requires a core count (e.g. 1 or 2.5)")?;
+                let cores: f32 = value
                     .parse()
-                    .map_err(|_| format!("invalid percentage: {value}"))?;
-                args.config.process_boost_cpu_percent = if pct <= 0.0 { None } else { Some(pct) };
+                    .map_err(|_| format!("invalid core count: {value}"))?;
+                args.config.process_boost_cpu_cores = if cores <= 0.0 { None } else { Some(cores) };
             }
             "--process-interval" => {
                 let value = iter

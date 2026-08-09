@@ -119,7 +119,7 @@ fn process_refresh_interval_reuses_cached_list() {
         // Effectively never due again within this test; the CPU boost must
         // be off too, or a busy test machine would force a refresh
         process_refresh_interval: Duration::from_secs(3600),
-        process_boost_cpu_percent: None,
+        process_boost_cpu_cores: None,
         ..Default::default()
     };
     let mut collector = LocalCollector::new(config);

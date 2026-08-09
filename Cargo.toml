@@ -2,8 +2,8 @@
 name = "zstats"
 version = "0.1.0"
 edition = "2024"
-# edition 2024 stabilized in Rust 1.85
-rust-version = "1.85"
+# sysinfo 0.39 requires Rust 1.95+
+rust-version = "1.95.0"
 license = "Apache-2.0"
 description = "Unified, extensible core for system performance metrics collection (embeddable as a library or runnable as a CLI tool)"
 repository = "https://github.com/vicanso/zstats"

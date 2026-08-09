@@ -6,7 +6,7 @@ cost tunable down to tray-app levels.
 
 ## Install
 
-Requires Rust **1.85+** (edition 2024).
+Requires Rust **1.95+** (MSRV; driven by sysinfo 0.39).
 
 ```bash
 # from crates.io (after the crate is published)
@@ -111,7 +111,7 @@ expensive subsystems are opt-out and throttled (`CollectorConfig`):
 | `dedupe_disks` | `true` | Keep one entry per device name (shortest mount); collapses APFS synthetic mounts |
 | `cpu_frequency_refresh_interval` | 30s | CPU frequency refreshes on its own cadence; usage still every collect |
 | `process_refresh_interval` | 0 (every collect) | Throttle the process list; the last list is reused between refreshes |
-| `process_boost_cpu_percent` | 15% | While overall CPU is at or above this, the process list refreshes every collect for precise attribution |
+| `process_boost_cpu_cores` | 1.0 | While overall load is ≥ this many logical cores of work, the process list refreshes every collect (scales with CPU count; 0/None = off) |
 | `collect_process_disk_io` | `false` | Per-process read/write byte rates (extra refresh cost when on) |
 | `max_processes` | 50 | Kept processes; the budget is split between top-by-CPU and top-by-memory so idle memory hogs stay visible |
 | `collect_timeout` | 2s | Enforced by the Scheduler around each collect |

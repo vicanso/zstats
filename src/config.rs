@@ -32,17 +32,22 @@ pub struct CollectorConfig {
     /// averaged over the longer window (smoother rankings)
     pub process_refresh_interval: Duration,
 
-    /// While overall CPU usage is at or above this percentage, the process
-    /// list refreshes on every collect regardless of
+    /// While overall CPU load is at or above this many *logical cores* of
+    /// work, the process list refreshes on every collect regardless of
     /// `process_refresh_interval` — busy periods get precise per-process
     /// attribution, idle periods stay cheap. None disables the boost.
     ///
-    /// The default (15%) targets personal-device monitoring: on a 12-core
-    /// machine it means roughly two cores' worth of sustained work. For
-    /// server-style monitoring a higher value (e.g. 50%) fits better —
-    /// note the threshold is a share of ALL cores, so the same percentage
-    /// is more sensitive on machines with fewer cores
-    pub process_boost_cpu_percent: Option<f32>,
+    /// Units match per-process CPU% (single-core units): `1.0` means "at
+    /// least one full core busy". The effective overall-usage threshold is
+    /// therefore `cores / logical_cores * 100`, so the same setting scales
+    /// across machine sizes:
+    /// - 4 cores, threshold 1.0 → boost at ≥ 25% overall
+    /// - 64 cores, threshold 1.0 → boost at ≥ ~1.6% overall
+    ///
+    /// Default `Some(1.0)` catches a single busy process on both laptops
+    /// and big servers. Raise it (e.g. 4.0) when baseline load is high and
+    /// you want fewer forced process refreshes.
+    pub process_boost_cpu_cores: Option<f32>,
 
     /// Max number of processes to keep. The budget is split between the
     /// top-by-CPU and top-by-memory rankings so that both views stay
@@ -94,7 +99,7 @@ impl Default for CollectorConfig {
         Self {
             collect_processes: true,
             process_refresh_interval: Duration::ZERO,
-            process_boost_cpu_percent: Some(15.0),
+            process_boost_cpu_cores: Some(1.0),
             max_processes: 50,
             collect_process_disk_io: false,
             per_core_cpu: true,

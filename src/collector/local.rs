@@ -473,9 +473,24 @@ impl LocalCollector {
     }
 }
 
-/// Whether high overall CPU usage should force a process refresh this round
-fn process_boost_active(threshold: Option<f32>, cpu_usage: f32) -> bool {
-    threshold.is_some_and(|t| cpu_usage >= t)
+/// Whether overall load (in logical-core units) should force a process
+/// refresh this round.
+///
+/// `cpu_usage_percent` is sysinfo's global usage (0..=100 over *all* cores).
+/// Converting to core-units: `logical_cores * usage / 100`.
+fn process_boost_active(
+    threshold_cores: Option<f32>,
+    cpu_usage_percent: f32,
+    logical_cores: u32,
+) -> bool {
+    let Some(threshold) = threshold_cores else {
+        return false;
+    };
+    if logical_cores == 0 || !threshold.is_finite() || threshold <= 0.0 {
+        return false;
+    }
+    let busy_cores = logical_cores as f32 * (cpu_usage_percent / 100.0);
+    busy_cores >= threshold
 }
 
 fn by_cpu_then_memory(a: &ProcKey, b: &ProcKey) -> std::cmp::Ordering {
@@ -526,9 +541,11 @@ impl Collector for LocalCollector {
         self.refresh_cpu();
         self.system.refresh_memory();
 
+        let logical_cores = self.system.cpus().len() as u32;
         let boost = process_boost_active(
-            self.config.process_boost_cpu_percent,
+            self.config.process_boost_cpu_cores,
             self.system.global_cpu_usage(),
+            logical_cores,
         );
         let processes_due = self.config.collect_processes
             && (boost
@@ -567,11 +584,19 @@ mod tests {
     }
 
     #[test]
-    fn boost_activates_at_threshold() {
-        assert!(process_boost_active(Some(50.0), 62.0));
-        assert!(process_boost_active(Some(50.0), 50.0));
-        assert!(!process_boost_active(Some(50.0), 12.0));
-        assert!(!process_boost_active(None, 99.0));
+    fn boost_uses_core_units_not_raw_percent() {
+        // 1.0 core busy: 25% overall on 4 cores, ~1.56% on 64 cores
+        assert!(process_boost_active(Some(1.0), 25.0, 4));
+        assert!(process_boost_active(Some(1.0), 100.0 / 64.0, 64)); // exactly 1 core
+        assert!(!process_boost_active(Some(1.0), 10.0, 4));
+        // 15% overall is only ~0.6 cores on 4U, but ~9.6 cores on 64U
+        assert!(!process_boost_active(Some(1.0), 15.0, 4));
+        assert!(process_boost_active(Some(1.0), 15.0, 64));
+        assert!(process_boost_active(Some(2.0), 50.0, 4));
+        assert!(!process_boost_active(Some(2.0), 40.0, 4));
+        assert!(!process_boost_active(None, 99.0, 64));
+        assert!(!process_boost_active(Some(1.0), 100.0, 0));
+        assert!(!process_boost_active(Some(0.0), 100.0, 8));
     }
 
     #[test]

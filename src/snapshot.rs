@@ -36,13 +36,13 @@ pub struct SystemSnapshot {
     /// Memory metrics
     pub memory: MemorySnapshot,
 
-    /// Disk metrics (possibly multiple)
-    pub disks: Vec<DiskSnapshot>,
+    /// Disk metrics; None when disk collection is disabled
+    pub disks: Option<Vec<DiskSnapshot>>,
 
-    /// Network metrics (possibly multiple interfaces)
-    pub networks: Vec<NetworkSnapshot>,
+    /// Network metrics; None when network collection is disabled
+    pub networks: Option<Vec<NetworkSnapshot>>,
 
-    /// Process list (optional, collection is configurable)
+    /// Process list; None when process collection is disabled
     pub processes: Option<Vec<ProcessSnapshot>>,
 
     /// Load averages

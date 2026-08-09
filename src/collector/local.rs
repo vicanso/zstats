@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
-use sysinfo::{Disks, Networks, ProcessesToUpdate, System};
+use sysinfo::{Disks, Networks, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 use crate::collector::Collector;
 use crate::config::CollectorConfig;
@@ -72,11 +72,25 @@ impl LocalCollector {
             labels: config.labels.clone(),
         };
 
+        // Skip building refreshed lists for disabled subsystems: the initial
+        // enumeration itself is costly (disks are the most expensive refresh
+        // on some platforms)
+        let disks = if config.collect_disks {
+            Disks::new_with_refreshed_list()
+        } else {
+            Disks::new()
+        };
+        let networks = if config.collect_networks {
+            Networks::new_with_refreshed_list()
+        } else {
+            Networks::new()
+        };
+
         Self {
             config,
             system,
-            disks: Disks::new_with_refreshed_list(),
-            networks: Networks::new_with_refreshed_list(),
+            disks,
+            networks,
             host,
             last_disk_counters: HashMap::new(),
             last_net_counters: HashMap::new(),
@@ -88,10 +102,25 @@ impl LocalCollector {
         self.system.refresh_cpu_all();
         self.system.refresh_memory();
         if self.config.collect_processes {
-            self.system.refresh_processes(ProcessesToUpdate::All, true);
+            // Explicit refresh kind: the `refresh_processes` shortcut does
+            // NOT fetch cmd (and wastes time on disk_usage/exe we don't
+            // expose). cmd is immutable per process, so OnlyIfNotSet
+            // fetches it exactly once per process
+            self.system.refresh_processes_specifics(
+                ProcessesToUpdate::All,
+                true,
+                ProcessRefreshKind::nothing()
+                    .with_memory()
+                    .with_cpu()
+                    .with_cmd(UpdateKind::OnlyIfNotSet),
+            );
         }
-        self.disks.refresh(true);
-        self.networks.refresh(true);
+        if self.config.collect_disks {
+            self.disks.refresh(true);
+        }
+        if self.config.collect_networks {
+            self.networks.refresh(true);
+        }
     }
 
     fn collect_cpu(&self) -> CpuSnapshot {
@@ -123,7 +152,11 @@ impl LocalCollector {
         }
     }
 
-    fn collect_disks(&mut self, elapsed: Option<Duration>) -> Vec<DiskSnapshot> {
+    fn collect_disks(&mut self, elapsed: Option<Duration>) -> Option<Vec<DiskSnapshot>> {
+        if !self.config.collect_disks {
+            return None;
+        }
+
         let mut snapshots = Vec::new();
         let mut counters = HashMap::new();
 
@@ -169,10 +202,14 @@ impl LocalCollector {
 
         // Replace wholesale so counters of removed disks are pruned automatically
         self.last_disk_counters = counters;
-        snapshots
+        Some(snapshots)
     }
 
-    fn collect_networks(&mut self, elapsed: Option<Duration>) -> Vec<NetworkSnapshot> {
+    fn collect_networks(&mut self, elapsed: Option<Duration>) -> Option<Vec<NetworkSnapshot>> {
+        if !self.config.collect_networks {
+            return None;
+        }
+
         let mut snapshots = Vec::new();
         let mut counters = HashMap::new();
 
@@ -222,7 +259,7 @@ impl LocalCollector {
         }
 
         self.last_net_counters = counters;
-        snapshots
+        Some(snapshots)
     }
 
     fn collect_processes(&self) -> Option<Vec<ProcessSnapshot>> {

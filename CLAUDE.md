@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-zstats is a system performance metrics collection library + CLI tool (Rust, edition 2024). The design spec lives in `collector-core-design.md` — note the crate is named `collector-core` there, but the code was merged into the single `zstats` crate (lib + bin); the API matches the spec.
+zstats is a system performance metrics collection library + CLI tool (Rust, edition 2024). The design spec lives in `collector-core-design.md` — note the crate is named `collector-core` there, but the code was merged into the single `zstats` crate (lib + bin). The API follows the spec with one deviation: disk, network, and process collection are each toggleable in `CollectorConfig`, so their snapshot fields are all `Option<Vec<_>>` (`None` means "not collected", not "none found"; the spec has plain `Vec` for disks/networks). CPU, memory, and load are always collected — they cost only microseconds, whereas disks are the most expensive refresh (~20ms on macOS) and processes come second.
 
 The module's scope is **collecting local machine data only**: the "remote Collector (pulling snapshots from other machines via gRPC/HTTP)" extension mentioned in section 12 of the design doc has been explicitly rejected — do not design abstractions or features for it.
 

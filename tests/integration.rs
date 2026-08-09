@@ -35,7 +35,7 @@ fn local_collector_produces_sane_snapshot() {
     assert!(first.cpu.logical_cores > 0);
     assert!(!first.host.hostname.is_empty());
     // The first sample has no diff baseline; rates should be None
-    for disk in &first.disks {
+    for disk in first.disks.as_ref().expect("disks enabled") {
         assert!(disk.read_bytes_per_sec.is_none());
         assert!(disk.write_bytes_per_sec.is_none());
     }
@@ -51,10 +51,11 @@ fn local_collector_produces_sane_snapshot() {
     assert!(!processes.is_empty());
     assert!(processes.len() <= max_processes);
     // From the second sample on, rate metrics should have values
-    for disk in &second.disks {
+    for disk in second.disks.as_ref().expect("disks enabled") {
         assert!(disk.read_bytes_per_sec.is_some());
         assert!(disk.write_bytes_per_sec.is_some());
     }
+    assert!(second.networks.is_some());
     assert!(second.timestamp >= first.timestamp);
 
     // The snapshot round-trips through serialization
@@ -68,6 +69,8 @@ fn config_toggles_are_respected() {
     let config = CollectorConfig {
         collect_processes: false,
         per_core_cpu: false,
+        collect_disks: false,
+        collect_networks: false,
         ..Default::default()
     };
     let mut collector = LocalCollector::new(config);
@@ -75,6 +78,8 @@ fn config_toggles_are_respected() {
 
     assert!(snapshot.processes.is_none());
     assert!(snapshot.cpu.per_core_usage.is_empty());
+    assert!(snapshot.disks.is_none());
+    assert!(snapshot.networks.is_none());
 }
 
 struct FailingSink;

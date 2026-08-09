@@ -20,6 +20,7 @@ use std::time::Duration;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CollectorConfig {
     /// Whether to collect process info (relatively expensive)
     pub collect_processes: bool,
@@ -30,6 +31,13 @@ pub struct CollectorConfig {
 
     /// Whether to collect per-core CPU usage
     pub per_core_cpu: bool,
+
+    /// Whether to collect disk metrics (volume enumeration is the most
+    /// expensive refresh on some platforms, e.g. ~20ms on macOS)
+    pub collect_disks: bool,
+
+    /// Whether to collect network interface metrics
+    pub collect_networks: bool,
 
     /// Custom host labels
     pub labels: HashMap<String, String>,
@@ -44,6 +52,8 @@ impl Default for CollectorConfig {
             collect_processes: true,
             max_processes: 50,
             per_core_cpu: true,
+            collect_disks: true,
+            collect_networks: true,
             labels: HashMap::new(),
             collect_timeout: Duration::from_secs(2),
         }

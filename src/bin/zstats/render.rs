@@ -23,6 +23,66 @@ use zstats::{MetricSink, SinkError, SystemSnapshot, async_trait};
 /// Max number of processes to display
 const TOP_PROCESSES: usize = 5;
 
+/// Max display width (in chars) of the process command line
+const CMD_MAX_WIDTH: usize = 50;
+
+/// Width of the section label column ("HOST  ", "DISK  ", ...)
+const LABEL_WIDTH: usize = 6;
+
+enum Align {
+    Left,
+    Right,
+}
+
+/// Write a section as an aligned table: a header row prefixed by the section
+/// label, then one indented row per entry. Column widths are computed from
+/// the actual data; numeric columns should be right-aligned.
+fn write_table(
+    out: &mut String,
+    label: &str,
+    headers: &[&str],
+    aligns: &[Align],
+    rows: &[Vec<String>],
+) {
+    if rows.is_empty() {
+        return;
+    }
+
+    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
+    for row in rows {
+        for (i, cell) in row.iter().enumerate() {
+            widths[i] = widths[i].max(cell.len());
+        }
+    }
+
+    let render_row = |cells: &[&str]| -> String {
+        let mut line = String::new();
+        for (i, cell) in cells.iter().enumerate() {
+            if i > 0 {
+                line.push_str("  ");
+            }
+            let width = widths[i];
+            match aligns[i] {
+                Align::Right => {
+                    let _ = write!(line, "{cell:>width$}");
+                }
+                // Left-aligned last column: no trailing padding
+                Align::Left if i == cells.len() - 1 => line.push_str(cell),
+                Align::Left => {
+                    let _ = write!(line, "{cell:<width$}");
+                }
+            }
+        }
+        line
+    };
+
+    let _ = writeln!(out, "{label:<LABEL_WIDTH$}{}", render_row(headers));
+    for row in rows {
+        let cells: Vec<&str> = row.iter().map(String::as_str).collect();
+        let _ = writeln!(out, "{:<LABEL_WIDTH$}{}", "", render_row(&cells));
+    }
+}
+
 pub fn render(s: &SystemSnapshot) -> String {
     let mut out = String::new();
 
@@ -64,51 +124,96 @@ pub fn render(s: &SystemSnapshot) -> String {
         human_bytes(s.memory.swap_total_bytes),
     );
 
-    for disk in &s.disks {
-        let _ = writeln!(
-            out,
-            "DISK  {}  {}  free {} / {}  R {}  W {}",
-            disk.name,
-            disk.mount_point,
-            human_bytes(disk.available_bytes),
-            human_bytes(disk.total_bytes),
-            human_rate(disk.read_bytes_per_sec),
-            human_rate(disk.write_bytes_per_sec),
+    if let Some(disks) = &s.disks {
+        let rows: Vec<Vec<String>> = disks
+            .iter()
+            .map(|d| {
+                vec![
+                    d.name.clone(),
+                    d.mount_point.clone(),
+                    human_bytes(d.available_bytes),
+                    human_bytes(d.total_bytes),
+                    human_rate(d.read_bytes_per_sec),
+                    human_rate(d.write_bytes_per_sec),
+                ]
+            })
+            .collect();
+        write_table(
+            &mut out,
+            "DISK",
+            &["NAME", "MOUNT", "FREE", "TOTAL", "READ", "WRITE"],
+            &[
+                Align::Left,
+                Align::Left,
+                Align::Right,
+                Align::Right,
+                Align::Right,
+                Align::Right,
+            ],
+            &rows,
         );
     }
 
-    // Only show interfaces with traffic to avoid a wall of idle utun/lo entries
-    let active: Vec<_> = s
-        .networks
-        .iter()
-        .filter(|n| n.received_bytes_per_sec > 0 || n.transmitted_bytes_per_sec > 0)
-        .collect();
-    if active.is_empty() {
-        let _ = writeln!(out, "NET   (no active interfaces)");
-    } else {
-        for net in active {
-            let _ = writeln!(
-                out,
-                "NET   {}  rx {}  tx {}",
-                net.interface,
-                human_rate(Some(net.received_bytes_per_sec)),
-                human_rate(Some(net.transmitted_bytes_per_sec)),
+    if let Some(networks) = &s.networks {
+        // Only show interfaces with traffic to avoid a wall of idle utun/lo entries
+        let rows: Vec<Vec<String>> = networks
+            .iter()
+            .filter(|n| n.received_bytes_per_sec > 0 || n.transmitted_bytes_per_sec > 0)
+            .map(|n| {
+                vec![
+                    n.interface.clone(),
+                    human_rate(Some(n.received_bytes_per_sec)),
+                    human_rate(Some(n.transmitted_bytes_per_sec)),
+                ]
+            })
+            .collect();
+        if rows.is_empty() {
+            let _ = writeln!(out, "NET   (no active interfaces)");
+        } else {
+            write_table(
+                &mut out,
+                "NET",
+                &["IFACE", "RX", "TX"],
+                &[Align::Left, Align::Right, Align::Right],
+                &rows,
             );
         }
     }
 
     if let Some(processes) = &s.processes {
-        let _ = writeln!(out, "TOP   {:>7}  {:>6}  {:>9}  NAME", "PID", "CPU%", "MEM");
-        for p in processes.iter().take(TOP_PROCESSES) {
-            let _ = writeln!(
-                out,
-                "      {:>7}  {:>6.1}  {:>9}  {}",
-                p.pid,
-                p.cpu_usage_percent,
-                human_bytes(p.memory_bytes),
-                p.name,
-            );
-        }
+        let rows: Vec<Vec<String>> = processes
+            .iter()
+            .take(TOP_PROCESSES)
+            .map(|p| {
+                // cmd can be empty (e.g. no permission to read other users'
+                // processes); fall back to "-" so the column stays readable
+                let cmd = if p.cmd.is_empty() {
+                    "-".to_string()
+                } else {
+                    truncate_chars(&p.cmd, CMD_MAX_WIDTH)
+                };
+                vec![
+                    p.pid.to_string(),
+                    format!("{:.1}", p.cpu_usage_percent),
+                    human_bytes(p.memory_bytes),
+                    p.name.clone(),
+                    cmd,
+                ]
+            })
+            .collect();
+        write_table(
+            &mut out,
+            "TOP",
+            &["PID", "CPU%", "MEM", "NAME", "CMD"],
+            &[
+                Align::Right,
+                Align::Right,
+                Align::Right,
+                Align::Left,
+                Align::Left,
+            ],
+            &rows,
+        );
     }
 
     out
@@ -135,6 +240,16 @@ fn human_rate(rate: Option<u64>) -> String {
         Some(v) => format!("{}/s", human_bytes(v)),
         None => "-".to_string(),
     }
+}
+
+/// Truncate to at most `max` chars, appending an ellipsis when cut
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.chars().count() <= max {
+        return s.to_string();
+    }
+    let mut truncated: String = s.chars().take(max.saturating_sub(1)).collect();
+    truncated.push('…');
+    truncated
 }
 
 /// Sink that prints text output in watch mode
@@ -168,5 +283,41 @@ mod tests {
     fn human_rate_missing_baseline() {
         assert_eq!(human_rate(None), "-");
         assert_eq!(human_rate(Some(1024)), "1.0 KiB/s");
+    }
+
+    #[test]
+    fn table_columns_align() {
+        let mut out = String::new();
+        write_table(
+            &mut out,
+            "NET",
+            &["IFACE", "RX", "TX"],
+            &[Align::Left, Align::Right, Align::Right],
+            &[
+                vec!["en0".into(), "13.1 KiB/s".into(), "14.8 KiB/s".into()],
+                vec!["bridge100".into(), "3.4 KiB/s".into(), "358 B/s".into()],
+            ],
+        );
+        let expected = "\
+NET   IFACE              RX          TX
+      en0        13.1 KiB/s  14.8 KiB/s
+      bridge100   3.4 KiB/s     358 B/s
+";
+        assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn truncate_chars_respects_char_boundaries() {
+        assert_eq!(truncate_chars("short", 10), "short");
+        assert_eq!(truncate_chars("abcdef", 4), "abc…");
+        // Multi-byte chars must not be cut mid-codepoint
+        assert_eq!(truncate_chars("ééééé", 3), "éé…");
+    }
+
+    #[test]
+    fn empty_table_writes_nothing() {
+        let mut out = String::new();
+        write_table(&mut out, "DISK", &["NAME"], &[Align::Left], &[]);
+        assert!(out.is_empty());
     }
 }

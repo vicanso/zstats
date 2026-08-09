@@ -37,6 +37,8 @@ Options:
   --json              Output as JSON (single line, machine-friendly)
   --pretty            Output as pretty-printed JSON (implies --json)
   --no-processes      Skip process collection
+  --no-disks          Skip disk collection
+  --no-networks       Skip network collection
   --max-processes <n> Max number of processes to collect (default 50)
   -h, --help          Show this help
 ";
@@ -74,6 +76,8 @@ fn parse_args() -> Result<CliArgs, String> {
             }
             "--pretty" => args.format = OutputFormat::JsonPretty,
             "--no-processes" => args.config.collect_processes = false,
+            "--no-disks" => args.config.collect_disks = false,
+            "--no-networks" => args.config.collect_networks = false,
             "--interval" => {
                 let value = iter
                     .next()

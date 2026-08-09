@@ -19,6 +19,121 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+/// Parse a human-friendly duration: `"500ms"`, `"2s"`, `"5m"`, `"1h"`,
+/// or a bare integer meaning milliseconds
+pub fn parse_duration(value: &str) -> Result<Duration, String> {
+    let v = value.trim();
+    if v.is_empty() {
+        return Err("empty duration".into());
+    }
+    if v.chars().all(|c| c.is_ascii_digit()) {
+        let ms: u64 = v
+            .parse()
+            .map_err(|_| format!("invalid duration: {value}"))?;
+        return Ok(Duration::from_millis(ms));
+    }
+    let unit_start = v
+        .find(|c: char| !c.is_ascii_digit())
+        .expect("checked: not all digits");
+    let (number, unit) = v.split_at(unit_start);
+    let n: u64 = number
+        .parse()
+        .map_err(|_| format!("invalid duration: {value}"))?;
+    let ms = match unit.trim() {
+        "ms" => n,
+        "s" => n * 1_000,
+        "m" => n * 60_000,
+        "h" => n * 3_600_000,
+        other => {
+            return Err(format!(
+                "invalid duration unit: {other} (use ms, s, m or h)"
+            ));
+        }
+    };
+    Ok(Duration::from_millis(ms))
+}
+
+/// The most compact exact representation: `1h`, `5m`, `90s`, `1500ms`
+pub fn format_duration(duration: Duration) -> String {
+    let ms = duration.as_millis() as u64;
+    if ms == 0 {
+        return "0s".to_string();
+    }
+    if ms.is_multiple_of(3_600_000) {
+        format!("{}h", ms / 3_600_000)
+    } else if ms.is_multiple_of(60_000) {
+        format!("{}m", ms / 60_000)
+    } else if ms.is_multiple_of(1_000) {
+        format!("{}s", ms / 1_000)
+    } else {
+        format!("{ms}ms")
+    }
+}
+
+/// Serde representation for human-friendly durations: serializes as a
+/// string like `"60s"`; deserializes from such strings or from a bare
+/// integer meaning milliseconds
+pub mod duration_serde {
+    use std::time::Duration;
+
+    use serde::{Deserializer, Serializer, de};
+
+    use super::{format_duration, parse_duration};
+
+    pub fn serialize<S: Serializer>(duration: &Duration, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&format_duration(*duration))
+    }
+
+    struct DurationVisitor;
+
+    impl de::Visitor<'_> for DurationVisitor {
+        type Value = Duration;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str(
+                "a duration like \"500ms\", \"2s\", \"5m\", \"1h\", or milliseconds as an integer",
+            )
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<Duration, E> {
+            Ok(Duration::from_millis(v))
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<Duration, E> {
+            u64::try_from(v)
+                .map(Duration::from_millis)
+                .map_err(|_| E::custom("duration must not be negative"))
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<Duration, E> {
+            parse_duration(v).map_err(E::custom)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Duration, D::Error> {
+        d.deserialize_any(DurationVisitor)
+    }
+}
+
+/// [`duration_serde`] for `Option<Duration>` fields (combine with
+/// `#[serde(default, skip_serializing_if = "Option::is_none")]`)
+pub mod option_duration_serde {
+    use std::time::Duration;
+
+    use serde::{Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(duration: &Option<Duration>, s: S) -> Result<S::Ok, S::Error> {
+        match duration {
+            Some(d) => super::duration_serde::serialize(d, s),
+            None => s.serialize_none(),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Duration>, D::Error> {
+        super::duration_serde::deserialize(d).map(Some)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct CollectorConfig {
@@ -30,6 +145,7 @@ pub struct CollectorConfig {
     /// "top processes" view can set e.g. 10s: between refreshes the
     /// snapshot carries the last collected list, and per-process CPU% is
     /// averaged over the longer window (smoother rankings)
+    #[serde(with = "duration_serde")]
     pub process_refresh_interval: Duration,
 
     /// While overall CPU load is at or above this many *logical cores* of
@@ -66,6 +182,7 @@ pub struct CollectorConfig {
     /// How often to refresh CPU frequency. Frequency changes slowly relative
     /// to usage; refreshing it every collect is wasted work. Usage is still
     /// refreshed on every collect. Zero refreshes frequency every collect.
+    #[serde(with = "duration_serde")]
     pub cpu_frequency_refresh_interval: Duration,
 
     /// Whether to collect disk metrics
@@ -77,7 +194,15 @@ pub struct CollectorConfig {
     /// barely changes, so it runs on its own slower cadence; IO counters
     /// still refresh on every collect. Capacity values between refreshes
     /// are the last known ones
+    #[serde(with = "duration_serde")]
     pub disk_storage_refresh_interval: Duration,
+
+    /// How often to refresh disk IO counters and rebuild disk snapshots.
+    /// Zero (the default) refreshes on every collect. Between refreshes the
+    /// last snapshot list (including rates) is reused; rate diffs span the
+    /// time since the previous disk refresh
+    #[serde(with = "duration_serde")]
+    pub disk_io_refresh_interval: Duration,
 
     /// When true, keep a single entry per disk device name (preferring the
     /// shortest mount point). Collapses APFS synthetic mounts such as `/`
@@ -86,6 +211,12 @@ pub struct CollectorConfig {
 
     /// Whether to collect network interface metrics
     pub collect_networks: bool,
+
+    /// How often to refresh network counters and rebuild network snapshots.
+    /// Zero (the default) refreshes on every collect; same reuse semantics
+    /// as `disk_io_refresh_interval`
+    #[serde(with = "duration_serde")]
+    pub network_refresh_interval: Duration,
 
     /// Whether to collect hardware temperature sensors (sysinfo Components).
     /// Platform-dependent: macOS returns many named sensors with occasional
@@ -96,12 +227,14 @@ pub struct CollectorConfig {
     /// CPU counters, so a multi-second cadence is enough and avoids extra
     /// IOKit/hwmon work every collect. Between refreshes the last reading
     /// is reused. Zero refreshes every collect.
+    #[serde(with = "duration_serde")]
     pub temperature_refresh_interval: Duration,
 
     /// Custom host labels
     pub labels: HashMap<String, String>,
 
     /// Collect timeout (guards against platform calls that hang)
+    #[serde(with = "duration_serde")]
     pub collect_timeout: Duration,
 }
 
@@ -117,13 +250,134 @@ impl Default for CollectorConfig {
             cpu_frequency_refresh_interval: Duration::from_secs(30),
             collect_disks: true,
             disk_storage_refresh_interval: Duration::from_secs(60),
+            disk_io_refresh_interval: Duration::ZERO,
             dedupe_disks: true,
             collect_networks: true,
+            network_refresh_interval: Duration::ZERO,
             collect_temperatures: true,
             // Temps drift over seconds/minutes, not milliseconds
             temperature_refresh_interval: Duration::from_secs(15),
             labels: HashMap::new(),
             collect_timeout: Duration::from_secs(2),
         }
+    }
+}
+
+#[cfg(feature = "config")]
+impl CollectorConfig {
+    /// Load collector settings from `<dir>/config.toml`'s `[collector]`
+    /// section (durations are integer milliseconds). A missing file yields
+    /// the defaults; other sections and unknown keys are ignored, so the
+    /// same file can carry application-level settings alongside.
+    ///
+    /// ```toml
+    /// [collector]
+    /// process_refresh_interval = 10000
+    /// disk_io_refresh_interval = 10000
+    /// collect_temperatures = false
+    /// ```
+    pub fn load_from_dir(dir: impl AsRef<std::path::Path>) -> Result<Self, crate::ConfigError> {
+        #[derive(Default, Deserialize)]
+        #[serde(default)]
+        struct FileRoot {
+            collector: CollectorConfig,
+        }
+
+        let path = dir.as_ref().join("config.toml");
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(source) => {
+                return Err(crate::ConfigError::Read {
+                    path: path.display().to_string(),
+                    source,
+                });
+            }
+        };
+        let root: FileRoot = toml::from_str(&content).map_err(|e| crate::ConfigError::Parse {
+            path: path.display().to_string(),
+            message: e.to_string(),
+        })?;
+        Ok(root.collector)
+    }
+}
+
+#[cfg(test)]
+mod duration_tests {
+    use super::*;
+
+    #[test]
+    fn parse_duration_accepts_units_and_bare_millis() {
+        assert_eq!(parse_duration("500ms").unwrap(), Duration::from_millis(500));
+        assert_eq!(parse_duration("2s").unwrap(), Duration::from_secs(2));
+        assert_eq!(parse_duration("5m").unwrap(), Duration::from_secs(300));
+        assert_eq!(parse_duration("1h").unwrap(), Duration::from_secs(3600));
+        assert_eq!(parse_duration("1500").unwrap(), Duration::from_millis(1500));
+        assert_eq!(parse_duration(" 10s ").unwrap(), Duration::from_secs(10));
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("1.5s").is_err());
+        assert!(parse_duration("5x").is_err());
+        assert!(parse_duration("s").is_err());
+    }
+
+    #[test]
+    fn format_duration_picks_compact_unit() {
+        assert_eq!(format_duration(Duration::ZERO), "0s");
+        assert_eq!(format_duration(Duration::from_millis(1500)), "1500ms");
+        assert_eq!(format_duration(Duration::from_secs(90)), "90s");
+        assert_eq!(format_duration(Duration::from_secs(300)), "5m");
+        assert_eq!(format_duration(Duration::from_secs(3600)), "1h");
+    }
+}
+
+#[cfg(all(test, feature = "config"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_from_dir_reads_collector_section() {
+        let dir = std::env::temp_dir().join(format!("zstats-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        std::fs::write(
+            dir.join("config.toml"),
+            r#"
+[collector]
+collect_disks = false
+process_refresh_interval = 5000
+network_refresh_interval = "10s"
+
+[alerts]
+cpu = 40.0
+"#,
+        )
+        .expect("write config");
+
+        let config = CollectorConfig::load_from_dir(&dir).expect("load");
+        assert!(!config.collect_disks);
+        // Bare integers stay milliseconds; unit strings also work
+        assert_eq!(config.process_refresh_interval, Duration::from_secs(5));
+        assert_eq!(config.network_refresh_interval, Duration::from_secs(10));
+        // Untouched fields keep their defaults
+        assert!(config.collect_networks);
+        assert_eq!(config.collect_timeout, Duration::from_secs(2));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_from_missing_dir_yields_defaults() {
+        let dir = std::env::temp_dir().join("zstats-config-test-does-not-exist");
+        let config = CollectorConfig::load_from_dir(&dir).expect("defaults");
+        assert!(config.collect_disks);
+    }
+
+    #[test]
+    fn durations_roundtrip_as_human_strings() {
+        let config = CollectorConfig::default();
+        let toml = toml::to_string(&config).expect("serialize");
+        assert!(toml.contains(r#"disk_storage_refresh_interval = "1m""#));
+        assert!(toml.contains(r#"collect_timeout = "2s""#));
+        let back: CollectorConfig = toml::from_str(&toml).expect("reparse");
+        assert_eq!(back.disk_storage_refresh_interval, Duration::from_secs(60));
     }
 }

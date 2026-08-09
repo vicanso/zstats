@@ -26,11 +26,13 @@ runtime = [
     "tokio/sync",
     "tokio/time",
 ]
+# Load CollectorConfig from a config directory's config.toml
+config = ["dep:toml"]
 # CLI tool (the bin is bound to this feature via required-features)
 cli = [
+    "config",
     "runtime",
     "dep:libc",
-    "dep:toml",
     "dep:unicode-width",
     "tokio/io-std",
     "tokio/io-util",

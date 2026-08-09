@@ -88,6 +88,7 @@ impl<T: Copy> Thresholds<T> {
 
 /// Alert settings the CLI provided at startup, kept so hot reloads can
 /// re-run the "CLI flags > config file > builtin defaults" merge
+#[derive(Default)]
 pub struct AlertCliOptions {
     /// Outer None = flag not given; inner None = disabled with 0
     pub cpu: Option<Option<f32>>,
@@ -125,7 +126,7 @@ fn merge_thresholds(cli: &AlertCliOptions, file: &settings::AlertsConfig) -> Act
     };
     let cooldown = cli
         .cooldown
-        .unwrap_or_else(|| Duration::from_secs(file.cooldown_secs.unwrap_or(600)));
+        .unwrap_or_else(|| file.cooldown.unwrap_or(Duration::from_secs(600)));
 
     // CLI overrides go first: Thresholds returns the first name match
     let mut cpu = Thresholds::new(cpu_default);
@@ -652,7 +653,7 @@ mod tests {
     fn merge_file_beats_builtin_and_cli_beats_file() {
         let mut file = settings::AlertsConfig {
             cpu: Some(50.0),
-            cooldown_secs: Some(300),
+            cooldown: Some(Duration::from_secs(300)),
             ..Default::default()
         };
         file.cpu_overrides.insert("ghostty".into(), 100.0);

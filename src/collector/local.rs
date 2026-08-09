@@ -74,8 +74,9 @@ pub struct LocalCollector {
     last_disk_counters: HashMap<String, DiskCounters>,
     last_net_counters: HashMap<String, NetCounters>,
     last_process_disk_counters: HashMap<u32, DiskCounters>,
-    last_collect_time: Option<Instant>,
     last_disk_storage_refresh: Option<Instant>,
+    last_disk_io_refresh: Option<Instant>,
+    last_network_refresh: Option<Instant>,
     last_process_refresh: Option<Instant>,
     last_cpu_frequency_refresh: Option<Instant>,
     last_temperature_refresh: Option<Instant>,
@@ -83,6 +84,10 @@ pub struct LocalCollector {
     /// `process_refresh_interval` is non-zero. Arc so cache hits and
     /// snapshot clones share the same allocation.
     cached_processes: Option<Arc<Vec<ProcessSnapshot>>>,
+    /// Last disk / network snapshots, reused between their refreshes when
+    /// the corresponding interval is non-zero
+    cached_disks: Option<Vec<DiskSnapshot>>,
+    cached_networks: Option<Vec<NetworkSnapshot>>,
     /// Last temperature sample, reused between temperature refreshes
     cached_temperatures: Option<Vec<TemperatureSnapshot>>,
 }
@@ -134,13 +139,16 @@ impl LocalCollector {
             last_disk_counters: HashMap::new(),
             last_net_counters: HashMap::new(),
             last_process_disk_counters: HashMap::new(),
-            last_collect_time: None,
             last_disk_storage_refresh,
+            last_disk_io_refresh: None,
+            last_network_refresh: None,
             last_process_refresh: None,
             // Frequency was just refreshed above
             last_cpu_frequency_refresh: Some(Instant::now()),
             last_temperature_refresh: None,
             cached_processes: None,
+            cached_disks: None,
+            cached_networks: None,
             cached_temperatures: None,
         }
     }
@@ -159,51 +167,30 @@ impl LocalCollector {
         self.system.refresh_cpu_specifics(kind);
     }
 
-    /// Refresh the throttleable subsystems (CPU/memory are refreshed
-    /// directly in `collect`, before this runs).
+    /// Refresh the process table when due.
     ///
     /// Returns the elapsed time since the previous process refresh when
     /// processes were refreshed this round (for process disk IO rates).
-    fn refresh(&mut self, refresh_processes: bool) -> Option<Duration> {
-        let process_elapsed = if refresh_processes {
-            let elapsed = self.last_process_refresh.map(|t| t.elapsed());
-            // Explicit refresh kind: the `refresh_processes` shortcut does
-            // NOT fetch cmd (and wastes time on disk_usage/exe we don't
-            // always need). cmd is immutable per process, so OnlyIfNotSet
-            // fetches it exactly once per process.
-            let mut kind = ProcessRefreshKind::nothing()
-                .with_memory()
-                .with_cpu()
-                .with_cmd(UpdateKind::OnlyIfNotSet);
-            if self.config.collect_process_disk_io {
-                kind = kind.with_disk_usage();
-            }
-            self.system
-                .refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
-            self.last_process_refresh = Some(Instant::now());
-            elapsed
-        } else {
-            None
-        };
-
-        if self.config.collect_disks {
-            // IO counters are cheap and refresh every round; the capacity
-            // query costs ~25x more and barely changes, so it runs on the
-            // configured slower cadence
-            let storage_due = self
-                .last_disk_storage_refresh
-                .is_none_or(|t| t.elapsed() >= self.config.disk_storage_refresh_interval);
-            let mut kind = DiskRefreshKind::nothing().with_io_usage();
-            if storage_due {
-                kind = kind.with_storage();
-                self.last_disk_storage_refresh = Some(Instant::now());
-            }
-            self.disks.refresh_specifics(true, kind);
+    fn refresh_process_table(&mut self, refresh_processes: bool) -> Option<Duration> {
+        if !refresh_processes {
+            return None;
         }
-        if self.config.collect_networks {
-            self.networks.refresh(true);
+        let elapsed = self.last_process_refresh.map(|t| t.elapsed());
+        // Explicit refresh kind: the `refresh_processes` shortcut does
+        // NOT fetch cmd (and wastes time on disk_usage/exe we don't
+        // always need). cmd is immutable per process, so OnlyIfNotSet
+        // fetches it exactly once per process.
+        let mut kind = ProcessRefreshKind::nothing()
+            .with_memory()
+            .with_cpu()
+            .with_cmd(UpdateKind::OnlyIfNotSet);
+        if self.config.collect_process_disk_io {
+            kind = kind.with_disk_usage();
         }
-        process_elapsed
+        self.system
+            .refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
+        self.last_process_refresh = Some(Instant::now());
+        elapsed
     }
 
     fn collect_cpu(&self) -> CpuSnapshot {
@@ -235,10 +222,32 @@ impl LocalCollector {
         }
     }
 
-    fn collect_disks(&mut self, elapsed: Option<Duration>) -> Option<Vec<DiskSnapshot>> {
+    fn collect_disks(&mut self) -> Option<Vec<DiskSnapshot>> {
         if !self.config.collect_disks {
             return None;
         }
+        let due = self.config.disk_io_refresh_interval.is_zero()
+            || self
+                .last_disk_io_refresh
+                .is_none_or(|t| t.elapsed() >= self.config.disk_io_refresh_interval);
+        if !due {
+            return self.cached_disks.clone();
+        }
+        // Rate diffs span the time since the previous disk refresh
+        let elapsed = self.last_disk_io_refresh.map(|t| t.elapsed());
+
+        // IO counters are cheap; the capacity query costs ~25x more and
+        // barely changes, so it runs on its own, slower cadence
+        let storage_due = self
+            .last_disk_storage_refresh
+            .is_none_or(|t| t.elapsed() >= self.config.disk_storage_refresh_interval);
+        let mut kind = DiskRefreshKind::nothing().with_io_usage();
+        if storage_due {
+            kind = kind.with_storage();
+            self.last_disk_storage_refresh = Some(Instant::now());
+        }
+        self.disks.refresh_specifics(true, kind);
+        self.last_disk_io_refresh = Some(Instant::now());
 
         let mut snapshots = Vec::new();
         let mut counters = HashMap::new();
@@ -292,13 +301,25 @@ impl LocalCollector {
             snapshots = dedupe_disks_by_name(snapshots);
         }
 
+        self.cached_disks = Some(snapshots.clone());
         Some(snapshots)
     }
 
-    fn collect_networks(&mut self, elapsed: Option<Duration>) -> Option<Vec<NetworkSnapshot>> {
+    fn collect_networks(&mut self) -> Option<Vec<NetworkSnapshot>> {
         if !self.config.collect_networks {
             return None;
         }
+        let due = self.config.network_refresh_interval.is_zero()
+            || self
+                .last_network_refresh
+                .is_none_or(|t| t.elapsed() >= self.config.network_refresh_interval);
+        if !due {
+            return self.cached_networks.clone();
+        }
+        // Rate diffs span the time since the previous network refresh
+        let elapsed = self.last_network_refresh.map(|t| t.elapsed());
+        self.networks.refresh(true);
+        self.last_network_refresh = Some(Instant::now());
 
         let mut snapshots = Vec::new();
         let mut counters = HashMap::new();
@@ -363,6 +384,7 @@ impl LocalCollector {
         }
 
         self.last_net_counters = counters;
+        self.cached_networks = Some(snapshots.clone());
         Some(snapshots)
     }
 
@@ -611,18 +633,15 @@ impl Collector for LocalCollector {
                 || self
                     .last_process_refresh
                     .is_none_or(|t| t.elapsed() >= self.config.process_refresh_interval));
-        let process_elapsed = self.refresh(processes_due);
-
-        let elapsed = self.last_collect_time.map(|t| t.elapsed());
-        self.last_collect_time = Some(Instant::now());
+        let process_elapsed = self.refresh_process_table(processes_due);
 
         Ok(SystemSnapshot {
             timestamp: Timestamp::now(),
             host: self.collect_host(),
             cpu: self.collect_cpu(),
             memory: self.collect_memory(),
-            disks: self.collect_disks(elapsed),
-            networks: self.collect_networks(elapsed),
+            disks: self.collect_disks(),
+            networks: self.collect_networks(),
             processes: self.collect_processes(processes_due, process_elapsed),
             load: self.collect_load(),
             temperatures: self.collect_temperatures(),

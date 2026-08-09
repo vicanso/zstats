@@ -62,3 +62,21 @@ pub enum SchedulerError {
     #[snafu(display("scheduler is already running"))]
     AlreadyRunning,
 }
+
+/// Errors from loading configuration files (the `config` feature)
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
+pub enum ConfigError {
+    // Custom selector suffix: `Read` alone is a likely future clash and the
+    // module already establishes this convention for `Timeout`
+    #[snafu(display("failed to read {path}: {source}"))]
+    #[snafu(context(suffix(ConfigSnafu)))]
+    Read {
+        path: String,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("failed to parse {path}: {message}"))]
+    #[snafu(context(suffix(ConfigSnafu)))]
+    Parse { path: String, message: String },
+}

@@ -34,57 +34,46 @@ const USAGE: &str = "\
 zstats - system performance metrics collector
 
 Usage:
-  zstats [options]         Collect once and print (default)
-  zstats serve [options]   Run the collector daemon, keeping recent history
-  zstats attach            Attach to the daemon: replay history, then live view.
-                           Keys: q/Ctrl+C/d detach (daemon keeps running)
-  zstats stop              Stop the daemon
+  zstats                      Foreground live view: everything sampled at a
+                              fixed 2s interval, screen refreshes in place.
+                              Keys: q/Ctrl+C quit, d detach into the daemon
+  zstats serve                Background daemon driven by the config directory
+                              (detaches by default; --foreground to stay)
+  zstats attach               Attach to the daemon: history replay + live view.
+                              Keys: q/Ctrl+C/d detach (daemon keeps running)
+  zstats stop                 Stop the daemon
+  zstats -add <key> <value>   Persist a setting into <config-dir>/config.toml;
+                              a running daemon reloads alert settings within
+                              ~30 collects, other changes apply on restart
+  zstats -remove <key> [name] Reset a setting to its builtin default (name
+                              drops a per-process alert override)
+  zstats -list                Show the config file
 
 Options:
-  --watch                  Collect continuously in the foreground; on a TTY the
-                           screen refreshes in place with colors.
-                           Keys: q/Ctrl+C quit, d detach into a daemon
-  --interval <ms>          Collection interval for watch/serve (default 2000)
-  --history <secs>         serve: how much history to keep (default 300)
-  --detach                 serve: fork to the background and return
-  --json                   Output as JSON (single line, machine-friendly)
-  --pretty                 Output as pretty-printed JSON (implies --json)
-  --no-processes           Skip process collection
-  --no-disks               Skip disk collection
-  --no-networks            Skip network collection
-  --no-temperatures        Skip hardware temperature sensors
-  --temp-interval <ms>     Temperature refresh cadence (default 15000);
-                           0 = every collect. Temps change slowly so a
-                           multi-second interval is enough
-  --process-interval <ms>  Process list refresh cadence; 0 = every collect
-                           (default: 0, but serve defaults to 10000)
-  --process-boost <cores>  While overall load is at least this many logical
-                           cores of work, refresh processes every collect
-                           (default 1, 0 = off). Scales with CPU count:
-                           1 core ≈ 25% overall on 4U, ~1.6% on 64U
-  --alert-cpu <pct>        serve: notify when a process averages at least this
-                           CPU% (single-core units) over the last minute
-                           (default 30, 0 = off). Repeat with name=pct for
-                           per-process overrides, e.g. --alert-cpu ghostty=100
-  --alert-mem <pct>        serve: notify when a process's 1-minute average
-                           share of total memory reaches this percentage
-                           (default 25, 0 = off); also supports name=pct
-  --alert-cooldown <secs>  serve: minimum time between repeated alerts for
-                           the same process and rule (default 600)
-  --add-alert <spec>       Persist a per-process alert override to
-                           ~/.zstats/config.toml and exit. Spec is
-                           [cpu:|mem:]name=pct, e.g. ghostty=100 or
-                           mem:chrome=40; pct 0 disables that process.
-                           serve picks the file up on its next start
-  --remove-alert <spec>    Remove a persisted override ([cpu:|mem:]name;
-                           without a prefix removes both rules) and exit
-  --list-alerts            Show the persisted alert configuration and exit
-  --max-processes <n>      Max number of processes to collect (default 50)
-  --process-disk-io        Also collect per-process disk read/write rates
-                           (off by default; adds cost to process refresh)
-  --no-dedupe-disks        Keep every mount point (default collapses APFS
-                           synthetic mounts that share a device name)
-  -h, --help               Show this help
+  --config-dir <path>  Config directory (default ~/.zstats)
+  --foreground         serve: stay in the foreground
+  --json / --pretty    Print one JSON snapshot instead of the live view
+  -h, --help           Show this help
+
+Config keys for -add (also accepted as key=value). Durations take 500ms /
+2s / 5m / 1h, or a bare integer meaning milliseconds; 0 = every collect:
+  interval <dur>              [daemon] collection interval (default 2s)
+  history <dur>               [daemon] history retention (default 5m)
+  detach <bool>               [daemon] serve detaches by default (default true)
+  process-interval <dur>      [collector] process cadence (serve default 10s)
+  disk-interval <dur>         [collector] disk cadence (default 0)
+  disk-storage-interval <dur> [collector] disk capacity cadence (default 60s)
+  network-interval <dur>      [collector] network cadence (default 0)
+  temp-interval <dur>         [collector] temperature cadence (default 15s)
+  cpu-freq-interval <dur>     [collector] CPU frequency cadence (default 30s)
+  process-boost <cores>       [collector] busy-cores boost (default 1, 0 = off)
+  max-processes <n>           [collector] kept processes (default 50)
+  collect-processes | collect-disks | collect-networks | collect-temperatures
+  process-disk-io | dedupe-disks | per-core-cpu        <true|false>
+  alert-cpu <pct|name=pct>    [alerts] 1-min avg CPU rule: default threshold or
+                              per-process override, e.g. alert-cpu ghostty=100
+  alert-mem <pct|name=pct>    [alerts] 1-min avg memory-share rule, same forms
+  alert-cooldown <dur>        [alerts] re-alert cooldown (default 10m)
 ";
 
 #[derive(Clone, Copy, PartialEq)]
@@ -94,165 +83,43 @@ enum OutputFormat {
     JsonPretty,
 }
 
+/// Foreground live view: a fixed 2s beat for everything
+const FOREGROUND_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Force every subsystem to refresh on each collect: the foreground view
+/// shows current numbers, cadence throttles are for the daemon. Collection
+/// toggles (what to collect) still come from the config file
+fn foreground_config(mut config: CollectorConfig) -> CollectorConfig {
+    config.process_refresh_interval = Duration::ZERO;
+    config.cpu_frequency_refresh_interval = Duration::ZERO;
+    config.disk_storage_refresh_interval = Duration::ZERO;
+    config.disk_io_refresh_interval = Duration::ZERO;
+    config.network_refresh_interval = Duration::ZERO;
+    config.temperature_refresh_interval = Duration::ZERO;
+    config
+}
+
 struct CliArgs {
-    watch: bool,
-    interval: Duration,
     format: OutputFormat,
-    config: CollectorConfig,
-    history: Duration,
-    detach: bool,
-    /// None = mode-dependent default (serve throttles to 10s, others
-    /// refresh on every collect)
-    process_interval: Option<Duration>,
-    /// Daemon alert thresholds. Outer `None` = flag not given (fall back
-    /// to the config file, then the builtin default); inner `None` = rule
-    /// explicitly disabled with 0. Overrides are per-process-name
-    /// exceptions from `name=pct` flag values
-    alert_cpu: Option<Option<f32>>,
-    alert_cpu_overrides: Vec<(String, Option<f32>)>,
-    alert_mem_fraction: Option<Option<f64>>,
-    alert_mem_overrides: Vec<(String, Option<f64>)>,
-    /// Minimum time between repeated alerts; None = not given on the CLI
-    alert_cooldown: Option<Duration>,
+    /// serve: stay in the foreground instead of detaching
+    foreground: bool,
 }
 
 fn parse_args(raw: Vec<String>) -> Result<CliArgs, String> {
     let mut args = CliArgs {
-        watch: false,
-        interval: Duration::from_millis(2000),
         format: OutputFormat::Text,
-        config: CollectorConfig::default(),
-        history: Duration::from_secs(300),
-        detach: false,
-        process_interval: None,
-        alert_cpu: None,
-        alert_cpu_overrides: Vec::new(),
-        alert_mem_fraction: None,
-        alert_mem_overrides: Vec::new(),
-        alert_cooldown: None,
+        foreground: false,
     };
 
-    let mut iter = raw.into_iter();
-    while let Some(arg) = iter.next() {
+    for arg in raw {
         match arg.as_str() {
-            "--watch" => args.watch = true,
-            "--detach" => args.detach = true,
-            "--history" => {
-                let value = iter.next().ok_or("--history requires seconds")?;
-                let secs: u64 = value
-                    .parse()
-                    .map_err(|_| format!("invalid history: {value}"))?;
-                args.history = Duration::from_secs(secs);
-            }
-            "--alert-cpu" => {
-                let value = iter
-                    .next()
-                    .ok_or("--alert-cpu requires a percentage or name=pct")?;
-                if let Some((name, pct)) = value.split_once('=') {
-                    let name = name.trim();
-                    if name.is_empty() {
-                        return Err(format!("invalid process name in: {value}"));
-                    }
-                    let pct: f32 = pct
-                        .parse()
-                        .map_err(|_| format!("invalid percentage: {value}"))?;
-                    args.alert_cpu_overrides
-                        .push((name.to_string(), if pct <= 0.0 { None } else { Some(pct) }));
-                } else {
-                    let pct: f32 = value
-                        .parse()
-                        .map_err(|_| format!("invalid percentage: {value}"))?;
-                    args.alert_cpu = Some(if pct <= 0.0 { None } else { Some(pct) });
-                }
-            }
-            "--alert-mem" => {
-                let value = iter
-                    .next()
-                    .ok_or("--alert-mem requires a percentage or name=pct")?;
-                if let Some((name, pct)) = value.split_once('=') {
-                    let name = name.trim();
-                    if name.is_empty() {
-                        return Err(format!("invalid process name in: {value}"));
-                    }
-                    let pct: f64 = pct
-                        .parse()
-                        .map_err(|_| format!("invalid percentage: {value}"))?;
-                    args.alert_mem_overrides.push((
-                        name.to_string(),
-                        if pct <= 0.0 { None } else { Some(pct / 100.0) },
-                    ));
-                } else {
-                    let pct: f64 = value
-                        .parse()
-                        .map_err(|_| format!("invalid percentage: {value}"))?;
-                    args.alert_mem_fraction =
-                        Some(if pct <= 0.0 { None } else { Some(pct / 100.0) });
-                }
-            }
-            "--alert-cooldown" => {
-                let value = iter.next().ok_or("--alert-cooldown requires seconds")?;
-                let secs: u64 = value
-                    .parse()
-                    .map_err(|_| format!("invalid cooldown: {value}"))?;
-                args.alert_cooldown = Some(Duration::from_secs(secs));
-            }
-            "--process-boost" => {
-                let value = iter
-                    .next()
-                    .ok_or("--process-boost requires a core count (e.g. 1 or 2.5)")?;
-                let cores: f32 = value
-                    .parse()
-                    .map_err(|_| format!("invalid core count: {value}"))?;
-                args.config.process_boost_cpu_cores = if cores <= 0.0 { None } else { Some(cores) };
-            }
-            "--process-interval" => {
-                let value = iter
-                    .next()
-                    .ok_or("--process-interval requires a value in milliseconds")?;
-                let ms: u64 = value
-                    .parse()
-                    .map_err(|_| format!("invalid interval: {value}"))?;
-                args.process_interval = Some(Duration::from_millis(ms));
-            }
+            "--foreground" => args.foreground = true,
             "--json" => {
                 if args.format == OutputFormat::Text {
                     args.format = OutputFormat::Json;
                 }
             }
             "--pretty" => args.format = OutputFormat::JsonPretty,
-            "--no-processes" => args.config.collect_processes = false,
-            "--no-disks" => args.config.collect_disks = false,
-            "--no-networks" => args.config.collect_networks = false,
-            "--no-temperatures" => args.config.collect_temperatures = false,
-            "--temp-interval" => {
-                let value = iter
-                    .next()
-                    .ok_or("--temp-interval requires a value in milliseconds")?;
-                let ms: u64 = value
-                    .parse()
-                    .map_err(|_| format!("invalid interval: {value}"))?;
-                args.config.temperature_refresh_interval = Duration::from_millis(ms);
-            }
-            "--interval" => {
-                let value = iter
-                    .next()
-                    .ok_or("--interval requires a value in milliseconds")?;
-                let ms: u64 = value
-                    .parse()
-                    .map_err(|_| format!("invalid interval: {value}"))?;
-                if ms == 0 {
-                    return Err("--interval must be greater than 0".into());
-                }
-                args.interval = Duration::from_millis(ms);
-            }
-            "--max-processes" => {
-                let value = iter.next().ok_or("--max-processes requires a number")?;
-                args.config.max_processes = value
-                    .parse()
-                    .map_err(|_| format!("invalid number: {value}"))?;
-            }
-            "--process-disk-io" => args.config.collect_process_disk_io = true,
-            "--no-dedupe-disks" => args.config.dedupe_disks = false,
             "-h" | "--help" => {
                 print!("{USAGE}");
                 std::process::exit(0);
@@ -263,47 +130,9 @@ fn parse_args(raw: Vec<String>) -> Result<CliArgs, String> {
     Ok(args)
 }
 
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum AlertRule {
-    Cpu,
-    Mem,
-}
-
-/// Split an optional `cpu:` / `mem:` prefix off an alert spec; no prefix
-/// means the CPU rule
-fn split_alert_rule(spec: &str) -> (AlertRule, &str) {
-    if let Some(rest) = spec.strip_prefix("mem:") {
-        (AlertRule::Mem, rest)
-    } else if let Some(rest) = spec.strip_prefix("cpu:") {
-        (AlertRule::Cpu, rest)
-    } else {
-        (AlertRule::Cpu, spec)
-    }
-}
-
-/// Parse an `--add-alert` spec: `[cpu:|mem:]name=pct`
-fn parse_alert_spec(spec: &str) -> Result<(AlertRule, String, f64), String> {
-    let (rule, rest) = split_alert_rule(spec);
-    let (name, pct) = rest
-        .split_once('=')
-        .ok_or_else(|| format!("invalid spec: {spec} (expected [cpu:|mem:]name=pct)"))?;
-    let name = name.trim();
-    if name.is_empty() {
-        return Err(format!("invalid spec: {spec} (empty process name)"));
-    }
-    let pct: f64 = pct
-        .trim()
-        .parse()
-        .map_err(|_| format!("invalid percentage in: {spec}"))?;
-    if pct < 0.0 {
-        return Err(format!("invalid percentage in: {spec} (must be >= 0)"));
-    }
-    Ok((rule, name.to_string(), pct))
-}
-
-/// Handle the persistent-config actions (`--add-alert`, `--remove-alert`,
-/// `--list-alerts`): apply them to ~/.zstats/config.toml and exit
-fn run_alert_config_actions(raw: &[String]) -> ExitCode {
+/// Handle the persistent-config actions (`-add`, `-remove`, `-list`):
+/// apply them to `<config-dir>/config.toml` and exit
+fn run_config_actions(raw: &[String]) -> ExitCode {
     let mut config = match settings::load() {
         Ok(config) => config,
         Err(e) => {
@@ -314,57 +143,62 @@ fn run_alert_config_actions(raw: &[String]) -> ExitCode {
 
     let mut modified = false;
     let mut list = false;
-    let mut iter = raw.iter();
+    let mut iter = raw.iter().peekable();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
-            "--add-alert" => {
-                let Some(spec) = iter.next() else {
-                    eprintln!("--add-alert requires [cpu:|mem:]name=pct");
+            "-add" | "--add" => {
+                let Some(first) = iter.next() else {
+                    eprintln!("-add requires <key> <value> (or key=value)");
                     return ExitCode::FAILURE;
                 };
-                match parse_alert_spec(spec) {
-                    Ok((AlertRule::Cpu, name, pct)) => {
-                        println!("cpu alert for {name}: {pct}%");
-                        config.alerts.cpu_overrides.insert(name, pct as f32);
+                // Both `-add key value` and `-add key=value` are accepted;
+                // for alert overrides the value itself contains '=', e.g.
+                // `-add alert-cpu ghostty=100`
+                let (key, value) = match first.split_once('=') {
+                    Some((key, value)) => (key.to_string(), value.to_string()),
+                    None => {
+                        let Some(value) = iter.next() else {
+                            eprintln!("-add {first} requires a value");
+                            return ExitCode::FAILURE;
+                        };
+                        (first.clone(), value.clone())
                     }
-                    Ok((AlertRule::Mem, name, pct)) => {
-                        println!("mem alert for {name}: {pct}%");
-                        config.alerts.mem_overrides.insert(name, pct);
+                };
+                match settings::apply_add(&mut config, &key, &value) {
+                    Ok(description) => {
+                        println!("{description}");
+                        modified = true;
                     }
                     Err(e) => {
                         eprintln!("{e}");
                         return ExitCode::FAILURE;
                     }
                 }
-                modified = true;
             }
-            "--remove-alert" => {
-                let Some(spec) = iter.next() else {
-                    eprintln!("--remove-alert requires [cpu:|mem:]name");
+            "-remove" | "--remove" => {
+                let Some(key) = iter.next() else {
+                    eprintln!("-remove requires <key> [name]");
                     return ExitCode::FAILURE;
                 };
-                let (explicit, name) = match spec.split_once(':') {
-                    Some(("cpu", name)) => (Some(AlertRule::Cpu), name),
-                    Some(("mem", name)) => (Some(AlertRule::Mem), name),
-                    _ => (None, spec.as_str()),
+                // Optional trailing name for per-process alert overrides
+                let name = match iter.peek() {
+                    Some(next) if !next.starts_with('-') => iter.next().map(|s| s.as_str()),
+                    _ => None,
                 };
-                let mut removed = false;
-                if explicit != Some(AlertRule::Mem) {
-                    removed |= config.alerts.cpu_overrides.remove(name).is_some();
-                }
-                if explicit != Some(AlertRule::Cpu) {
-                    removed |= config.alerts.mem_overrides.remove(name).is_some();
-                }
-                if removed {
-                    println!("removed alert override for {name}");
-                    modified = true;
-                } else {
-                    println!("no alert override found for {name}");
+                match settings::apply_remove(&mut config, key, name) {
+                    Ok(description) => {
+                        println!("{description}");
+                        modified = true;
+                    }
+                    Err(e) => {
+                        eprintln!("{e}");
+                        return ExitCode::FAILURE;
+                    }
                 }
             }
-            "--list-alerts" => list = true,
+            "-list" | "--list" => list = true,
             other => {
-                eprintln!("cannot combine {other} with alert config actions (use -h for help)");
+                eprintln!("cannot combine {other} with config actions (use -h for help)");
                 return ExitCode::FAILURE;
             }
         }
@@ -378,35 +212,16 @@ fn run_alert_config_actions(raw: &[String]) -> ExitCode {
         println!("saved to {}", settings::path().display());
     }
     if list {
-        let a = &config.alerts;
-        println!("alerts config ({}):", settings::path().display());
-        match a.cpu {
-            Some(p) if p > 0.0 => println!("  cpu default: {p}%"),
-            Some(_) => println!("  cpu default: off"),
-            None => println!("  cpu default: 30% (builtin)"),
-        }
-        match a.mem {
-            Some(p) if p > 0.0 => println!("  mem default: {p}%"),
-            Some(_) => println!("  mem default: off"),
-            None => println!("  mem default: 25% (builtin)"),
-        }
-        match a.cooldown_secs {
-            Some(s) => println!("  cooldown: {s}s"),
-            None => println!("  cooldown: 600s (builtin)"),
-        }
-        println!("  cpu overrides:");
-        if a.cpu_overrides.is_empty() {
-            println!("    (none)");
-        }
-        for (name, pct) in &a.cpu_overrides {
-            println!("    {name} = {pct}%");
-        }
-        println!("  mem overrides:");
-        if a.mem_overrides.is_empty() {
-            println!("    (none)");
-        }
-        for (name, pct) in &a.mem_overrides {
-            println!("    {name} = {pct}%");
+        let path = settings::path();
+        match std::fs::read_to_string(&path) {
+            Ok(content) => {
+                println!("# {}", path.display());
+                print!("{content}");
+            }
+            Err(_) => println!(
+                "(no config file at {}; builtin defaults apply)",
+                path.display()
+            ),
         }
     }
     ExitCode::SUCCESS
@@ -453,14 +268,15 @@ fn detach_into_daemon() -> ExitCode {
         println!("zstats daemon is already running; view it with `zstats attach`");
         return ExitCode::SUCCESS;
     }
-    // Re-run ourselves as `serve`, keeping the collection flags but
-    // dropping the foreground-only ones
+    // Re-run ourselves as `serve` (keeping e.g. --config-dir); --foreground
+    // stops the already-detached child from detaching again
     let mut args = vec!["serve".to_string()];
     args.extend(
         std::env::args()
             .skip(1)
-            .filter(|a| a != "--watch" && a != "--json" && a != "--pretty"),
+            .filter(|a| a != "--json" && a != "--pretty"),
     );
+    args.push("--foreground".to_string());
     match spawn_detached(args) {
         Ok(pid) => {
             println!(
@@ -563,10 +379,13 @@ fn detach_self() -> ExitCode {
         return ExitCode::FAILURE;
     }
 
-    let args: Vec<String> = std::env::args()
+    // The child must not detach again (the config file may set
+    // daemon.detach = true): force it into the foreground
+    let mut args: Vec<String> = std::env::args()
         .skip(1)
         .filter(|a| a != "--detach")
         .collect();
+    args.push("--foreground".to_string());
     match spawn_detached(args) {
         Ok(pid) => {
             println!(
@@ -599,12 +418,25 @@ fn main() -> ExitCode {
 
     let mut raw: Vec<String> = std::env::args().skip(1).collect();
 
+    // --config-dir applies to every mode (including the config actions
+    // below), so resolve it before anything reads settings
+    if let Some(i) = raw.iter().position(|a| a == "--config-dir") {
+        let Some(dir) = raw.get(i + 1).cloned() else {
+            eprintln!("--config-dir requires a path");
+            return ExitCode::FAILURE;
+        };
+        settings::set_dir(std::path::PathBuf::from(dir));
+        raw.drain(i..=i + 1);
+    }
+
     // Persistent-config actions are standalone: apply and exit
-    if raw
-        .iter()
-        .any(|a| a == "--add-alert" || a == "--remove-alert" || a == "--list-alerts")
-    {
-        return run_alert_config_actions(&raw);
+    if raw.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            "-add" | "--add" | "-remove" | "--remove" | "-list" | "--list"
+        )
+    }) {
+        return run_config_actions(&raw);
     }
 
     let subcommand = raw.first().filter(|a| !a.starts_with('-')).cloned();
@@ -612,7 +444,7 @@ fn main() -> ExitCode {
         raw.remove(0);
     }
 
-    let mut args = match parse_args(raw) {
+    let args = match parse_args(raw) {
         Ok(args) => args,
         Err(msg) => {
             eprintln!("{msg}");
@@ -620,55 +452,65 @@ fn main() -> ExitCode {
         }
     };
 
-    // The daemon runs long in the background: throttle its process list to
-    // a 10s cadence by default (~0.45% CPU instead of ~1.3%); an explicit
-    // --process-interval 0 restores per-collect refresh
-    args.config.process_refresh_interval = match (args.process_interval, subcommand.as_deref()) {
-        (Some(interval), _) => interval,
-        (None, Some("serve")) => Duration::from_secs(10),
-        (None, _) => Duration::ZERO,
+    // serve is driven by the config directory (default ~/.zstats); the
+    // foreground view only takes its collection toggles from there.
+    // attach/stop don't need the file (a broken config must not block
+    // stopping a daemon)
+    let needs_file = matches!(subcommand.as_deref(), None | Some("serve"));
+    let file = if needs_file {
+        match settings::load() {
+            Ok(file) => file,
+            Err(e) => {
+                eprintln!("{e}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        settings::FileConfig::default()
     };
+    let base_collector = file.collector.clone().unwrap_or_default();
 
     match subcommand.as_deref() {
         None => {
-            if !args.watch {
-                return run_once(args.config, args.format);
+            // Foreground mode: everything sampled fresh at a fixed 2s
+            // interval — the cadence throttles exist for the long-running
+            // daemon, a live view wants current numbers
+            let config = foreground_config(base_collector);
+            match args.format {
+                OutputFormat::Text => {
+                    runtime().block_on(run_watch(config, FOREGROUND_INTERVAL, OutputFormat::Text))
+                }
+                format => run_once(config, format),
             }
-            runtime().block_on(run_watch(args.config, args.interval, args.format))
         }
         #[cfg(unix)]
         Some("serve") => {
-            if args.detach {
+            // Background mode: detaches unless the config or --foreground
+            // says otherwise
+            let detach = !args.foreground && file.daemon.detach.unwrap_or(true);
+            if detach {
                 return detach_self();
             }
+
+            let interval = file.daemon.interval.unwrap_or(Duration::from_millis(2000));
+            let history = file.daemon.history.unwrap_or(Duration::from_secs(300));
+            let mut config = base_collector;
+            // The daemon runs long in the background: default its process
+            // list to a 10s cadence (~0.45% CPU instead of ~1.3%) unless
+            // the config file sets one
+            if config.process_refresh_interval.is_zero() {
+                config.process_refresh_interval = Duration::from_secs(10);
+            }
+
             let mut extra_sinks: Vec<Arc<dyn MetricSink>> = Vec::new();
-            // Alert settings: CLI flags > config file > builtin defaults.
-            // The file is loaded fail-fast here and then hot-reloaded by
-            // the sink on mtime change (every 30 collects)
-            let file = match settings::load() {
-                Ok(file) => file,
-                Err(e) => {
-                    eprintln!("{e}");
-                    return ExitCode::FAILURE;
-                }
-            };
-            let cli_options = alerts::AlertCliOptions {
-                cpu: args.alert_cpu,
-                cpu_overrides: args.alert_cpu_overrides,
-                mem: args.alert_mem_fraction,
-                mem_overrides: args.alert_mem_overrides,
-                cooldown: args.alert_cooldown,
-            };
-            let alert_sink = alerts::AlertSink::from_options(cli_options, &file.alerts);
+            // Alert settings come from the config file (hot-reloaded by
+            // the sink on mtime change, every 30 collects)
+            let alert_sink =
+                alerts::AlertSink::from_options(alerts::AlertCliOptions::default(), &file.alerts);
             if alert_sink.enabled() {
                 extra_sinks.push(Arc::new(alert_sink));
             }
-            runtime().block_on(daemon::serve(
-                args.config,
-                args.interval,
-                args.history,
-                extra_sinks,
-            ))
+            runtime().block_on(daemon::serve(config, interval, history, extra_sinks))
         }
         #[cfg(unix)]
         Some("attach") => runtime().block_on(daemon::attach()),

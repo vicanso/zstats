@@ -1,6 +1,6 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help build release test lint fmt fmt-check check check-features run once json clean install
+.PHONY: help build release test lint fmt fmt-check check check-features run json clean install
 
 help: ## Show this help
 	@awk 'BEGIN {FS = ":.*##"} /^[a-zA-Z_-]+:.*##/ {printf "  \033[36m%-14s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -26,13 +26,11 @@ fmt-check: ## Check formatting without modifying files
 check-features: ## Verify each feature combination compiles independently
 	cargo check --no-default-features
 	cargo check --no-default-features --features runtime
+	cargo check --no-default-features --features config
 
 check: fmt-check lint check-features test ## CI aggregate: format + clippy + feature matrix + tests
 
-run: ## Watch mode (human-readable output, Ctrl+C to exit)
-	cargo run --quiet -- --watch
-
-once: ## Collect once, human-readable output
+run: ## Foreground live view (fixed 2s sampling, q/Ctrl+C to exit)
 	cargo run --quiet
 
 json: ## Collect once, pretty-printed JSON

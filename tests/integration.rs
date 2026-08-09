@@ -114,6 +114,45 @@ fn process_disk_io_opt_in_and_disk_dedupe() {
 }
 
 #[test]
+fn disk_and_network_intervals_reuse_cached_lists() {
+    let config = CollectorConfig {
+        // Effectively never due again within this test
+        disk_io_refresh_interval: Duration::from_secs(3600),
+        network_refresh_interval: Duration::from_secs(3600),
+        collect_processes: false,
+        ..Default::default()
+    };
+    let mut collector = LocalCollector::new(config);
+
+    let first = collector.collect().expect("first collect");
+    std::thread::sleep(Duration::from_millis(200));
+    let second = collector.collect().expect("second collect");
+
+    // Between refreshes the cached lists are returned verbatim
+    let (d1, d2) = (
+        first.disks.as_ref().expect("disks"),
+        second.disks.as_ref().expect("disks"),
+    );
+    assert_eq!(d1.len(), d2.len());
+    for (a, b) in d1.iter().zip(d2.iter()) {
+        assert_eq!(a.mount_point, b.mount_point);
+        assert_eq!(a.available_bytes, b.available_bytes);
+        assert_eq!(a.read_bytes_per_sec, b.read_bytes_per_sec);
+        assert_eq!(a.write_bytes_per_sec, b.write_bytes_per_sec);
+    }
+    let (n1, n2) = (
+        first.networks.as_ref().expect("networks"),
+        second.networks.as_ref().expect("networks"),
+    );
+    assert_eq!(n1.len(), n2.len());
+    for (a, b) in n1.iter().zip(n2.iter()) {
+        assert_eq!(a.interface, b.interface);
+        assert_eq!(a.received_bytes_per_sec, b.received_bytes_per_sec);
+        assert_eq!(a.transmitted_bytes_per_sec, b.transmitted_bytes_per_sec);
+    }
+}
+
+#[test]
 fn process_refresh_interval_reuses_cached_list() {
     let config = CollectorConfig {
         // Effectively never due again within this test; the CPU boost must

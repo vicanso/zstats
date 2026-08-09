@@ -64,7 +64,7 @@ pub use async_trait::async_trait;
 
 pub use collector::{Collector, LocalCollector};
 pub use config::CollectorConfig;
-pub use error::{CollectError, SchedulerError, SinkError};
+pub use error::{CollectError, ConfigError, SchedulerError, SinkError};
 #[cfg(feature = "runtime")]
 pub use scheduler::Scheduler;
 #[cfg(feature = "runtime")]

@@ -36,7 +36,6 @@ const CMD_MAX_WIDTH: usize = 50;
 /// bar, and the per-process memory bar
 const GAUGE_WIDTH: usize = 20;
 const DISK_GAUGE_WIDTH: usize = 14;
-const PROC_MEM_GAUGE_WIDTH: usize = 10;
 
 /// Rolling window for per-process averages in watch mode
 const AVG_WINDOW: Duration = Duration::from_secs(60);
@@ -284,6 +283,33 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
         s.load.load15,
     );
 
+    if let Some(temps) = &s.temperatures {
+        if temps.is_empty() {
+            let _ = writeln!(out, "TEMP  (no sensors)");
+        } else {
+            // Show the hottest few; full list is in JSON
+            const SHOW: usize = 4;
+            let parts: Vec<String> = temps
+                .iter()
+                .take(SHOW)
+                .map(|t| {
+                    let color = level_color(f64::from(t.celsius) / 100.0, 0.65, 0.85);
+                    format!(
+                        "{} {}",
+                        theme.paint(color, &format!("{:.1}°C", t.celsius)),
+                        t.label
+                    )
+                })
+                .collect();
+            let more = if temps.len() > SHOW {
+                format!("  (+{} more)", temps.len() - SHOW)
+            } else {
+                String::new()
+            };
+            let _ = writeln!(out, "TEMP  {}{}", parts.join("  ·  "), more);
+        }
+    }
+
     if let Some(disks) = &s.disks {
         let rows: Vec<Vec<String>> = disks
             .iter()
@@ -410,14 +436,6 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
             }
         }
 
-        // Per-process memory bar, relative to the largest displayed process
-        let max_mem = selected
-            .iter()
-            .map(|p| p.memory_bytes)
-            .max()
-            .unwrap_or(1)
-            .max(1);
-
         let cpu_header = if proc_averages.is_some() {
             "CPU%(AVG)"
         } else {
@@ -445,7 +463,6 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
                     p.pid.to_string(),
                     p.name.clone(),
                     cpu_cell,
-                    gauge(p.memory_bytes as f64 / max_mem as f64, PROC_MEM_GAUGE_WIDTH),
                     mem_cell,
                     cmd_cell(p),
                 ]
@@ -454,12 +471,11 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
         write_table(
             &mut out,
             "PROC",
-            &["PID", "NAME", cpu_header, "", mem_header, "CMD"],
+            &["PID", "NAME", cpu_header, mem_header, "CMD"],
             &[
                 Align::Right,
                 Align::Left,
                 Align::Right,
-                Align::Left,
                 Align::Right,
                 Align::Left,
             ],

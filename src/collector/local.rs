@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
 use sysinfo::{
-    CpuRefreshKind, DiskRefreshKind, Disks, Networks, Pid, ProcessRefreshKind, ProcessesToUpdate,
-    System, UpdateKind,
+    Components, CpuRefreshKind, DiskRefreshKind, Disks, Networks, Pid, ProcessRefreshKind,
+    ProcessesToUpdate, System, UpdateKind,
 };
 
 use crate::collector::Collector;
@@ -29,9 +29,14 @@ use crate::config::CollectorConfig;
 use crate::error::CollectError;
 use crate::snapshot::{
     CpuSnapshot, DiskSnapshot, HostInfo, LoadSnapshot, MemorySnapshot, NetworkSnapshot,
-    ProcessSnapshot, SystemSnapshot,
+    ProcessSnapshot, SystemSnapshot, TemperatureSnapshot,
 };
 use crate::utils::rate::rate_per_sec;
+
+/// Plausible ambient / silicon sensor range; drops firmware garbage such as
+/// the -9200°C placeholders sometimes reported on Apple Silicon.
+const TEMP_CELSIUS_MIN: f32 = -20.0;
+const TEMP_CELSIUS_MAX: f32 = 150.0;
 
 #[derive(Debug, Clone, Copy)]
 struct DiskCounters {
@@ -62,6 +67,7 @@ pub struct LocalCollector {
     system: System,
     disks: Disks,
     networks: Networks,
+    components: Components,
     /// Static host identity (uptime is filled in at collect time)
     host: HostInfo,
     // Internal state: the previous sample used for rate calculation
@@ -72,10 +78,13 @@ pub struct LocalCollector {
     last_disk_storage_refresh: Option<Instant>,
     last_process_refresh: Option<Instant>,
     last_cpu_frequency_refresh: Option<Instant>,
+    last_temperature_refresh: Option<Instant>,
     /// Last collected process list, reused between process refreshes when
     /// `process_refresh_interval` is non-zero. Arc so cache hits and
     /// snapshot clones share the same allocation.
     cached_processes: Option<Arc<Vec<ProcessSnapshot>>>,
+    /// Last temperature sample, reused between temperature refreshes
+    cached_temperatures: Option<Vec<TemperatureSnapshot>>,
 }
 
 impl LocalCollector {
@@ -111,12 +120,16 @@ impl LocalCollector {
         } else {
             Networks::new()
         };
+        // Temperatures are refreshed on their own slow cadence; start empty
+        // so the first collect that is due performs a real read
+        let components = Components::new();
 
         Self {
             config,
             system,
             disks,
             networks,
+            components,
             host,
             last_disk_counters: HashMap::new(),
             last_net_counters: HashMap::new(),
@@ -126,7 +139,9 @@ impl LocalCollector {
             last_process_refresh: None,
             // Frequency was just refreshed above
             last_cpu_frequency_refresh: Some(Instant::now()),
+            last_temperature_refresh: None,
             cached_processes: None,
+            cached_temperatures: None,
         }
     }
 
@@ -467,10 +482,54 @@ impl LocalCollector {
         }
     }
 
+    fn collect_temperatures(&mut self) -> Option<Vec<TemperatureSnapshot>> {
+        if !self.config.collect_temperatures {
+            return None;
+        }
+
+        let due = self.config.temperature_refresh_interval.is_zero()
+            || self
+                .last_temperature_refresh
+                .is_none_or(|t| t.elapsed() >= self.config.temperature_refresh_interval);
+
+        if !due {
+            return self.cached_temperatures.clone();
+        }
+
+        self.components.refresh(true);
+        let mut sensors: Vec<TemperatureSnapshot> = self
+            .components
+            .list()
+            .iter()
+            .filter_map(|c| {
+                let celsius = c.temperature().filter(|t| is_plausible_celsius(*t))?;
+                let max_celsius = c.max().filter(|t| is_plausible_celsius(*t));
+                let critical_celsius = c.critical().filter(|t| is_plausible_celsius(*t));
+                Some(TemperatureSnapshot {
+                    label: c.label().to_string(),
+                    celsius,
+                    max_celsius,
+                    critical_celsius,
+                })
+            })
+            .collect();
+        // Hottest first so UIs can take a prefix without sorting again
+        sensors.sort_by(|a, b| b.celsius.total_cmp(&a.celsius));
+
+        self.last_temperature_refresh = Some(Instant::now());
+        self.cached_temperatures = Some(sensors.clone());
+        Some(sensors)
+    }
+
     fn collect_host(&mut self) -> HostInfo {
         self.host.uptime_secs = System::uptime();
         self.host.clone()
     }
+}
+
+/// Reject NaN/inf and firmware garbage outside a sane silicon/ambient range
+fn is_plausible_celsius(t: f32) -> bool {
+    t.is_finite() && (TEMP_CELSIUS_MIN..=TEMP_CELSIUS_MAX).contains(&t)
 }
 
 /// Whether overall load (in logical-core units) should force a process
@@ -566,6 +625,7 @@ impl Collector for LocalCollector {
             networks: self.collect_networks(elapsed),
             processes: self.collect_processes(processes_due, process_elapsed),
             load: self.collect_load(),
+            temperatures: self.collect_temperatures(),
             extras: HashMap::new(),
         })
     }
@@ -581,6 +641,18 @@ mod tests {
 
     fn key(pid: u32, cpu: f32, mem: u64) -> ProcKey {
         ProcKey { pid, cpu, mem }
+    }
+
+    #[test]
+    fn plausible_celsius_filters_garbage() {
+        assert!(is_plausible_celsius(42.0));
+        assert!(is_plausible_celsius(0.0));
+        assert!(is_plausible_celsius(99.5));
+        assert!(!is_plausible_celsius(f32::NAN));
+        assert!(!is_plausible_celsius(f32::INFINITY));
+        assert!(!is_plausible_celsius(-9201.0));
+        assert!(!is_plausible_celsius(200.0));
+        assert!(!is_plausible_celsius(-50.0));
     }
 
     #[test]

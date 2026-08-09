@@ -87,6 +87,17 @@ pub struct CollectorConfig {
     /// Whether to collect network interface metrics
     pub collect_networks: bool,
 
+    /// Whether to collect hardware temperature sensors (sysinfo Components).
+    /// Platform-dependent: macOS returns many named sensors with occasional
+    /// garbage values (filtered); some environments report none.
+    pub collect_temperatures: bool,
+
+    /// How often to refresh temperatures. Sensors change slowly compared to
+    /// CPU counters, so a multi-second cadence is enough and avoids extra
+    /// IOKit/hwmon work every collect. Between refreshes the last reading
+    /// is reused. Zero refreshes every collect.
+    pub temperature_refresh_interval: Duration,
+
     /// Custom host labels
     pub labels: HashMap<String, String>,
 
@@ -108,6 +119,9 @@ impl Default for CollectorConfig {
             disk_storage_refresh_interval: Duration::from_secs(60),
             dedupe_disks: true,
             collect_networks: true,
+            collect_temperatures: true,
+            // Temps drift over seconds/minutes, not milliseconds
+            temperature_refresh_interval: Duration::from_secs(15),
             labels: HashMap::new(),
             collect_timeout: Duration::from_secs(2),
         }

@@ -71,5 +71,5 @@ pub use scheduler::Scheduler;
 pub use sink::{LocalChannelSink, MetricSink, StdoutSink};
 pub use snapshot::{
     CpuSnapshot, DiskSnapshot, HostInfo, LoadSnapshot, MemorySnapshot, NetworkSnapshot,
-    ProcessSnapshot, SystemSnapshot,
+    ProcessSnapshot, SystemSnapshot, TemperatureSnapshot,
 };

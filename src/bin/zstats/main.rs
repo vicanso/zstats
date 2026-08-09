@@ -52,6 +52,10 @@ Options:
   --no-processes           Skip process collection
   --no-disks               Skip disk collection
   --no-networks            Skip network collection
+  --no-temperatures        Skip hardware temperature sensors
+  --temp-interval <ms>     Temperature refresh cadence (default 15000);
+                           0 = every collect. Temps change slowly so a
+                           multi-second interval is enough
   --process-interval <ms>  Process list refresh cadence; 0 = every collect
                            (default: 0, but serve defaults to 10000)
   --process-boost <cores>  While overall load is at least this many logical
@@ -219,6 +223,16 @@ fn parse_args(raw: Vec<String>) -> Result<CliArgs, String> {
             "--no-processes" => args.config.collect_processes = false,
             "--no-disks" => args.config.collect_disks = false,
             "--no-networks" => args.config.collect_networks = false,
+            "--no-temperatures" => args.config.collect_temperatures = false,
+            "--temp-interval" => {
+                let value = iter
+                    .next()
+                    .ok_or("--temp-interval requires a value in milliseconds")?;
+                let ms: u64 = value
+                    .parse()
+                    .map_err(|_| format!("invalid interval: {value}"))?;
+                args.config.temperature_refresh_interval = Duration::from_millis(ms);
+            }
             "--interval" => {
                 let value = iter
                     .next()

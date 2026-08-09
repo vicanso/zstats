@@ -391,6 +391,7 @@ mod tests {
                 load5: 0.0,
                 load15: 0.0,
             },
+            temperatures: None,
             extras: Default::default(),
         }
     }

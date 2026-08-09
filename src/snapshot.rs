@@ -51,6 +51,12 @@ pub struct SystemSnapshot {
     /// Load averages
     pub load: LoadSnapshot,
 
+    /// Hardware temperature sensors; None when temperature collection is
+    /// disabled. Empty vec means collection ran but no plausible readings
+    /// were available (platform/driver dependent). Sorted hottest-first.
+    #[serde(default)]
+    pub temperatures: Option<Vec<TemperatureSnapshot>>,
+
     /// Extension fields (reserved)
     #[serde(default)]
     pub extras: HashMap<String, serde_json::Value>,
@@ -156,4 +162,23 @@ pub struct LoadSnapshot {
     pub load1: f64,
     pub load5: f64,
     pub load15: f64,
+}
+
+/// One hardware temperature sensor (CPU die, battery, NAND, …).
+///
+/// Labels and availability are platform-specific. On macOS the names are
+/// often raw firmware strings (e.g. `PMU tdie8`); values outside a
+/// plausible range are dropped by the collector.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TemperatureSnapshot {
+    /// Sensor label as reported by the OS / sysinfo
+    pub label: String,
+    /// Current temperature in Celsius
+    pub celsius: f32,
+    /// Highest reading observed for this sensor (when available)
+    #[serde(default)]
+    pub max_celsius: Option<f32>,
+    /// Critical / shutdown threshold (when available)
+    #[serde(default)]
+    pub critical_celsius: Option<f32>,
 }

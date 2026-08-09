@@ -153,6 +153,7 @@ fn config_toggles_are_respected() {
         per_core_cpu: false,
         collect_disks: false,
         collect_networks: false,
+        collect_temperatures: false,
         ..Default::default()
     };
     let mut collector = LocalCollector::new(config);
@@ -162,6 +163,39 @@ fn config_toggles_are_respected() {
     assert!(snapshot.cpu.per_core_usage.is_empty());
     assert!(snapshot.disks.is_none());
     assert!(snapshot.networks.is_none());
+    assert!(snapshot.temperatures.is_none());
+}
+
+#[test]
+fn temperatures_refresh_interval_reuses_cache() {
+    let config = CollectorConfig {
+        collect_temperatures: true,
+        // Effectively never re-refresh within this test
+        temperature_refresh_interval: Duration::from_secs(3600),
+        collect_processes: false,
+        ..Default::default()
+    };
+    let mut collector = LocalCollector::new(config);
+    let first = collector.collect().expect("first");
+    let second = collector.collect().expect("second");
+
+    let a = first.temperatures.expect("temps enabled");
+    let b = second.temperatures.expect("temps enabled");
+    // Same cached sample (labels + values bit-identical)
+    assert_eq!(a.len(), b.len());
+    for (x, y) in a.iter().zip(b.iter()) {
+        assert_eq!(x.label, y.label);
+        assert_eq!(x.celsius.to_bits(), y.celsius.to_bits());
+    }
+    // Plausible filter: no absurd firmware placeholders
+    for t in &a {
+        assert!(
+            (-20.0..=150.0).contains(&t.celsius),
+            "implausible temp {} for {}",
+            t.celsius,
+            t.label
+        );
+    }
 }
 
 struct FailingSink;

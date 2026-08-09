@@ -35,8 +35,9 @@ Collector (trait, sync) ──SystemSnapshot──▶ Scheduler ──concurrent
 
 - **`SystemSnapshot` is the single data contract**: host info (including
   uptime), CPU (overall, per-core, frequency on a slower cadence),
-  memory/swap, load averages, and — each individually toggleable — disks
-  (capacity + IO rates, kind, removable; optional per-device dedupe),
+  memory/swap, load averages, hardware temperatures (slow cadence; platform
+  sensors with garbage values filtered), and — each individually toggleable —
+  disks (capacity + IO rates, kind, removable; optional per-device dedupe),
   network interfaces (rx/tx byte/packet/error rates), and processes (top-N
   by CPU and by memory, with command lines, virtual memory, run time, and
   optional per-process disk IO). Serde-serializable; timestamps are RFC 3339
@@ -106,7 +107,8 @@ expensive subsystems are opt-out and throttled (`CollectorConfig`):
 
 | Knob | Default | Effect |
 |------|---------|--------|
-| `collect_disks` / `collect_networks` / `collect_processes` | `true` | Disable a subsystem entirely (its snapshot field becomes `None`) |
+| `collect_disks` / `collect_networks` / `collect_processes` / `collect_temperatures` | `true` | Disable a subsystem entirely (its snapshot field becomes `None`) |
+| `temperature_refresh_interval` | 15s | Hardware temps change slowly; readings are reused between refreshes |
 | `disk_storage_refresh_interval` | 60s | Disk capacity (statfs, the most expensive call) refreshes on its own slow cadence; IO counters still refresh every collect |
 | `dedupe_disks` | `true` | Keep one entry per device name (shortest mount); collapses APFS synthetic mounts |
 | `cpu_frequency_refresh_interval` | 30s | CPU frequency refreshes on its own cadence; usage still every collect |

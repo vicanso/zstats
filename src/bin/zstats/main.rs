@@ -492,6 +492,21 @@ fn main() -> ExitCode {
                 return detach_self();
             }
 
+            // Timestamped, leveled logs for the daemon: visible in the
+            // foreground, appended to the log file when detached. This also
+            // surfaces the lib Scheduler's own tracing warnings (sink
+            // failures, collect timeouts), which are dropped otherwise.
+            // Level via ZSTATS_LOG (error|warn|info|debug|trace), default info
+            let level = std::env::var("ZSTATS_LOG")
+                .ok()
+                .and_then(|l| l.parse::<tracing::Level>().ok())
+                .unwrap_or(tracing::Level::INFO);
+            let _ = tracing_subscriber::fmt()
+                .with_max_level(level)
+                .with_writer(std::io::stderr)
+                .with_ansi(std::io::stderr().is_terminal())
+                .try_init();
+
             let interval = file.daemon.interval.unwrap_or(Duration::from_millis(2000));
             let history = file.daemon.history.unwrap_or(Duration::from_secs(300));
             let mut config = base_collector;

@@ -154,6 +154,13 @@ pub async fn serve(
         return ExitCode::FAILURE;
     }
 
+    tracing::info!(
+        "daemon started: socket {}, interval {}, history {}",
+        path.display(),
+        zstats::config::format_duration(interval),
+        zstats::config::format_duration(retention),
+    );
+
     let accept_task = {
         let shutdown = Arc::clone(&shutdown);
         tokio::spawn(async move {
@@ -180,6 +187,7 @@ pub async fn serve(
     scheduler.stop().await;
     accept_task.abort();
     let _ = std::fs::remove_file(&path);
+    tracing::info!("daemon stopped");
     ExitCode::SUCCESS
 }
 

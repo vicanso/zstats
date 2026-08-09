@@ -1,0 +1,100 @@
+# zstats configuration reference.
+#
+# Live location: <config-dir>/config.toml (default ~/.zstats/config.toml;
+# override with --config-dir). Every key is optional — a missing key uses
+# the builtin default shown here. The file is usually managed through
+# `zstats -add <key> <value>` / `-remove <key>` / `-list`, but editing it
+# by hand is fine.
+#
+# Durations accept "500ms", "2s", "5m", "1h", or a bare integer meaning
+# milliseconds. A cadence of "0s" means "refresh on every collect".
+#
+# `zstats serve` reads everything below; the foreground live view (bare
+# `zstats`) uses only the [collector] on/off toggles and forces every
+# cadence to a fixed 2s beat. The [alerts] section is hot-reloaded by a
+# running daemon within ~30 collects; other changes need a daemon restart.
+
+[collector]
+# ------------------------------------------------------------------ processes
+# Process table collection (the PROC view and per-process alerting)
+collect_processes = true
+# How often to walk the full process table. "0s" = every collect; the
+# daemon defaults to "10s" when left at zero (cuts steady-state CPU from
+# ~1.3% to ~0.45% on a 12-core laptop)
+process_refresh_interval = "0s"
+# While overall load is at least this many logical cores of work, the
+# process list refreshes every collect regardless of the cadence above —
+# busy periods get precise attribution. 1.0 = one full core; scales with
+# machine size (25% overall on 4 cores, ~1.6% on 64). 0 disables
+process_boost_cpu_cores = 1.0
+# Kept processes; the budget is split between top-by-CPU and top-by-memory
+# so idle memory hogs stay visible
+max_processes = 50
+# Per-process disk read/write rates (extra refresh cost on every pass)
+collect_process_disk_io = false
+
+# ------------------------------------------------------------------------ cpu
+# Per-core usage list in snapshots (overall usage is always collected)
+per_core_cpu = true
+# CPU frequency changes slowly; refreshing it every collect is wasted work
+cpu_frequency_refresh_interval = "30s"
+
+# ---------------------------------------------------------------------- disks
+collect_disks = true
+# Disk sampling cadence (IO counters + snapshot rebuild)
+disk_io_refresh_interval = "0s"
+# Capacity (statfs) is ~25x more expensive than IO counters and barely
+# changes — it throttles separately underneath the disk cadence
+disk_storage_refresh_interval = "1m"
+# Collapse APFS synthetic mounts (e.g. "/" and "/System/Volumes/Data")
+# into one entry per device name, preferring the shortest mount point
+dedupe_disks = true
+
+# ------------------------------------------------------------------- networks
+collect_networks = true
+network_refresh_interval = "0s"
+
+# --------------------------------------------------------------- temperatures
+# Hardware sensors via sysinfo Components; platform-dependent, implausible
+# firmware readings are filtered out
+collect_temperatures = true
+temperature_refresh_interval = "15s"
+
+# ----------------------------------------------------------------------- misc
+# Hard cap for one collect pass (guards against platform calls that hang)
+collect_timeout = "2s"
+
+# Custom host labels attached to every snapshot (for multi-machine setups)
+[collector.labels]
+# env = "home"
+# role = "laptop"
+
+[daemon]
+# Collection interval for `zstats serve`
+interval = "2s"
+# How much snapshot history the daemon keeps for `zstats attach` replay
+history = "5m"
+# serve detaches into the background by default; set false (or pass
+# --foreground) to keep it in the terminal
+detach = true
+
+[alerts]
+# Desktop notification when a process's 1-minute average CPU reaches this
+# threshold (single-core units: 100 = one full core; same scale as the
+# PROC table). 0 disables the rule
+cpu = 30.0
+# ... or when its 1-minute average share of total memory reaches this
+# percentage. 0 disables
+mem = 25.0
+# Minimum time between repeated alerts for the same process and rule
+cooldown = "10m"
+
+# Per-process threshold overrides (case-insensitive process names).
+# A higher bar for apps that are legitimately busy in your workflow —
+# unlike an ignore list, a real runaway still alerts. 0 disables the
+# rule for that process only
+[alerts.cpu_overrides]
+# ghostty = 100.0
+
+[alerts.mem_overrides]
+# "Google Chrome" = 50.0

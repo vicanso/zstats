@@ -239,12 +239,7 @@ impl AlertSink {
         reload.rounds_since_check = 0;
 
         let mtime = config_mtime();
-        if std::env::var_os("ZSTATS_ALERT_DEBUG").is_some() {
-            eprintln!(
-                "[alert-debug] reload check: mtime={mtime:?} last={:?}",
-                reload.last_mtime
-            );
-        }
+        tracing::debug!(?mtime, last = ?reload.last_mtime, "alert config reload check");
         if mtime == reload.last_mtime {
             return;
         }
@@ -254,13 +249,10 @@ impl AlertSink {
             Ok(file) => {
                 *self.active.lock().unwrap_or_else(|e| e.into_inner()) =
                     merge_thresholds(cli, &file.alerts);
-                eprintln!(
-                    "[zstats alert] reloaded config from {}",
-                    settings::path().display()
-                );
+                tracing::info!("reloaded alert config from {}", settings::path().display());
             }
             Err(e) => {
-                eprintln!("[zstats alert] config reload failed, keeping previous settings: {e}");
+                tracing::warn!("alert config reload failed, keeping previous settings: {e}");
             }
         }
     }
@@ -268,11 +260,8 @@ impl AlertSink {
     /// Record the snapshot and return the alerts that should fire now.
     /// Separated from `write` (with an injectable clock) for testability
     fn record_and_evaluate(&self, now: Instant, snapshot: &SystemSnapshot) -> Vec<AlertEvent> {
-        let debug = std::env::var_os("ZSTATS_ALERT_DEBUG").is_some();
         let Some(processes) = snapshot.processes.as_deref() else {
-            if debug {
-                eprintln!("[alert-debug] snapshot has no processes");
-            }
+            tracing::debug!("alert evaluation skipped: snapshot has no processes");
             return Vec::new();
         };
         let total_memory = snapshot.memory.total_bytes;
@@ -303,14 +292,14 @@ impl AlertSink {
                 .front()
                 .map(|(t, ..)| now.duration_since(*t))
                 .unwrap_or(Duration::ZERO);
-            if debug && p.cpu_usage_percent > 20.0 {
-                eprintln!(
-                    "[alert-debug] pid={} name={} cpu={:.1} samples={} span={}s",
-                    p.pid,
-                    p.name,
-                    p.cpu_usage_percent,
-                    samples.len(),
-                    span.as_secs()
+            if p.cpu_usage_percent > 20.0 {
+                tracing::debug!(
+                    pid = p.pid,
+                    name = %p.name,
+                    cpu = p.cpu_usage_percent,
+                    samples = samples.len(),
+                    span_secs = span.as_secs(),
+                    "alert window state"
                 );
             }
             if span < MIN_SPAN {
@@ -428,10 +417,10 @@ impl MetricSink for AlertSink {
     async fn write(&self, snapshot: &SystemSnapshot) -> Result<(), SinkError> {
         self.maybe_reload();
         for event in self.record_and_evaluate(Instant::now(), snapshot) {
-            // Also log to stderr: visible when serve runs in the foreground,
-            // and it separates "rule fired" from "notification displayed"
-            // when debugging delivery issues
-            eprintln!("[zstats alert] {}", event.message);
+            // Also log the alert: visible in the daemon log with a
+            // timestamp, and it separates "rule fired" from "notification
+            // displayed" when debugging delivery issues
+            tracing::info!("alert: {}", event.message);
             send_notification(&event.message);
         }
         Ok(())

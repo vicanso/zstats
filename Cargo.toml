@@ -33,6 +33,7 @@ cli = [
     "config",
     "runtime",
     "dep:libc",
+    "dep:tracing-subscriber",
     "dep:unicode-width",
     "tokio/io-std",
     "tokio/io-util",
@@ -51,6 +52,7 @@ sysinfo = "0.39.6"
 tokio = { version = "1.53.1", optional = true }
 toml = { version = "1.1.4", optional = true }
 tracing = { version = "0.1.44", optional = true }
+tracing-subscriber = { version = "0.3", optional = true }
 unicode-width = { version = "0.2", optional = true }
 
 [target.'cfg(unix)'.dependencies]

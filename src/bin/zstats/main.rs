@@ -16,6 +16,7 @@
 mod alerts;
 #[cfg(unix)]
 mod daemon;
+mod keys;
 mod render;
 mod settings;
 
@@ -35,7 +36,8 @@ zstats - system performance metrics collector
 Usage:
   zstats [options]         Collect once and print (default)
   zstats serve [options]   Run the collector daemon, keeping recent history
-  zstats attach            Attach to the daemon: replay history, then live view
+  zstats attach            Attach to the daemon: replay history, then live view.
+                           Keys: q/Ctrl+C/d detach (daemon keeps running)
   zstats stop              Stop the daemon
 
 Options:
@@ -426,90 +428,6 @@ fn run_once(config: CollectorConfig, format: OutputFormat) -> ExitCode {
     }
 }
 
-enum WatchExit {
-    Quit,
-    Detach,
-}
-
-/// Put stdin into raw-ish mode (no line buffering, no echo) so single
-/// keypresses arrive immediately. ISIG stays on, so Ctrl+C still works.
-/// Restores the original settings on drop
-#[cfg(unix)]
-struct RawMode {
-    original: libc::termios,
-}
-
-#[cfg(unix)]
-impl RawMode {
-    fn enable() -> Option<Self> {
-        unsafe {
-            if libc::isatty(libc::STDIN_FILENO) == 0 {
-                return None;
-            }
-            let mut term = std::mem::zeroed::<libc::termios>();
-            if libc::tcgetattr(libc::STDIN_FILENO, &mut term) != 0 {
-                return None;
-            }
-            let original = term;
-            term.c_lflag &= !(libc::ICANON | libc::ECHO);
-            term.c_cc[libc::VMIN] = 1;
-            term.c_cc[libc::VTIME] = 0;
-            if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &term) != 0 {
-                return None;
-            }
-            Some(Self { original })
-        }
-    }
-}
-
-#[cfg(unix)]
-impl Drop for RawMode {
-    fn drop(&mut self) {
-        unsafe {
-            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.original);
-        }
-    }
-}
-
-/// Wait for the user to end watch mode: Ctrl+C always quits; on an
-/// interactive terminal `q` quits and `d` detaches into a daemon
-#[cfg(unix)]
-async fn wait_watch_exit(interactive: bool) -> WatchExit {
-    use tokio::io::AsyncReadExt as _;
-
-    let raw = if interactive { RawMode::enable() } else { None };
-    if raw.is_none() {
-        let _ = tokio::signal::ctrl_c().await;
-        return WatchExit::Quit;
-    }
-    let _raw = raw;
-
-    let mut stdin = tokio::io::stdin();
-    let mut buf = [0u8; 1];
-    loop {
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => return WatchExit::Quit,
-            result = stdin.read(&mut buf) => match result {
-                Ok(n) if n > 0 => match buf[0] {
-                    b'q' | b'Q' => return WatchExit::Quit,
-                    b'd' | b'D' => return WatchExit::Detach,
-                    _ => {}
-                },
-                _ => {
-                    let _ = tokio::signal::ctrl_c().await;
-                    return WatchExit::Quit;
-                }
-            }
-        }
-    }
-}
-
-#[cfg(not(unix))]
-async fn wait_watch_exit(_interactive: bool) -> WatchExit {
-    let _ = tokio::signal::ctrl_c().await;
-    WatchExit::Quit
-}
-
 /// Hand the current watch session over to a background daemon
 #[cfg(unix)]
 fn detach_into_daemon() -> ExitCode {
@@ -574,13 +492,13 @@ async fn run_watch(config: CollectorConfig, interval: Duration, format: OutputFo
         return ExitCode::FAILURE;
     }
 
-    let exit = wait_watch_exit(interactive).await;
+    let exit = keys::wait_live_exit(interactive).await;
     scheduler.stop().await;
     render::leave_live_screen(interactive);
 
     match exit {
-        WatchExit::Quit => ExitCode::SUCCESS,
-        WatchExit::Detach => detach_into_daemon(),
+        keys::LiveExit::Quit => ExitCode::SUCCESS,
+        keys::LiveExit::Detach => detach_into_daemon(),
     }
 }
 

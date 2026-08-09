@@ -229,8 +229,12 @@ async fn handle_client(
 }
 
 /// Attach to the daemon: replay buffered history, then follow live data.
-/// Ctrl+C detaches; the daemon keeps running
+/// `q` / `d` / Ctrl+C all leave the client; the daemon keeps running.
 pub async fn attach() -> ExitCode {
+    use tokio::io::AsyncReadExt as _;
+
+    use crate::keys::{self, LiveExit, RawMode};
+
     let path = socket_path();
     let stream = match UnixStream::connect(&path).await {
         Ok(stream) => stream,
@@ -252,8 +256,11 @@ pub async fn attach() -> ExitCode {
         .and_then(|n| n.trim().parse().ok())
         .unwrap_or(0);
 
-    let sink = TextSink::new();
     let interactive = enter_live_screen();
+    let mut sink = TextSink::new();
+    if interactive {
+        sink = sink.with_footer("q/d detach · daemon keeps running");
+    }
 
     // Replay history: absorb everything except the newest snapshot so the
     // rolling averages are warm, then render the newest immediately
@@ -271,19 +278,43 @@ pub async fn attach() -> ExitCode {
         }
     }
 
+    // Keys only work with raw stdin; when that fails, fall back to Ctrl+C
+    let raw = if interactive { RawMode::enable() } else { None };
+    let keys_enabled = raw.is_some();
+    let _raw = raw;
+
+    let mut stdin = tokio::io::stdin();
+    let mut buf = [0u8; 1];
     let mut daemon_gone = false;
+    let mut exit = LiveExit::Quit;
+
     loop {
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => break,
-            line = lines.next_line() => match line {
-                Ok(Some(line)) => {
-                    if let Ok(snapshot) = serde_json::from_str::<SystemSnapshot>(&line) {
-                        let _ = sink.write(&snapshot).await;
-                    }
-                }
-                _ => {
-                    daemon_gone = true;
+            _ = tokio::signal::ctrl_c() => {
+                exit = LiveExit::Quit;
+                break;
+            }
+            result = stdin.read(&mut buf), if keys_enabled => {
+                // stdin closed or error: keep following the daemon stream
+                if let Ok(n) = result
+                    && n > 0
+                    && let Some(action) = keys::key_to_exit(buf[0])
+                {
+                    exit = action;
                     break;
+                }
+            }
+            line = lines.next_line() => {
+                match line {
+                    Ok(Some(line)) => {
+                        if let Ok(snapshot) = serde_json::from_str::<SystemSnapshot>(&line) {
+                            let _ = sink.write(&snapshot).await;
+                        }
+                    }
+                    _ => {
+                        daemon_gone = true;
+                        break;
+                    }
                 }
             }
         }
@@ -292,6 +323,12 @@ pub async fn attach() -> ExitCode {
     leave_live_screen(interactive);
     if daemon_gone {
         eprintln!("zstats daemon closed the connection");
+    } else if matches!(exit, LiveExit::Detach | LiveExit::Quit) {
+        // Leaving the client is intentional; remind how to come back
+        println!(
+            "detached; daemon still running (log: {}). reattach with `zstats attach`",
+            log_path().display()
+        );
     }
     ExitCode::SUCCESS
 }

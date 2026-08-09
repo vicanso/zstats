@@ -15,16 +15,37 @@
 //! Human-readable text rendering (CLI only; the library itself has no
 //! notion of presentation).
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
+use std::io::{IsTerminal, Write as _};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use jiff::tz::TimeZone;
-use zstats::{MetricSink, SinkError, SystemSnapshot, async_trait};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use zstats::{MetricSink, ProcessSnapshot, SinkError, SystemSnapshot, async_trait};
 
-/// Max number of processes to display
-const TOP_PROCESSES: usize = 5;
+/// PROC table: rows ranked by CPU, then rows ranked by memory
+const PROC_CPU_ROWS: usize = 5;
+const PROC_MEM_ROWS: usize = 4;
 
-/// Max display width (in chars) of the process command line
+/// Max display width (in columns) of the process command line
 const CMD_MAX_WIDTH: usize = 50;
+
+/// Gauge widths: the header gauges (CPU/MEM/SWP/LOAD), the per-disk usage
+/// bar, and the per-process memory bar
+const GAUGE_WIDTH: usize = 20;
+const DISK_GAUGE_WIDTH: usize = 14;
+const PROC_MEM_GAUGE_WIDTH: usize = 10;
+
+/// Rolling window for per-process averages in watch mode
+const AVG_WINDOW: Duration = Duration::from_secs(60);
+
+/// Per-process rolling averages over [`AVG_WINDOW`]: (cpu %, memory bytes)
+type ProcAverages = HashMap<u32, (f32, u64)>;
+
+/// One recorded sample: (when, cpu %, memory bytes)
+type ProcSample = (Instant, f32, u64);
 
 /// Width of the section label column ("HOST  ", "DISK  ", ...)
 const LABEL_WIDTH: usize = 6;
@@ -32,6 +53,83 @@ const LABEL_WIDTH: usize = 6;
 enum Align {
     Left,
     Right,
+}
+
+/// ANSI styling, disabled when the output is not a terminal so piped
+/// output stays plain text
+#[derive(Clone, Copy)]
+struct Theme {
+    enabled: bool,
+}
+
+impl Theme {
+    const fn plain() -> Self {
+        Self { enabled: false }
+    }
+
+    fn paint(&self, code: &str, text: &str) -> String {
+        if self.enabled && !text.is_empty() {
+            format!("\x1b[{code}m{text}\x1b[0m")
+        } else {
+            text.to_string()
+        }
+    }
+}
+
+/// SGR color codes
+const RED_BOLD: &str = "1;31";
+const YELLOW: &str = "33";
+const GREEN: &str = "32";
+const DIM: &str = "2";
+
+/// Color for a utilization level: green under `warn`, yellow between,
+/// bold red above `crit`
+fn level_color(fraction: f64, warn: f64, crit: f64) -> &'static str {
+    if fraction >= crit {
+        RED_BOLD
+    } else if fraction >= warn {
+        YELLOW
+    } else {
+        GREEN
+    }
+}
+
+/// Display width of a string, ignoring ANSI escape sequences
+fn visible_width(s: &str) -> usize {
+    let mut width = 0;
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip the escape sequence up to its final letter
+            for follow in chars.by_ref() {
+                if follow.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            width += c.width().unwrap_or(0);
+        }
+    }
+    width
+}
+
+/// Render a block gauge like `██████░░░░░░` for a 0.0–1.0 fraction
+fn gauge(fraction: f64, width: usize) -> String {
+    let filled = (fraction.clamp(0.0, 1.0) * width as f64).round() as usize;
+    let mut bar = "█".repeat(filled);
+    bar.push_str(&"░".repeat(width - filled));
+    bar
+}
+
+/// Gauge with the filled part colored by utilization level and the empty
+/// part dimmed
+fn styled_gauge(fraction: f64, width: usize, theme: Theme) -> String {
+    let filled = (fraction.clamp(0.0, 1.0) * width as f64).round() as usize;
+    format!(
+        "{}{}",
+        theme.paint(level_color(fraction, 0.6, 0.85), &"█".repeat(filled)),
+        theme.paint(DIM, &"░".repeat(width - filled)),
+    )
 }
 
 /// Write a section as an aligned table: a header row prefixed by the section
@@ -43,15 +141,18 @@ fn write_table(
     headers: &[&str],
     aligns: &[Align],
     rows: &[Vec<String>],
+    theme: Theme,
 ) {
     if rows.is_empty() {
         return;
     }
 
-    let mut widths: Vec<usize> = headers.iter().map(|h| h.len()).collect();
+    // Measure by visible display width: cells may contain ANSI escapes
+    // (colors) and wide CJK chars
+    let mut widths: Vec<usize> = headers.iter().map(|h| visible_width(h)).collect();
     for row in rows {
         for (i, cell) in row.iter().enumerate() {
-            widths[i] = widths[i].max(cell.len());
+            widths[i] = widths[i].max(visible_width(cell));
         }
     }
 
@@ -61,22 +162,28 @@ fn write_table(
             if i > 0 {
                 line.push_str("  ");
             }
-            let width = widths[i];
+            let pad = widths[i].saturating_sub(visible_width(cell));
             match aligns[i] {
                 Align::Right => {
-                    let _ = write!(line, "{cell:>width$}");
+                    line.push_str(&" ".repeat(pad));
+                    line.push_str(cell);
                 }
                 // Left-aligned last column: no trailing padding
                 Align::Left if i == cells.len() - 1 => line.push_str(cell),
                 Align::Left => {
-                    let _ = write!(line, "{cell:<width$}");
+                    line.push_str(cell);
+                    line.push_str(&" ".repeat(pad));
                 }
             }
         }
         line
     };
 
-    let _ = writeln!(out, "{label:<LABEL_WIDTH$}{}", render_row(headers));
+    let _ = writeln!(
+        out,
+        "{label:<LABEL_WIDTH$}{}",
+        theme.paint(DIM, &render_row(headers))
+    );
     for row in rows {
         let cells: Vec<&str> = row.iter().map(String::as_str).collect();
         let _ = writeln!(out, "{:<LABEL_WIDTH$}{}", "", render_row(&cells));
@@ -84,6 +191,10 @@ fn write_table(
 }
 
 pub fn render(s: &SystemSnapshot) -> String {
+    render_with(s, None, Theme::plain())
+}
+
+fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: Theme) -> String {
     let mut out = String::new();
 
     let _ = writeln!(
@@ -105,32 +216,70 @@ pub fn render(s: &SystemSnapshot) -> String {
         .unwrap_or_default();
     let _ = writeln!(
         out,
-        "CPU   {:.1}%  {} cores{}  load {:.2} / {:.2} / {:.2}",
-        s.cpu.usage_percent, s.cpu.logical_cores, freq, s.load.load1, s.load.load5, s.load.load15,
+        "CPU   {}  {:>5.1}%  {} cores{}",
+        styled_gauge(f64::from(s.cpu.usage_percent) / 100.0, GAUGE_WIDTH, theme),
+        s.cpu.usage_percent,
+        s.cpu.logical_cores,
+        freq,
     );
 
-    let mem_percent = if s.memory.total_bytes > 0 {
-        s.memory.used_bytes as f64 / s.memory.total_bytes as f64 * 100.0
+    let mem_fraction = if s.memory.total_bytes > 0 {
+        s.memory.used_bytes as f64 / s.memory.total_bytes as f64
     } else {
         0.0
     };
     let _ = writeln!(
         out,
-        "MEM   {} / {} ({:.1}%)  swap {} / {}",
+        "MEM   {}  {:>5.1}%  {} / {}",
+        styled_gauge(mem_fraction, GAUGE_WIDTH, theme),
+        mem_fraction * 100.0,
         human_bytes(s.memory.used_bytes),
         human_bytes(s.memory.total_bytes),
-        mem_percent,
-        human_bytes(s.memory.swap_used_bytes),
-        human_bytes(s.memory.swap_total_bytes),
+    );
+
+    if s.memory.swap_total_bytes > 0 {
+        let swap_fraction = s.memory.swap_used_bytes as f64 / s.memory.swap_total_bytes as f64;
+        let _ = writeln!(
+            out,
+            "SWP   {}  {:>5.1}%  {} / {}",
+            styled_gauge(swap_fraction, GAUGE_WIDTH, theme),
+            swap_fraction * 100.0,
+            human_bytes(s.memory.swap_used_bytes),
+            human_bytes(s.memory.swap_total_bytes),
+        );
+    }
+
+    // Load gauge is scaled against the core count: 1.0 per core = full
+    let load_fraction = if s.cpu.logical_cores > 0 {
+        s.load.load1 / f64::from(s.cpu.logical_cores)
+    } else {
+        0.0
+    };
+    let _ = writeln!(
+        out,
+        "LOAD  {}  {:>6.2}  {:.2} · {:.2}",
+        styled_gauge(load_fraction, GAUGE_WIDTH, theme),
+        s.load.load1,
+        s.load.load5,
+        s.load.load15,
     );
 
     if let Some(disks) = &s.disks {
         let rows: Vec<Vec<String>> = disks
             .iter()
             .map(|d| {
+                let used = d.total_bytes.saturating_sub(d.available_bytes);
+                let fraction = if d.total_bytes > 0 {
+                    used as f64 / d.total_bytes as f64
+                } else {
+                    0.0
+                };
+                // Highlight disks over 90% usage in bold red
+                let color = level_color(fraction, 0.7, 0.9);
                 vec![
-                    d.name.clone(),
                     d.mount_point.clone(),
+                    theme.paint(color, &gauge(fraction, DISK_GAUGE_WIDTH)),
+                    theme.paint(color, &format!("{:.1}%", fraction * 100.0)),
                     human_bytes(d.available_bytes),
                     human_bytes(d.total_bytes),
                     human_rate(d.read_bytes_per_sec),
@@ -141,7 +290,7 @@ pub fn render(s: &SystemSnapshot) -> String {
         write_table(
             &mut out,
             "DISK",
-            &["NAME", "MOUNT", "FREE", "TOTAL", "READ", "WRITE"],
+            &["MOUNT", "USED", "USE%", "FREE", "TOTAL", "READ", "WRITE"],
             &[
                 Align::Left,
                 Align::Left,
@@ -149,8 +298,10 @@ pub fn render(s: &SystemSnapshot) -> String {
                 Align::Right,
                 Align::Right,
                 Align::Right,
+                Align::Right,
             ],
             &rows,
+            theme,
         );
     }
 
@@ -173,46 +324,104 @@ pub fn render(s: &SystemSnapshot) -> String {
             write_table(
                 &mut out,
                 "NET",
-                &["IFACE", "RX", "TX"],
+                &["IFACE", "RX↓", "TX↑"],
                 &[Align::Left, Align::Right, Align::Right],
                 &rows,
+                theme,
             );
         }
     }
 
     if let Some(processes) = &s.processes {
-        let rows: Vec<Vec<String>> = processes
+        // cmd can be empty (e.g. no permission to read other users'
+        // processes); fall back to "-" so the column stays readable
+        let cmd_cell = |p: &ProcessSnapshot| {
+            if p.cmd.is_empty() {
+                "-".to_string()
+            } else {
+                truncate_width(&p.cmd, CMD_MAX_WIDTH)
+            }
+        };
+
+        let avg_of = |p: &ProcessSnapshot| proc_averages.and_then(|m| m.get(&p.pid)).copied();
+        let cpu_key = |p: &ProcessSnapshot| avg_of(p).map_or(p.cpu_usage_percent, |(c, _)| c);
+        let mem_key = |p: &ProcessSnapshot| avg_of(p).map_or(p.memory_bytes, |(_, m)| m);
+
+        // One PROC table: the top rows ranked by CPU, then the top memory
+        // processes appended, so heavy-but-idle processes stay visible.
+        // With rolling averages available (watch mode), rank by the average
+        // so the ordering doesn't reshuffle on every tick
+        let mut by_cpu: Vec<&ProcessSnapshot> = processes.iter().collect();
+        by_cpu.sort_by(|a, b| cpu_key(b).total_cmp(&cpu_key(a)));
+        let mut selected: Vec<&ProcessSnapshot> =
+            by_cpu.iter().copied().take(PROC_CPU_ROWS).collect();
+
+        let mut by_mem: Vec<&ProcessSnapshot> = processes.iter().collect();
+        by_mem.sort_by_key(|p| std::cmp::Reverse(mem_key(p)));
+        for p in by_mem {
+            if selected.len() >= PROC_CPU_ROWS + PROC_MEM_ROWS {
+                break;
+            }
+            if selected.iter().all(|q| q.pid != p.pid) {
+                selected.push(p);
+            }
+        }
+
+        // Per-process memory bar, relative to the largest displayed process
+        let max_mem = selected
             .iter()
-            .take(TOP_PROCESSES)
+            .map(|p| p.memory_bytes)
+            .max()
+            .unwrap_or(1)
+            .max(1);
+
+        let cpu_header = if proc_averages.is_some() {
+            "CPU%(AVG)"
+        } else {
+            "CPU%"
+        };
+        let mem_header = if proc_averages.is_some() {
+            "MEM(AVG)"
+        } else {
+            "MEM"
+        };
+        let rows: Vec<Vec<String>> = selected
+            .iter()
             .map(|p| {
-                // cmd can be empty (e.g. no permission to read other users'
-                // processes); fall back to "-" so the column stays readable
-                let cmd = if p.cmd.is_empty() {
-                    "-".to_string()
-                } else {
-                    truncate_chars(&p.cmd, CMD_MAX_WIDTH)
+                let cpu_cell = match avg_of(p) {
+                    Some((avg, _)) => format!("{:.1}({avg:.1})", p.cpu_usage_percent),
+                    None => format!("{:.1}", p.cpu_usage_percent),
+                };
+                let mem_cell = match avg_of(p) {
+                    Some((_, avg)) => {
+                        format!("{}({})", human_bytes(p.memory_bytes), human_bytes(avg))
+                    }
+                    None => human_bytes(p.memory_bytes),
                 };
                 vec![
                     p.pid.to_string(),
-                    format!("{:.1}", p.cpu_usage_percent),
-                    human_bytes(p.memory_bytes),
                     p.name.clone(),
-                    cmd,
+                    cpu_cell,
+                    gauge(p.memory_bytes as f64 / max_mem as f64, PROC_MEM_GAUGE_WIDTH),
+                    mem_cell,
+                    cmd_cell(p),
                 ]
             })
             .collect();
         write_table(
             &mut out,
-            "TOP",
-            &["PID", "CPU%", "MEM", "NAME", "CMD"],
+            "PROC",
+            &["PID", "NAME", cpu_header, "", mem_header, "CMD"],
             &[
                 Align::Right,
-                Align::Right,
+                Align::Left,
                 Align::Right,
                 Align::Left,
+                Align::Right,
                 Align::Left,
             ],
             &rows,
+            theme,
         );
     }
 
@@ -242,23 +451,98 @@ fn human_rate(rate: Option<u64>) -> String {
     }
 }
 
-/// Truncate to at most `max` chars, appending an ellipsis when cut
-fn truncate_chars(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
+/// Truncate to at most `max` display columns, appending an ellipsis when cut
+fn truncate_width(s: &str, max: usize) -> String {
+    if s.width() <= max {
         return s.to_string();
     }
-    let mut truncated: String = s.chars().take(max.saturating_sub(1)).collect();
+    let budget = max.saturating_sub(1);
+    let mut truncated = String::new();
+    let mut used = 0;
+    for c in s.chars() {
+        let w = c.width().unwrap_or(0);
+        if used + w > budget {
+            break;
+        }
+        truncated.push(c);
+        used += w;
+    }
     truncated.push('…');
     truncated
 }
 
-/// Sink that prints text output in watch mode
-pub struct TextSink;
+/// Sink that prints text output in watch mode.
+///
+/// Keeps a rolling window ([`AVG_WINDOW`]) of per-process CPU/memory samples
+/// so the PROC table can rank by average instead of the latest value —
+/// smoothing lives here in the presentation layer, the library keeps
+/// delivering raw per-interval facts.
+#[derive(Default)]
+pub struct TextSink {
+    history: Mutex<HashMap<u32, VecDeque<ProcSample>>>,
+    /// On a TTY: enable colors and repaint in place instead of scrolling
+    interactive: bool,
+}
+
+impl TextSink {
+    pub fn new() -> Self {
+        Self {
+            history: Mutex::new(HashMap::new()),
+            interactive: std::io::stdout().is_terminal(),
+        }
+    }
+
+    /// Record the current samples and return per-PID rolling averages
+    fn averages(&self, processes: &[ProcessSnapshot]) -> ProcAverages {
+        let mut history = self.history.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+
+        // Drop PIDs absent from this snapshot (dead, or fell out of the
+        // collector's selection) so the map doesn't grow forever
+        let current: HashSet<u32> = processes.iter().map(|p| p.pid).collect();
+        history.retain(|pid, _| current.contains(pid));
+
+        let mut averages = ProcAverages::with_capacity(processes.len());
+        for p in processes {
+            let samples = history.entry(p.pid).or_default();
+            samples.push_back((now, p.cpu_usage_percent, p.memory_bytes));
+            while let Some((t, ..)) = samples.front() {
+                if now.duration_since(*t) > AVG_WINDOW {
+                    samples.pop_front();
+                } else {
+                    break;
+                }
+            }
+
+            let n = samples.len() as f64;
+            let cpu_avg = samples.iter().map(|(_, c, _)| f64::from(*c)).sum::<f64>() / n;
+            let mem_avg = samples.iter().map(|(_, _, m)| *m as f64).sum::<f64>() / n;
+            averages.insert(p.pid, (cpu_avg as f32, mem_avg as u64));
+        }
+        averages
+    }
+}
 
 #[async_trait]
 impl MetricSink for TextSink {
     async fn write(&self, snapshot: &SystemSnapshot) -> Result<(), SinkError> {
-        println!("{}", render(snapshot));
+        let averages = snapshot.processes.as_deref().map(|ps| self.averages(ps));
+        let theme = Theme {
+            enabled: self.interactive,
+        };
+        let frame = render_with(snapshot, averages.as_ref(), theme);
+
+        if self.interactive {
+            // Repaint in place: cursor home, clear each line's tail as we
+            // overwrite it, then clear everything below the frame. This
+            // avoids the flicker a full-screen clear would cause
+            let frame = frame.replace('\n', "\x1b[K\n");
+            let mut stdout = std::io::stdout();
+            write!(stdout, "\x1b[H{frame}\x1b[J")?;
+            stdout.flush()?;
+        } else {
+            println!("{frame}");
+        }
         Ok(())
     }
 
@@ -286,6 +570,16 @@ mod tests {
     }
 
     #[test]
+    fn gauge_renders_fill_levels() {
+        assert_eq!(gauge(0.0, 4), "░░░░");
+        assert_eq!(gauge(0.5, 4), "██░░");
+        assert_eq!(gauge(1.0, 4), "████");
+        // Out-of-range fractions are clamped
+        assert_eq!(gauge(1.5, 4), "████");
+        assert_eq!(gauge(-0.5, 4), "░░░░");
+    }
+
+    #[test]
     fn table_columns_align() {
         let mut out = String::new();
         write_table(
@@ -297,6 +591,7 @@ mod tests {
                 vec!["en0".into(), "13.1 KiB/s".into(), "14.8 KiB/s".into()],
                 vec!["bridge100".into(), "3.4 KiB/s".into(), "358 B/s".into()],
             ],
+            Theme::plain(),
         );
         let expected = "\
 NET   IFACE              RX          TX
@@ -307,17 +602,114 @@ NET   IFACE              RX          TX
     }
 
     #[test]
-    fn truncate_chars_respects_char_boundaries() {
-        assert_eq!(truncate_chars("short", 10), "short");
-        assert_eq!(truncate_chars("abcdef", 4), "abc…");
+    fn truncate_by_display_width() {
+        assert_eq!(truncate_width("short", 10), "short");
+        assert_eq!(truncate_width("abcdef", 4), "abc…");
         // Multi-byte chars must not be cut mid-codepoint
-        assert_eq!(truncate_chars("ééééé", 3), "éé…");
+        assert_eq!(truncate_width("ééééé", 3), "éé…");
+        // CJK chars occupy two display columns each
+        assert_eq!(truncate_width("企业微信", 5), "企业…");
+    }
+
+    #[test]
+    fn table_aligns_cjk_by_display_width() {
+        let mut out = String::new();
+        write_table(
+            &mut out,
+            "TOP",
+            &["NAME", "MEM"],
+            &[Align::Left, Align::Right],
+            &[
+                vec!["chrome".into(), "1.0 GiB".into()],
+                vec!["企业微信".into(), "449.6 MiB".into()],
+            ],
+            Theme::plain(),
+        );
+        // "企业微信" is 8 display columns wide, so it sets the NAME width
+        let expected = "\
+TOP   NAME            MEM
+      chrome      1.0 GiB
+      企业微信  449.6 MiB
+";
+        assert_eq!(out, expected);
     }
 
     #[test]
     fn empty_table_writes_nothing() {
         let mut out = String::new();
-        write_table(&mut out, "DISK", &["NAME"], &[Align::Left], &[]);
+        write_table(
+            &mut out,
+            "DISK",
+            &["NAME"],
+            &[Align::Left],
+            &[],
+            Theme::plain(),
+        );
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn visible_width_ignores_ansi_escapes() {
+        let theme = Theme { enabled: true };
+        let painted = theme.paint(RED_BOLD, "abc");
+        assert!(painted.contains("\x1b["));
+        assert_eq!(visible_width(&painted), 3);
+        // CJK still counts as two columns each
+        assert_eq!(visible_width(&theme.paint(GREEN, "企业")), 4);
+    }
+
+    #[test]
+    fn colored_cells_stay_aligned() {
+        let theme = Theme { enabled: true };
+        let mut out = String::new();
+        write_table(
+            &mut out,
+            "DISK",
+            &["MOUNT", "USE%"],
+            &[Align::Left, Align::Right],
+            &[
+                vec!["/".into(), theme.paint(RED_BOLD, "98.8%")],
+                vec!["/System".into(), "72.6%".into()],
+            ],
+            Theme::plain(),
+        );
+        // Both data lines must end at the same visible column
+        let lines: Vec<&str> = out.lines().skip(1).collect();
+        assert_eq!(visible_width(lines[0]), visible_width(lines[1]));
+    }
+
+    #[test]
+    fn plain_theme_paints_nothing() {
+        assert_eq!(Theme::plain().paint(RED_BOLD, "text"), "text");
+    }
+
+    fn proc(pid: u32, cpu: f32, mem: u64) -> ProcessSnapshot {
+        ProcessSnapshot {
+            pid,
+            name: format!("p{pid}"),
+            cmd: String::new(),
+            cpu_usage_percent: cpu,
+            memory_bytes: mem,
+            parent_pid: None,
+            status: "Runnable".into(),
+        }
+    }
+
+    #[test]
+    fn text_sink_averages_across_writes_and_prunes_dead_pids() {
+        let sink = TextSink::new();
+
+        let first = sink.averages(&[proc(1, 10.0, 100)]);
+        assert_eq!(first[&1], (10.0, 100));
+
+        // Second sample: averages over both
+        let second = sink.averages(&[proc(1, 20.0, 300)]);
+        assert!((second[&1].0 - 15.0).abs() < 0.01);
+        assert_eq!(second[&1].1, 200);
+
+        // PID 1 gone: its history must be pruned
+        let third = sink.averages(&[proc(2, 1.0, 1)]);
+        assert!(!third.contains_key(&1));
+        assert_eq!(third[&2], (1.0, 1));
     }
 }

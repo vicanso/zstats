@@ -14,6 +14,7 @@
 
 mod render;
 
+use std::io::{IsTerminal, Write as _};
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,7 +33,8 @@ Usage:
 By default, collects once and prints human-readable text.
 
 Options:
-  --watch             Collect and print continuously; Ctrl+C to exit
+  --watch             Collect continuously; on a TTY the screen refreshes
+                      in place with colors. Ctrl+C to exit
   --interval <ms>     Collection interval in watch mode, in milliseconds (default 2000)
   --json              Output as JSON (single line, machine-friendly)
   --pretty            Output as pretty-printed JSON (implies --json)
@@ -144,10 +146,18 @@ fn run_once(config: CollectorConfig, format: OutputFormat) -> ExitCode {
 async fn run_watch(config: CollectorConfig, interval: Duration, format: OutputFormat) -> ExitCode {
     let collector = LocalCollector::new(config);
     let sink: Arc<dyn MetricSink> = match format {
-        OutputFormat::Text => Arc::new(TextSink),
+        OutputFormat::Text => Arc::new(TextSink::new()),
         OutputFormat::Json => Arc::new(StdoutSink::new()),
         OutputFormat::JsonPretty => Arc::new(StdoutSink::pretty()),
     };
+
+    // Text output on a TTY repaints in place: switch to the alternate
+    // screen (like top/htop) and hide the cursor, restoring both on exit
+    let in_place = format == OutputFormat::Text && std::io::stdout().is_terminal();
+    if in_place {
+        print!("\x1b[?1049h\x1b[?25l\x1b[H");
+        let _ = std::io::stdout().flush();
+    }
 
     let mut scheduler = Scheduler::new(Box::new(collector), vec![sink], interval);
     if scheduler.start().await.is_err() {
@@ -159,6 +169,11 @@ async fn run_watch(config: CollectorConfig, interval: Duration, format: OutputFo
         .await
         .expect("failed to listen for ctrl-c");
     scheduler.stop().await;
+
+    if in_place {
+        print!("\x1b[?25h\x1b[?1049l");
+        let _ = std::io::stdout().flush();
+    }
     ExitCode::SUCCESS
 }
 

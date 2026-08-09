@@ -65,6 +65,37 @@ fn local_collector_produces_sane_snapshot() {
 }
 
 #[test]
+fn process_refresh_interval_reuses_cached_list() {
+    let config = CollectorConfig {
+        // Effectively never due again within this test
+        process_refresh_interval: Duration::from_secs(3600),
+        ..Default::default()
+    };
+    let mut collector = LocalCollector::new(config);
+
+    let first = collector.collect().expect("first collect");
+    std::thread::sleep(Duration::from_millis(200));
+    let second = collector.collect().expect("second collect");
+
+    let a = first.processes.expect("processes enabled");
+    let b = second.processes.expect("processes enabled");
+    // The second snapshot must carry the exact cached list: identical pids
+    // AND bit-identical cpu values (a re-collection would recompute them)
+    assert_eq!(
+        a.iter().map(|p| p.pid).collect::<Vec<_>>(),
+        b.iter().map(|p| p.pid).collect::<Vec<_>>()
+    );
+    assert_eq!(
+        a.iter()
+            .map(|p| p.cpu_usage_percent.to_bits())
+            .collect::<Vec<_>>(),
+        b.iter()
+            .map(|p| p.cpu_usage_percent.to_bits())
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn config_toggles_are_respected() {
     let config = CollectorConfig {
         collect_processes: false,

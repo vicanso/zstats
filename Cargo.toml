@@ -21,6 +21,7 @@ runtime = [
 # CLI tool (the bin is bound to this feature via required-features)
 cli = [
     "runtime",
+    "dep:unicode-width",
     "tokio/rt-multi-thread",
     "tokio/signal",
 ]
@@ -34,6 +35,7 @@ snafu = "0.8"
 sysinfo = "0.39.6"
 tokio = { version = "1.53.1", optional = true }
 tracing = { version = "0.1.44", optional = true }
+unicode-width = { version = "0.2", optional = true }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
@@ -42,3 +44,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"
 name = "zstats"
 path = "src/bin/zstats/main.rs"
 required-features = ["cli"]
+
+[profile.release]
+codegen-units = 1
+lto = true
+strip = true
+panic = "abort"

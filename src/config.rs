@@ -25,16 +25,31 @@ pub struct CollectorConfig {
     /// Whether to collect process info (relatively expensive)
     pub collect_processes: bool,
 
-    /// Max number of processes to collect (sorted by CPU then memory,
-    /// then truncated)
+    /// How often to refresh the process list. Zero (the default) refreshes
+    /// on every collect. A tray-style embedder that only needs a coarse
+    /// "top processes" view can set e.g. 10s: between refreshes the
+    /// snapshot carries the last collected list, and per-process CPU% is
+    /// averaged over the longer window (smoother rankings)
+    pub process_refresh_interval: Duration,
+
+    /// Max number of processes to keep. The budget is split between the
+    /// top-by-CPU and top-by-memory rankings so that both views stay
+    /// meaningful; the returned list is sorted by CPU desc
     pub max_processes: usize,
 
     /// Whether to collect per-core CPU usage
     pub per_core_cpu: bool,
 
-    /// Whether to collect disk metrics (volume enumeration is the most
-    /// expensive refresh on some platforms, e.g. ~20ms on macOS)
+    /// Whether to collect disk metrics
     pub collect_disks: bool,
+
+    /// How often to refresh disk capacity (total/available bytes). The
+    /// capacity query is by far the most expensive part of disk collection
+    /// (~18ms per round on macOS vs ~0.7ms for IO counters) and the data
+    /// barely changes, so it runs on its own slower cadence; IO counters
+    /// still refresh on every collect. Capacity values between refreshes
+    /// are the last known ones
+    pub disk_storage_refresh_interval: Duration,
 
     /// Whether to collect network interface metrics
     pub collect_networks: bool,
@@ -50,9 +65,11 @@ impl Default for CollectorConfig {
     fn default() -> Self {
         Self {
             collect_processes: true,
+            process_refresh_interval: Duration::ZERO,
             max_processes: 50,
             per_core_cpu: true,
             collect_disks: true,
+            disk_storage_refresh_interval: Duration::from_secs(60),
             collect_networks: true,
             labels: HashMap::new(),
             collect_timeout: Duration::from_secs(2),

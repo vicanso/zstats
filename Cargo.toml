@@ -1,0 +1,44 @@
+[package]
+name = "zstats"
+version = "0.1.0"
+edition = "2024"
+description = "Unified, extensible core for system performance metrics collection (embeddable as a library or runnable as a CLI tool)"
+
+[features]
+default = ["cli"]
+# Async scheduling and output (Scheduler / MetricSink / LocalChannelSink /
+# StdoutSink; pulls in tokio etc.); without it only synchronous collection
+# (LocalCollector) remains, for embedders that drive their own scheduling
+runtime = [
+    "dep:async-trait",
+    "dep:tokio",
+    "dep:tracing",
+    "tokio/macros",
+    "tokio/rt",
+    "tokio/sync",
+    "tokio/time",
+]
+# CLI tool (the bin is bound to this feature via required-features)
+cli = [
+    "runtime",
+    "tokio/rt-multi-thread",
+    "tokio/signal",
+]
+
+[dependencies]
+async-trait = { version = "0.1.92", optional = true }
+jiff = { version = "0.2.31", features = ["serde"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.151"
+snafu = "0.8"
+sysinfo = "0.39.6"
+tokio = { version = "1.53.1", optional = true }
+tracing = { version = "0.1.44", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+
+[[bin]]
+name = "zstats"
+path = "src/bin/zstats/main.rs"
+required-features = ["cli"]

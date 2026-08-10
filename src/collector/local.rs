@@ -29,7 +29,7 @@ use crate::config::CollectorConfig;
 use crate::error::CollectError;
 use crate::snapshot::{
     CpuSnapshot, DiskSnapshot, HostInfo, LoadSnapshot, MemorySnapshot, NetworkSnapshot,
-    ProcessSnapshot, SystemSnapshot, TemperatureSnapshot,
+    PerfLevelSnapshot, ProcessGroupSnapshot, ProcessSnapshot, SystemSnapshot, TemperatureSnapshot,
 };
 use crate::utils::rate::rate_per_sec;
 
@@ -90,6 +90,12 @@ pub struct LocalCollector {
     cached_networks: Option<Vec<NetworkSnapshot>>,
     /// Last temperature sample, reused between temperature refreshes
     cached_temperatures: Option<Vec<TemperatureSnapshot>>,
+    /// Last per-application aggregates, refreshed on the process cadence
+    cached_process_groups: Option<Arc<Vec<ProcessGroupSnapshot>>>,
+    /// Static CPU performance-level topology (name, logical cores),
+    /// highest-performance level first; empty when the platform has
+    /// fewer than two levels. Read once at startup
+    perf_levels: Vec<(String, u32)>,
 }
 
 impl LocalCollector {
@@ -150,6 +156,8 @@ impl LocalCollector {
             cached_disks: None,
             cached_networks: None,
             cached_temperatures: None,
+            cached_process_groups: None,
+            perf_levels: detect_perf_levels(),
         }
     }
 
@@ -195,8 +203,12 @@ impl LocalCollector {
 
     fn collect_cpu(&self) -> CpuSnapshot {
         let cpus = self.system.cpus();
+        // Perf levels average the same sample even when the per-core list
+        // is disabled in the snapshot
+        let usages: Vec<f32> = cpus.iter().map(|c| c.cpu_usage()).collect();
+        let perf_levels = split_perf_levels(&usages, &self.perf_levels);
         let per_core_usage = if self.config.per_core_cpu {
-            cpus.iter().map(|c| c.cpu_usage()).collect()
+            usages
         } else {
             Vec::new()
         };
@@ -209,16 +221,20 @@ impl LocalCollector {
             logical_cores: cpus.len() as u32,
             physical_cores: System::physical_core_count().map(|n| n as u32),
             frequency_mhz,
+            perf_levels,
         }
     }
 
     fn collect_memory(&self) -> MemorySnapshot {
+        let (compressed_bytes, pressure_level) = memory_pressure();
         MemorySnapshot {
             total_bytes: self.system.total_memory(),
             used_bytes: self.system.used_memory(),
             available_bytes: self.system.available_memory(),
             swap_total_bytes: self.system.total_swap(),
             swap_used_bytes: self.system.used_swap(),
+            compressed_bytes,
+            pressure_level,
         }
     }
 
@@ -495,6 +511,62 @@ impl LocalCollector {
         Some(selected)
     }
 
+    /// Aggregate the FULL process table into per-application groups.
+    /// Runs on the process cadence, right after a process refresh, and
+    /// reuses the cached list between refreshes. One in-memory pass over
+    /// the table sysinfo already holds — no extra system calls
+    fn collect_process_groups(
+        &mut self,
+        refreshed: bool,
+    ) -> Option<Arc<Vec<ProcessGroupSnapshot>>> {
+        if !(self.config.collect_processes && self.config.collect_process_groups) {
+            return None;
+        }
+        if !refreshed {
+            return self.cached_process_groups.clone();
+        }
+
+        let mut table = HashMap::with_capacity(self.system.processes().len());
+        for p in self.system.processes().values() {
+            table.insert(
+                p.pid().as_u32(),
+                ProcNode {
+                    parent: p.parent().map(|pp| pp.as_u32()),
+                    cpu: p.cpu_usage(),
+                    mem: p.memory(),
+                },
+            );
+        }
+
+        // Names are materialized only for the selected group roots
+        let groups: Vec<ProcessGroupSnapshot> =
+            aggregate_process_groups(&table, self.config.max_processes)
+                .into_iter()
+                .filter_map(|g| {
+                    let root = self.system.process(Pid::from(g.root_pid as usize))?;
+                    Some(ProcessGroupSnapshot {
+                        root_pid: g.root_pid,
+                        name: root.name().to_string_lossy().to_string(),
+                        process_count: g.process_count,
+                        cpu_usage_percent: g.cpu,
+                        memory_bytes: g.mem,
+                    })
+                })
+                .collect();
+
+        let groups = Arc::new(groups);
+        self.cached_process_groups = Some(Arc::clone(&groups));
+        Some(groups)
+    }
+
+    /// The full table size at the last process refresh (the snapshot's
+    /// process list is truncated to top-N)
+    fn collect_total_processes(&self) -> Option<u32> {
+        self.config
+            .collect_processes
+            .then(|| self.system.processes().len() as u32)
+    }
+
     fn collect_load(&self) -> LoadSnapshot {
         let load = System::load_average();
         LoadSnapshot {
@@ -615,6 +687,195 @@ fn dedupe_disks_by_name(disks: Vec<DiskSnapshot>) -> Vec<DiskSnapshot> {
     out
 }
 
+/// One process table entry for group aggregation
+#[derive(Debug, Clone, Copy)]
+struct ProcNode {
+    parent: Option<u32>,
+    cpu: f32,
+    mem: u64,
+}
+
+/// Aggregated tree totals before name materialization
+#[derive(Debug, Clone, Copy)]
+struct GroupTotals {
+    root_pid: u32,
+    process_count: u32,
+    cpu: f32,
+    mem: u64,
+}
+
+/// Pid of init / launchd — the boundary that defines application roots
+const INIT_PID: u32 = 1;
+
+/// Resolve every process to the root of its tree (the ancestor whose
+/// parent is init/launchd, missing from the table, or absent) and sum
+/// CPU/memory per root. Returns at most `max` groups ranked by CPU
+/// (memory, then pid, as tie-breaks).
+fn aggregate_process_groups(table: &HashMap<u32, ProcNode>, max: usize) -> Vec<GroupTotals> {
+    // Memoized root resolution: each pid's chain is walked once
+    let mut roots: HashMap<u32, u32> = HashMap::with_capacity(table.len());
+    let mut path = Vec::new();
+    for &pid in table.keys() {
+        let mut current = pid;
+        let root = loop {
+            if let Some(&known) = roots.get(&current) {
+                break known;
+            }
+            path.push(current);
+            match table.get(&current).and_then(|node| node.parent) {
+                // `path.len()` guards against ppid cycles (should not
+                // happen, but a corrupt table must not hang collection)
+                Some(parent)
+                    if parent != INIT_PID
+                        && parent != current
+                        && table.contains_key(&parent)
+                        && path.len() < 512 =>
+                {
+                    current = parent;
+                }
+                _ => break current,
+            }
+        };
+        for p in path.drain(..) {
+            roots.insert(p, root);
+        }
+    }
+
+    let mut totals: HashMap<u32, GroupTotals> = HashMap::new();
+    for (pid, node) in table {
+        let root_pid = roots[pid];
+        let entry = totals.entry(root_pid).or_insert(GroupTotals {
+            root_pid,
+            process_count: 0,
+            cpu: 0.0,
+            mem: 0,
+        });
+        entry.process_count += 1;
+        entry.cpu += node.cpu;
+        entry.mem = entry.mem.saturating_add(node.mem);
+    }
+
+    let mut groups: Vec<GroupTotals> = totals.into_values().collect();
+    groups.sort_by(|a, b| {
+        b.cpu
+            .total_cmp(&a.cpu)
+            .then_with(|| b.mem.cmp(&a.mem))
+            .then_with(|| a.root_pid.cmp(&b.root_pid))
+    });
+    groups.truncate(max);
+    groups
+}
+
+/// Safe sysctl readers via the `sysctl` crate (the library forbids
+/// unsafe code; the FFI lives inside that crate)
+#[cfg(target_os = "macos")]
+fn sysctl_u64(name: &str) -> Option<u64> {
+    use sysctl::{Ctl, CtlValue, Sysctl};
+
+    match Ctl::new(name).ok()?.value().ok()? {
+        CtlValue::Int(v) => u64::try_from(v).ok(),
+        CtlValue::S64(v) => u64::try_from(v).ok(),
+        CtlValue::Long(v) => u64::try_from(v).ok(),
+        CtlValue::Uint(v) => Some(u64::from(v)),
+        CtlValue::U32(v) => Some(u64::from(v)),
+        CtlValue::Ulong(v) => Some(v),
+        CtlValue::U64(v) => Some(v),
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn sysctl_string(name: &str) -> Option<String> {
+    use sysctl::{Ctl, CtlValue, Sysctl};
+
+    match Ctl::new(name).ok()?.value().ok()? {
+        CtlValue::String(s) => Some(s),
+        _ => None,
+    }
+}
+
+/// Read the CPU performance-level topology (Apple Silicon P/E clusters)
+/// once via public sysctls: `hw.nperflevels` + `hw.perflevelN.*`.
+/// Returns (name, logical cores) with perflevel0 — the HIGHEST
+/// performance level — first; empty on platforms with fewer than two
+/// levels (Intel Macs, or any inconsistent reading)
+#[cfg(target_os = "macos")]
+fn detect_perf_levels() -> Vec<(String, u32)> {
+    let Some(n) = sysctl_u64("hw.nperflevels") else {
+        return Vec::new();
+    };
+    if n < 2 {
+        return Vec::new();
+    }
+    let mut levels = Vec::with_capacity(n as usize);
+    for i in 0..n {
+        let Some(cores) =
+            sysctl_u64(&format!("hw.perflevel{i}.logicalcpu")).and_then(|c| u32::try_from(c).ok())
+        else {
+            return Vec::new();
+        };
+        if cores == 0 {
+            return Vec::new();
+        }
+        let name =
+            sysctl_string(&format!("hw.perflevel{i}.name")).unwrap_or_else(|| format!("level{i}"));
+        levels.push((name, cores));
+    }
+    levels
+}
+
+#[cfg(not(target_os = "macos"))]
+fn detect_perf_levels() -> Vec<(String, u32)> {
+    Vec::new()
+}
+
+/// Memory-pressure signals via public sysctls: the memory compressor's
+/// footprint and the kernel's own pressure verdict. Pagein/pageout rates
+/// would need Mach `host_statistics64` (unsafe FFI) and are deliberately
+/// skipped — the compressor size and the kernel's level are the headline
+/// signals
+#[cfg(target_os = "macos")]
+fn memory_pressure() -> (Option<u64>, Option<u32>) {
+    (
+        sysctl_u64("vm.compressor_bytes_used"),
+        sysctl_u64("kern.memorystatus_vm_pressure_level").and_then(|v| u32::try_from(v).ok()),
+    )
+}
+
+#[cfg(not(target_os = "macos"))]
+fn memory_pressure() -> (Option<u64>, Option<u32>) {
+    (None, None)
+}
+
+/// Split per-core usage into per-performance-level averages. `levels` is
+/// highest-performance first (perflevel0), while core NUMBERING starts
+/// with the LOWEST level — E-cores occupy the first indices on Apple
+/// Silicon (verified empirically: a background-QoS load lands on
+/// cpu0..E-count) — so each level reads from the tail backwards. Returns
+/// None unless the topology exactly covers the core list
+fn split_perf_levels(per_core: &[f32], levels: &[(String, u32)]) -> Option<Vec<PerfLevelSnapshot>> {
+    if levels.len() < 2 {
+        return None;
+    }
+    let total: usize = levels.iter().map(|(_, c)| *c as usize).sum();
+    if total != per_core.len() || per_core.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(levels.len());
+    let mut end = per_core.len();
+    for (name, count) in levels {
+        let start = end - *count as usize;
+        let cores = &per_core[start..end];
+        out.push(PerfLevelSnapshot {
+            name: name.clone(),
+            logical_cores: *count,
+            usage_percent: cores.iter().sum::<f32>() / cores.len() as f32,
+        });
+        end = start;
+    }
+    Some(out)
+}
+
 impl Collector for LocalCollector {
     fn collect(&mut self) -> Result<SystemSnapshot, CollectError> {
         // CPU and memory refresh first (they cost microseconds): the fresh
@@ -643,6 +904,8 @@ impl Collector for LocalCollector {
             disks: self.collect_disks(),
             networks: self.collect_networks(),
             processes: self.collect_processes(processes_due, process_elapsed),
+            process_groups: self.collect_process_groups(processes_due),
+            total_processes: self.collect_total_processes(),
             load: self.collect_load(),
             temperatures: self.collect_temperatures(),
             extras: HashMap::new(),
@@ -660,6 +923,100 @@ mod tests {
 
     fn key(pid: u32, cpu: f32, mem: u64) -> ProcKey {
         ProcKey { pid, cpu, mem }
+    }
+
+    fn node(parent: Option<u32>, cpu: f32, mem: u64) -> ProcNode {
+        ProcNode { parent, cpu, mem }
+    }
+
+    #[test]
+    fn groups_aggregate_whole_trees_to_launchd_children() {
+        // launchd(1) → app(10) → helper(11) → grandchild(12)
+        //           → other(20)
+        // kernel-ish orphan(30) with a parent outside the table
+        let table = HashMap::from([
+            (1, node(None, 0.0, 10)),
+            (10, node(Some(1), 1.0, 100)),
+            (11, node(Some(10), 20.0, 200)),
+            (12, node(Some(11), 30.0, 400)),
+            (20, node(Some(1), 5.0, 50)),
+            (30, node(Some(999), 2.0, 25)),
+        ]);
+
+        let groups = aggregate_process_groups(&table, 50);
+        let by_root: HashMap<u32, GroupTotals> = groups.iter().map(|g| (g.root_pid, *g)).collect();
+
+        // The app tree sums root + every descendant
+        let app = &by_root[&10];
+        assert_eq!(app.process_count, 3);
+        assert!((app.cpu - 51.0).abs() < 1e-6);
+        assert_eq!(app.mem, 700);
+        // Single-process trees are their own group
+        assert_eq!(by_root[&20].process_count, 1);
+        assert_eq!(by_root[&30].process_count, 1);
+        assert_eq!(by_root[&1].process_count, 1);
+        // Ranked by CPU: the app tree first
+        assert_eq!(groups[0].root_pid, 10);
+    }
+
+    #[test]
+    fn groups_cap_at_max_and_survive_cycles() {
+        // A ppid cycle (40 ↔ 41) must not hang; extra trees beyond `max`
+        // are dropped lowest-CPU-first
+        let table = HashMap::from([
+            (10, node(Some(1), 30.0, 0)),
+            (20, node(Some(1), 20.0, 0)),
+            (30, node(Some(1), 10.0, 0)),
+            (40, node(Some(41), 1.0, 0)),
+            (41, node(Some(40), 1.0, 0)),
+        ]);
+
+        let groups = aggregate_process_groups(&table, 2);
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0].root_pid, 10);
+        assert_eq!(groups[1].root_pid, 20);
+    }
+
+    #[test]
+    fn perf_levels_read_from_the_tail_backwards() {
+        // 8P + 4E on 12 cores: numbering is E-first, so Efficiency reads
+        // cpu0-3 and Performance reads cpu4-11
+        let levels = vec![
+            ("Performance".to_string(), 8),
+            ("Efficiency".to_string(), 4),
+        ];
+        let mut per_core = vec![100.0f32; 4]; // E cores pegged
+        per_core.extend(vec![10.0f32; 8]); // P cores light
+
+        let split = split_perf_levels(&per_core, &levels).expect("split");
+        assert_eq!(split[0].name, "Performance");
+        assert_eq!(split[0].logical_cores, 8);
+        assert!((split[0].usage_percent - 10.0).abs() < 1e-4);
+        assert_eq!(split[1].name, "Efficiency");
+        assert_eq!(split[1].logical_cores, 4);
+        assert!((split[1].usage_percent - 100.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn perf_levels_require_exact_topology_match() {
+        let levels = vec![
+            ("Performance".to_string(), 8),
+            ("Efficiency".to_string(), 4),
+        ];
+        // Core count mismatch: stay honest and report nothing
+        assert!(split_perf_levels(&[0.0; 10], &levels).is_none());
+        // Fewer than two levels: not a heterogeneous CPU
+        assert!(split_perf_levels(&[0.0; 8], &[("all".to_string(), 8)]).is_none());
+        assert!(split_perf_levels(&[], &[]).is_none());
+    }
+
+    #[test]
+    fn reparented_orphan_becomes_its_own_root() {
+        // A helper whose parent died gets reparented to launchd: it must
+        // not merge into an unrelated tree
+        let table = HashMap::from([(10, node(Some(1), 5.0, 0)), (50, node(Some(1), 3.0, 0))]);
+        let groups = aggregate_process_groups(&table, 50);
+        assert_eq!(groups.len(), 2);
     }
 
     #[test]

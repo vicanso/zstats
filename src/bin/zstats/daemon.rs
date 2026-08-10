@@ -15,7 +15,9 @@
 //! Daemon mode: a background collector that keeps recent history and serves
 //! it to attaching clients over a per-user Unix domain socket.
 //!
-//! Line-oriented protocol:
+//! Line-oriented protocol (client side lives in `zstats::client` so other
+//! frontends can attach too; this module is the server plus the CLI's
+//! rendering around that client):
 //! - the client sends one command line: `ATTACH` or `STOP`
 //! - for `ATTACH` the server replies `HISTORY <n>` followed by n buffered
 //!   snapshots as JSON lines (oldest first), then streams each new snapshot
@@ -35,18 +37,9 @@ use zstats::{
     CollectorConfig, LocalCollector, MetricSink, Scheduler, SinkError, SystemSnapshot, async_trait,
 };
 
+pub use zstats::client::{is_running, socket_path};
+
 use crate::render::{TextSink, enter_live_screen, leave_live_screen};
-
-/// Per-user socket path, e.g. `$TMPDIR/zstats-tree.sock`
-pub fn socket_path() -> PathBuf {
-    let user = std::env::var("USER").unwrap_or_else(|_| "default".into());
-    std::env::temp_dir().join(format!("zstats-{user}.sock"))
-}
-
-/// Whether a daemon is currently reachable on the socket
-pub fn is_running() -> bool {
-    std::os::unix::net::UnixStream::connect(socket_path()).is_ok()
-}
 
 /// Per-user daemon log file, e.g. `$TMPDIR/zstats-tree.log` — the detached
 /// daemon's stdout/stderr (alert lines, warnings) append here
@@ -240,29 +233,21 @@ async fn handle_client(
 /// `q` / `d` / Ctrl+C all leave the client; the daemon keeps running.
 pub async fn attach() -> ExitCode {
     use tokio::io::AsyncReadExt as _;
+    use zstats::ClientError;
 
     use crate::keys::{self, LiveExit, RawMode};
 
-    let path = socket_path();
-    let stream = match UnixStream::connect(&path).await {
+    let mut stream = match zstats::client::attach().await {
         Ok(stream) => stream,
-        Err(_) => {
+        Err(ClientError::Connect { .. }) => {
             eprintln!("zstats daemon is not running (start it with `zstats serve`)");
             return ExitCode::FAILURE;
         }
+        Err(e) => {
+            eprintln!("failed to talk to the daemon: {e}");
+            return ExitCode::FAILURE;
+        }
     };
-    let (reader, mut writer) = stream.into_split();
-    if writer.write_all(b"ATTACH\n").await.is_err() {
-        eprintln!("failed to talk to the daemon");
-        return ExitCode::FAILURE;
-    }
-    let mut lines = BufReader::new(reader).lines();
-
-    let header = lines.next_line().await.ok().flatten().unwrap_or_default();
-    let history_count: usize = header
-        .strip_prefix("HISTORY ")
-        .and_then(|n| n.trim().parse().ok())
-        .unwrap_or(0);
 
     let interactive = enter_live_screen();
     let mut sink = TextSink::new();
@@ -272,17 +257,17 @@ pub async fn attach() -> ExitCode {
 
     // Replay history: absorb everything except the newest snapshot so the
     // rolling averages are warm, then render the newest immediately
-    for i in 0..history_count {
-        let Some(line) = lines.next_line().await.ok().flatten() else {
-            break;
-        };
-        let Ok(snapshot) = serde_json::from_str::<SystemSnapshot>(&line) else {
-            continue;
-        };
-        if i + 1 == history_count {
-            let _ = sink.write(&snapshot).await;
-        } else {
-            sink.absorb(&snapshot);
+    while stream.history_remaining() > 0 {
+        match stream.next().await {
+            Ok(Some(snapshot)) => {
+                if stream.history_remaining() == 0 {
+                    let _ = sink.write(&snapshot).await;
+                } else {
+                    sink.absorb(&snapshot);
+                }
+            }
+            // EOF or error: the live loop below reports the daemon as gone
+            _ => break,
         }
     }
 
@@ -312,12 +297,10 @@ pub async fn attach() -> ExitCode {
                     break;
                 }
             }
-            line = lines.next_line() => {
-                match line {
-                    Ok(Some(line)) => {
-                        if let Ok(snapshot) = serde_json::from_str::<SystemSnapshot>(&line) {
-                            let _ = sink.write(&snapshot).await;
-                        }
+            snapshot = stream.next() => {
+                match snapshot {
+                    Ok(Some(snapshot)) => {
+                        let _ = sink.write(&snapshot).await;
                     }
                     _ => {
                         daemon_gone = true;
@@ -344,20 +327,17 @@ pub async fn attach() -> ExitCode {
 /// Ask the daemon to shut down. Idempotent: a daemon that is not running
 /// already satisfies "stopped", so that case succeeds silently
 pub async fn stop() -> ExitCode {
-    let path = socket_path();
-    let stream = match UnixStream::connect(&path).await {
-        Ok(stream) => stream,
-        Err(_) => return ExitCode::SUCCESS,
-    };
-    let (reader, mut writer) = stream.into_split();
-    if writer.write_all(b"STOP\n").await.is_err() {
-        eprintln!("failed to talk to the daemon");
-        return ExitCode::FAILURE;
+    match zstats::client::stop().await {
+        Ok(true) => {
+            println!("zstats daemon stopped");
+            ExitCode::SUCCESS
+        }
+        Ok(false) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("failed to talk to the daemon: {e}");
+            ExitCode::FAILURE
+        }
     }
-    let mut lines = BufReader::new(reader).lines();
-    let _ = lines.next_line().await;
-    println!("zstats daemon stopped");
-    ExitCode::SUCCESS
 }
 
 #[cfg(test)]
@@ -383,6 +363,7 @@ mod tests {
                 logical_cores: 0,
                 physical_cores: None,
                 frequency_mhz: None,
+                perf_levels: None,
             },
             memory: MemorySnapshot {
                 total_bytes: 0,
@@ -390,10 +371,14 @@ mod tests {
                 available_bytes: 0,
                 swap_total_bytes: 0,
                 swap_used_bytes: 0,
+                compressed_bytes: None,
+                pressure_level: None,
             },
             disks: None,
             networks: None,
             processes: None,
+            process_groups: None,
+            total_processes: None,
             load: LoadSnapshot {
                 load1: 0.0,
                 load5: 0.0,

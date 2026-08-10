@@ -24,14 +24,20 @@ collect_processes = true
 process_refresh_interval = "0s"
 # While overall load is at least this many logical cores of work, the
 # process list refreshes every collect regardless of the cadence above —
-# busy periods get precise attribution. 1.0 = one full core; scales with
-# machine size (25% overall on 4 cores, ~1.6% on 64). 0 disables
-process_boost_cpu_cores = 1.0
+# busy periods get precise attribution. Core units; scales with machine
+# size. Default 2.0: a modern desktop's ambient load is already ~1 core,
+# so this means "ambient plus a whole extra core of anomaly" (1.0 would
+# keep the boost pinned on during any working session). 0 disables
+process_boost_cpu_cores = 2.0
 # Kept processes; the budget is split between top-by-CPU and top-by-memory
 # so idle memory hogs stay visible
 max_processes = 50
 # Per-process disk read/write rates (extra refresh cost on every pass)
 collect_process_disk_io = false
+# Per-application aggregates over whole process trees (root = child of
+# launchd, e.g. Chrome + all its helpers as one entry). One in-memory
+# pass during the process refresh, capped at max_processes groups
+collect_process_groups = true
 
 # ------------------------------------------------------------------------ cpu
 # Per-core usage list in snapshots (overall usage is always collected)
@@ -79,22 +85,132 @@ history = "5m"
 detach = true
 
 [alerts]
-# Desktop notification when a process's 1-minute average CPU reaches this
-# threshold (single-core units: 100 = one full core; same scale as the
-# PROC table). 0 disables the rule
+# The base cpu/mem thresholds below also drive metrics recording: once a
+# minute the daemon appends processes exceeding either base value to
+# <config-dir>/data/YYYY-MM-DD.jsonl (per-process overrides only silence
+# the notification, not the recording); files older than 30 days are
+# cleaned up daily.
+#
+# CPU threshold in single-core units (100 = one full core; same scale as
+# the PROC table). Two tiers share it, and one cooldown covers both:
+#   chronic: 5-minute average >= this value ("quietly always busy" —
+#            self-limiting bursts like an editor re-indexing never last
+#            that long)
+#   runaway: 1-minute average >= 3x this value (fast notification)
+# Per-process overrides scale both tiers. 0 disables the rule
 cpu = 30.0
-# ... or when its 1-minute average share of total memory reaches this
-# percentage. 0 disables
+# Notification when a process's 5-minute average share of total memory
+# reaches this percentage (no runaway tier — transient legitimate spikes
+# must not alert). 0 disables
 mem = 25.0
 # Minimum time between repeated alerts for the same process and rule
 cooldown = "10m"
 
+# Apply the builtin per-app override template beneath your own overrides.
+# Precedence per name: your override > template entry > the base `cpu`
+# value above. Set false for a pure user config
+template = true
+
 # Per-process threshold overrides (case-insensitive process names).
 # A higher bar for apps that are legitimately busy in your workflow —
 # unlike an ignore list, a real runaway still alerts. 0 disables the
-# rule for that process only
+# rule for that process only. Overrides silence the notification but the
+# data point is still recorded in <config-dir>/data/.
+#
+# Only LONG-RUNNING apps need overrides: short-lived bursts (a single
+# rustc, an ffmpeg one-shot) exit before the 50s alert window fills and
+# never notify anyway.
+#
+# The list below IS BUILT IN as the template (default on, see above) —
+# it is reproduced here as reference only; uncommenting an entry makes it
+# an explicit user override that shadows the builtin one. Values: 100 =
+# "only interrupt me at a full core", 200 = "multi-core is its job",
+# 0 = "never interrupt, still record".
 [alerts.cpu_overrides]
+# --- browsers: page loads / video / heavy-JS sites run for minutes
+# "Google Chrome" = 100.0
+# "Google Chrome Helper (Renderer)" = 100.0   # per-tab; ≥100 = a pegged tab
+# "Google Chrome Helper (GPU)" = 100.0        # video playback
+# "Microsoft Edge Helper (Renderer)" = 100.0
+# "Brave Browser Helper (Renderer)" = 100.0
+# "Arc Helper (Renderer)" = 100.0
+# firefox = 100.0
+# plugin-container = 100.0                    # Firefox content processes
+# "com.apple.WebKit.WebContent" = 100.0       # Safari tabs
+# "com.apple.WebKit.GPU" = 100.0
+
+# --- Electron / Chromium desktop apps: same engine, same bursts
+# "Slack Helper (Renderer)" = 100.0
+# "Discord Helper (Renderer)" = 100.0
+# "Notion Helper (Renderer)" = 100.0
+# "Obsidian Helper (Renderer)" = 100.0
+# "Figma Helper (Renderer)" = 100.0           # canvas rendering is real work
+# "Spotify Helper" = 100.0
+# "QQ Helper (Renderer)" = 100.0
+# "Lark Helper (Renderer)" = 100.0            # Feishu
+# DingTalk = 100.0
+# "WeCom Helper (Renderer)" = 100.0
+
+# --- editors / IDEs / language servers: re-index after every edit burst
+# "Cursor Helper (Renderer)" = 100.0
+# "Code Helper (Renderer)" = 100.0
+# gopls = 100.0
+# rust-analyzer = 100.0
+# clangd = 100.0
+# sourcekit-lsp = 100.0
+# SourceKitService = 200.0                    # Xcode indexing eats cores
+# idea = 200.0                                # JetBrains IDEs run under their
+# goland = 200.0                              #   own binary name (pycharm,
+# clion = 200.0                               #   webstorm, ... same story)
+
+# --- VMs / containers: guest workload is supposed to use cores
+# "com.docker.backend" = 200.0
+# "com.docker.virtualization" = 200.0
+# "OrbStack Helper" = 200.0
+# qemu-system-aarch64 = 200.0                 # UTM / Lima / colima
+# prl_vm_app = 200.0                          # Parallels
+# vmware-vmx = 200.0
+
+# --- terminals rendering streaming AI output, and the AI CLIs themselves
 # ghostty = 100.0
+# iTerm2 = 100.0
+# kitty = 100.0
+# alacritty = 100.0
+# claude = 100.0                              # Claude Code sessions
+
+# --- calls / screen sharing: video encode while the call lasts
+# "zoom.us" = 100.0
+# WeChat = 100.0
+# "Microsoft Teams" = 100.0
+# TencentMeeting = 100.0
+# avconferenced = 100.0                       # FaceTime's encoder
+
+# --- long jobs you started yourself: never actionable, history only
+# OBS = 0.0                                   # streaming / recording
+# ffmpeg = 0.0                                # long transcodes DO outlive 50s
+# HandBrake = 0.0
+# "Final Cut Pro" = 0.0
+# ollama = 0.0                                # local LLM inference pegs cores
+
+# --- macOS periodic system work: not actionable, keep the history only
+# mds_stores = 0.0                            # Spotlight indexing
+# mdworker_shared = 0.0                       #   ...and its worker pool
+# photoanalysisd = 0.0                        # Photos ML pass after imports
+# mediaanalysisd = 0.0                        # its video-analysis twin
+# backupd = 0.0                               # Time Machine
+# syspolicyd = 0.0                            # first-launch app verification
+# installd = 0.0                              # App Store / pkg installs
+# softwareupdated = 0.0
+# kernel_task = 0.0                           # inflates on purpose to cool the machine
+# wdavdaemon = 0.0                            # Microsoft Defender on corp Macs
+# WindowServer = 100.0                        # sustained ≥100% usually means some
+#                                             #   app is spamming redraws — actionable
+
+# Do NOT blanket-override interpreters like node/python/java — half the
+# real runaways are one of those (and tsserver/pyright/Gradle hide behind
+# them); override the specific app instead. Vendors rename helper
+# processes across versions: confirm the live name with `zstats --json`
+# before adding an override.
 
 [alerts.mem_overrides]
 # "Google Chrome" = 50.0

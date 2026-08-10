@@ -66,14 +66,17 @@ Config keys for -add (also accepted as key=value). Durations take 500ms /
   network-interval <dur>      [collector] network cadence (default 0)
   temp-interval <dur>         [collector] temperature cadence (default 15s)
   cpu-freq-interval <dur>     [collector] CPU frequency cadence (default 30s)
-  process-boost <cores>       [collector] busy-cores boost (default 1, 0 = off)
+  process-boost <cores>       [collector] busy-cores boost (default 2, 0 = off)
   max-processes <n>           [collector] kept processes (default 50)
   collect-processes | collect-disks | collect-networks | collect-temperatures
-  process-disk-io | dedupe-disks | per-core-cpu        <true|false>
-  alert-cpu <pct|name=pct>    [alerts] 1-min avg CPU rule: default threshold or
-                              per-process override, e.g. alert-cpu ghostty=100
-  alert-mem <pct|name=pct>    [alerts] 1-min avg memory-share rule, same forms
+  process-disk-io | process-groups | dedupe-disks | per-core-cpu   <true|false>
+  alert-cpu <pct|name=pct>    [alerts] CPU rules: 5-min avg >= pct (chronic)
+                              or 1-min avg >= 3x pct (runaway); name=pct sets
+                              a per-process override, e.g. alert-cpu ghostty=100
+  alert-mem <pct|name=pct>    [alerts] 5-min avg memory-share rule, same forms
   alert-cooldown <dur>        [alerts] re-alert cooldown (default 10m)
+  alert-template <bool>       [alerts] builtin per-app override template
+                              (default true; your overrides always win)
 ";
 
 #[derive(Clone, Copy, PartialEq)]
@@ -520,8 +523,7 @@ fn main() -> ExitCode {
             let mut extra_sinks: Vec<Arc<dyn MetricSink>> = Vec::new();
             // Alert settings come from the config file (hot-reloaded by
             // the sink on mtime change, every 30 collects)
-            let alert_sink =
-                alerts::AlertSink::from_options(alerts::AlertCliOptions::default(), &file.alerts);
+            let alert_sink = alerts::AlertSink::from_config(&file.alerts);
             if alert_sink.enabled() {
                 extra_sinks.push(Arc::new(alert_sink));
             }

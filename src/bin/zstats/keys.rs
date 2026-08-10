@@ -16,6 +16,8 @@
 
 /// How the user left a live foreground view
 #[derive(Clone, Copy, PartialEq, Debug)]
+// On Windows only Ctrl+C (Quit) exists — Detach needs the unix daemon
+#[cfg_attr(not(unix), allow(dead_code))]
 pub enum LiveExit {
     /// Quit the foreground view (and, in watch mode, the whole process)
     Quit,
@@ -109,6 +111,7 @@ pub async fn wait_live_exit(_interactive: bool) -> LiveExit {
 
 /// Map a single key byte (when already in raw mode) to a live-exit action.
 /// Returns None for keys that should be ignored.
+#[cfg(unix)]
 pub fn key_to_exit(byte: u8) -> Option<LiveExit> {
     match byte {
         b'q' | b'Q' => Some(LiveExit::Quit),

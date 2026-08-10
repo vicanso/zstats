@@ -63,6 +63,30 @@ pub enum SchedulerError {
     AlreadyRunning,
 }
 
+/// Errors from the daemon client (the `client` feature, unix only)
+#[cfg(all(feature = "client", unix))]
+#[derive(Debug, Snafu)]
+#[snafu(visibility(pub))]
+pub enum ClientError {
+    /// Connecting to the socket failed — in practice "no daemon is
+    /// running there"
+    #[snafu(display("no daemon reachable at {}: {source}", path.display()))]
+    #[snafu(context(suffix(ClientSnafu)))]
+    Connect {
+        path: std::path::PathBuf,
+        source: std::io::Error,
+    },
+
+    #[snafu(display("daemon connection failed: {source}"))]
+    #[snafu(context(suffix(ClientSnafu)))]
+    Io { source: std::io::Error },
+
+    /// The server's reply does not follow the attach protocol
+    #[snafu(display("unexpected reply from daemon: {reply:?}"))]
+    #[snafu(context(suffix(ClientSnafu)))]
+    Protocol { reply: String },
+}
+
 /// Errors from loading configuration files (the `config` feature)
 #[derive(Debug, Snafu)]
 #[snafu(visibility(pub))]
@@ -79,4 +103,11 @@ pub enum ConfigError {
     #[snafu(display("failed to parse {path}: {message}"))]
     #[snafu(context(suffix(ConfigSnafu)))]
     Parse { path: String, message: String },
+
+    #[snafu(display("failed to write {path}: {source}"))]
+    #[snafu(context(suffix(ConfigSnafu)))]
+    Write {
+        path: String,
+        source: std::io::Error,
+    },
 }

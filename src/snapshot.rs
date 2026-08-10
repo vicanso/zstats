@@ -48,6 +48,18 @@ pub struct SystemSnapshot {
     /// daemon history) does not deep-copy the process table.
     pub processes: Option<Arc<Vec<ProcessSnapshot>>>,
 
+    /// Per-application aggregates over whole process trees; None when
+    /// process or group collection is disabled. Refreshes on the process
+    /// cadence; same [`Arc`] sharing as `processes`.
+    #[serde(default)]
+    pub process_groups: Option<Arc<Vec<ProcessGroupSnapshot>>>,
+
+    /// Total number of processes in the system table as of the last
+    /// process refresh — `processes` only keeps the top N. None when
+    /// process collection is disabled
+    #[serde(default)]
+    pub total_processes: Option<u32>,
+
     /// Load averages
     pub load: LoadSnapshot,
 
@@ -77,6 +89,22 @@ pub struct HostInfo {
     pub labels: HashMap<String, String>,
 }
 
+/// Usage of one CPU performance level (Apple Silicon P/E clusters).
+///
+/// Static topology (level names and core counts) comes from the OS at
+/// collector startup; usage is the average of the level's cores from the
+/// same sample as `per_core_usage`. Dynamic per-cluster frequency/power
+/// are deliberately out of scope (they need root or private APIs).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PerfLevelSnapshot {
+    /// Level name as reported by the OS (e.g. "Performance", "Efficiency")
+    pub name: String,
+    /// Logical cores in this level
+    pub logical_cores: u32,
+    /// Average usage across this level's cores (0-100)
+    pub usage_percent: f32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CpuSnapshot {
     /// Overall usage, 0.0 ~ 100.0
@@ -90,6 +118,11 @@ pub struct CpuSnapshot {
     /// Current frequency (MHz, optional). Refreshed on a slower cadence
     /// than usage; may lag a few tens of seconds.
     pub frequency_mhz: Option<u64>,
+    /// Per-performance-level usage (heterogeneous CPUs, e.g. Apple
+    /// Silicon P/E clusters), highest-performance level first. None when
+    /// the platform reports fewer than two levels
+    #[serde(default)]
+    pub perf_levels: Option<Vec<PerfLevelSnapshot>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,6 +132,16 @@ pub struct MemorySnapshot {
     pub available_bytes: u64,
     pub swap_total_bytes: u64,
     pub swap_used_bytes: u64,
+    /// Bytes held by the OS memory compressor (macOS). Growth here is the
+    /// first sign of real memory pressure — long before "used" looks bad.
+    /// None on platforms without a compressor metric
+    #[serde(default)]
+    pub compressed_bytes: Option<u64>,
+    /// The kernel's own memory-pressure verdict (macOS
+    /// `kern.memorystatus_vm_pressure_level`): 1 = normal, 2 = warning,
+    /// 4 = critical. None when the platform does not report one
+    #[serde(default)]
+    pub pressure_level: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -155,6 +198,29 @@ pub struct ProcessSnapshot {
     pub read_bytes_per_sec: Option<u64>,
     #[serde(default)]
     pub write_bytes_per_sec: Option<u64>,
+}
+
+/// One application's whole process tree, aggregated: the root (a direct
+/// child of init/launchd) plus every descendant. This is what makes a
+/// multi-process app (a browser and its helpers, an Electron app) visible
+/// as a single entity — per-process values never exceed thresholds that
+/// the app as a whole does.
+///
+/// Computed over the FULL process table before top-N selection, so an app
+/// made of many small helpers is summed correctly even when none of its
+/// members rank into [`SystemSnapshot::processes`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcessGroupSnapshot {
+    /// Pid of the tree root
+    pub root_pid: u32,
+    /// Name of the root process
+    pub name: String,
+    /// Number of processes in the group (root included)
+    pub process_count: u32,
+    /// Sum of member CPU usage (single-core units, like per-process CPU)
+    pub cpu_usage_percent: f32,
+    /// Sum of member resident memory
+    pub memory_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

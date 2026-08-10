@@ -47,11 +47,25 @@
 //! # }
 //! ```
 
+// Platform FFI stays inside dependencies (sysinfo, the sysctl crate);
+// this library contains no unsafe code of its own
+#![forbid(unsafe_code)]
+
+#[cfg(feature = "frontend")]
+pub mod alerts;
+#[cfg(all(feature = "client", unix))]
+pub mod client;
 pub mod collector;
 pub mod config;
 pub mod error;
+#[cfg(feature = "frontend")]
+pub mod records;
+#[cfg(feature = "frontend")]
+pub mod rolling;
 #[cfg(feature = "runtime")]
 pub mod scheduler;
+#[cfg(feature = "frontend")]
+pub mod settings;
 #[cfg(feature = "runtime")]
 pub mod sink;
 pub mod snapshot;
@@ -62,8 +76,12 @@ pub mod utils;
 #[cfg(feature = "runtime")]
 pub use async_trait::async_trait;
 
+#[cfg(all(feature = "client", unix))]
+pub use client::DaemonStream;
 pub use collector::{Collector, LocalCollector};
 pub use config::CollectorConfig;
+#[cfg(all(feature = "client", unix))]
+pub use error::ClientError;
 pub use error::{CollectError, ConfigError, SchedulerError, SinkError};
 #[cfg(feature = "runtime")]
 pub use scheduler::Scheduler;
@@ -71,5 +89,5 @@ pub use scheduler::Scheduler;
 pub use sink::{LocalChannelSink, MetricSink, StdoutSink};
 pub use snapshot::{
     CpuSnapshot, DiskSnapshot, HostInfo, LoadSnapshot, MemorySnapshot, NetworkSnapshot,
-    ProcessSnapshot, SystemSnapshot, TemperatureSnapshot,
+    PerfLevelSnapshot, ProcessGroupSnapshot, ProcessSnapshot, SystemSnapshot, TemperatureSnapshot,
 };

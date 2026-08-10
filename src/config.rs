@@ -151,18 +151,24 @@ pub struct CollectorConfig {
     /// While overall CPU load is at or above this many *logical cores* of
     /// work, the process list refreshes on every collect regardless of
     /// `process_refresh_interval` — busy periods get precise per-process
-    /// attribution, idle periods stay cheap. None disables the boost.
+    /// attribution, idle periods stay cheap. None or a value <= 0
+    /// disables the boost (0 is what the config file round-trips, since
+    /// an absent field would revert to the default on reload).
     ///
     /// Units match per-process CPU% (single-core units): `1.0` means "at
     /// least one full core busy". The effective overall-usage threshold is
     /// therefore `cores / logical_cores * 100`, so the same setting scales
-    /// across machine sizes:
-    /// - 4 cores, threshold 1.0 → boost at ≥ 25% overall
-    /// - 64 cores, threshold 1.0 → boost at ≥ ~1.6% overall
+    /// across machine sizes.
     ///
-    /// Default `Some(1.0)` catches a single busy process on both laptops
-    /// and big servers. Raise it (e.g. 4.0) when baseline load is high and
-    /// you want fewer forced process refreshes.
+    /// Default `Some(2.0)`: a modern desktop's ambient load (browser +
+    /// language servers + background services) is already around one full
+    /// core, so 1.0 would keep the boost pinned on during any working
+    /// session — 2.0 means "ambient plus a whole extra core of anomaly".
+    /// Alert correctness does not depend on the boost (window averages
+    /// are time-weighted over whatever cadence is active); it only buys
+    /// finer per-process attribution while things are busy. Raise it
+    /// (e.g. 4.0) when baseline load is high and you want fewer forced
+    /// process refreshes.
     pub process_boost_cpu_cores: Option<f32>,
 
     /// Max number of processes to keep. The budget is split between the
@@ -175,6 +181,14 @@ pub struct CollectorConfig {
     /// When disabled, `ProcessSnapshot::{read,write}_bytes_per_sec` stay
     /// `None`.
     pub collect_process_disk_io: bool,
+
+    /// Also aggregate whole process trees into per-application groups
+    /// (`SystemSnapshot::process_groups`): root = a direct child of
+    /// init/launchd, summed over every descendant. Computed from the full
+    /// process table during the process refresh (one extra in-memory pass,
+    /// no additional system calls) and capped at `max_processes` groups
+    /// ranked by CPU. Requires `collect_processes`.
+    pub collect_process_groups: bool,
 
     /// Whether to collect per-core CPU usage
     pub per_core_cpu: bool,
@@ -243,9 +257,10 @@ impl Default for CollectorConfig {
         Self {
             collect_processes: true,
             process_refresh_interval: Duration::ZERO,
-            process_boost_cpu_cores: Some(1.0),
+            process_boost_cpu_cores: Some(2.0),
             max_processes: 50,
             collect_process_disk_io: false,
+            collect_process_groups: true,
             per_core_cpu: true,
             cpu_frequency_refresh_interval: Duration::from_secs(30),
             collect_disks: true,

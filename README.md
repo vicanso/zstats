@@ -113,7 +113,7 @@ expensive subsystems are opt-out and throttled (`CollectorConfig`):
 | `dedupe_disks` | `true` | Keep one entry per device name (shortest mount); collapses APFS synthetic mounts |
 | `cpu_frequency_refresh_interval` | 30s | CPU frequency refreshes on its own cadence; usage still every collect |
 | `process_refresh_interval` | 0 (every collect) | Throttle the process list; the last list is reused between refreshes |
-| `process_boost_cpu_cores` | 1.0 | While overall load is ≥ this many logical cores of work, the process list refreshes every collect (scales with CPU count; 0/None = off) |
+| `process_boost_cpu_cores` | 2.0 | While overall load is ≥ this many logical cores of work, the process list refreshes every collect (scales with CPU count; 0/None = off) |
 | `collect_process_disk_io` | `false` | Per-process read/write byte rates (extra refresh cost when on) |
 | `max_processes` | 50 | Kept processes; the budget is split between top-by-CPU and top-by-memory so idle memory hogs stay visible |
 | `collect_timeout` | 2s | Enforced by the Scheduler around each collect |
@@ -128,10 +128,33 @@ about 0% with only CPU/memory/load enabled.
 |---------|----------|
 | _none_ | Data contract + synchronous `LocalCollector` — no tokio |
 | `runtime` | `Scheduler` and the `sink` module (tokio, async-trait, tracing) |
+| `config` | `CollectorConfig::load_from_dir` — read `<dir>/config.toml` |
+| `client` | Typed client for the `zstats serve` daemon socket (unix only) |
+| `frontend` | Frontend building blocks: alert rule engine (`alerts`), rolling per-process averages (`rolling`), daily metrics history (`records`), full config-file model (`settings`) — sync only, no tokio |
 | `cli` (default) | The `zstats` command-line binary and its extra tokio features |
 
 Library consumers who drive their own scheduling can depend on
 `default-features = false`; add `runtime` for the async pipeline.
+
+For a single-process frontend (e.g. a tray GUI) that embeds collection —
+plain-thread collection loop, alert engine, metrics history, settings,
+all without tokio — see `examples/embedded.rs`
+(`cargo run --example embedded`).
+
+With the `client` feature, any frontend can attach to a running
+`zstats serve` daemon and receive typed snapshots — buffered history
+first, then live data — without knowing the wire format:
+
+```rust
+async fn follow() -> Result<(), zstats::ClientError> {
+    let mut stream = zstats::client::attach().await?;
+    while let Some(snapshot) = stream.next().await? {
+        let live = stream.history_remaining() == 0;
+        println!("{} (live: {live})", snapshot.timestamp);
+    }
+    Ok(())
+}
+```
 
 ## License
 

@@ -50,6 +50,9 @@ fn local_collector_produces_sane_snapshot() {
     let processes = second.processes.as_ref().expect("processes enabled");
     assert!(!processes.is_empty());
     assert!(processes.len() <= max_processes);
+    // The kept list is a truncation of the full table
+    let total = second.total_processes.expect("total with processes on");
+    assert!(total as usize >= processes.len());
     // From the second sample on, rate metrics should have values. A disk or
     // interface that appeared between the two samples has no diff baseline
     // yet (None), so require at least one entry with rates — always true for
@@ -71,6 +74,31 @@ fn local_collector_produces_sane_snapshot() {
         // Disk IO off by default
         assert!(p.read_bytes_per_sec.is_none());
         assert!(p.write_bytes_per_sec.is_none());
+    }
+
+    // Memory pressure (macOS): when reported, values must be sane
+    if let Some(compressed) = second.memory.compressed_bytes {
+        assert!(compressed < second.memory.total_bytes);
+    }
+    if let Some(level) = second.memory.pressure_level {
+        assert!(matches!(level, 1 | 2 | 4), "unexpected level {level}");
+    }
+    #[cfg(target_os = "macos")]
+    {
+        assert!(second.memory.compressed_bytes.is_some());
+        assert!(second.memory.pressure_level.is_some());
+    }
+
+    // Perf levels (Apple Silicon P/E clusters): when reported, the
+    // topology must exactly cover the logical cores and usages stay sane
+    if let Some(levels) = &second.cpu.perf_levels {
+        assert!(levels.len() >= 2);
+        let total: u32 = levels.iter().map(|l| l.logical_cores).sum();
+        assert_eq!(total, second.cpu.logical_cores);
+        for level in levels {
+            assert!(!level.name.is_empty());
+            assert!(level.usage_percent >= 0.0);
+        }
     }
 
     // The snapshot round-trips through serialization
@@ -203,6 +231,59 @@ fn config_toggles_are_respected() {
     assert!(snapshot.disks.is_none());
     assert!(snapshot.networks.is_none());
     assert!(snapshot.temperatures.is_none());
+    // Groups and the total count require process collection even though
+    // groups' own toggle defaults to on
+    assert!(snapshot.process_groups.is_none());
+    assert!(snapshot.total_processes.is_none());
+}
+
+#[test]
+fn process_groups_aggregate_trees_and_respect_toggle_and_cache() {
+    let max_processes = CollectorConfig::default().max_processes;
+    let mut collector = LocalCollector::new(CollectorConfig {
+        // Freeze the process cadence after the first collect so the
+        // second one must serve the cached groups
+        process_refresh_interval: Duration::from_secs(3600),
+        process_boost_cpu_cores: None,
+        ..Default::default()
+    });
+
+    let first = collector.collect().expect("first collect");
+    let groups = first.process_groups.as_ref().expect("groups enabled");
+    assert!(!groups.is_empty());
+    assert!(groups.len() <= max_processes);
+    for g in groups.iter() {
+        assert!(g.process_count >= 1);
+        assert!(!g.name.is_empty());
+    }
+    // Groups are ranked by CPU
+    for pair in groups.windows(2) {
+        assert!(pair[0].cpu_usage_percent >= pair[1].cpu_usage_percent);
+    }
+    // A real desktop always has at least one multi-process tree (this
+    // test binary itself runs under cargo under a shell)
+    assert!(groups.iter().any(|g| g.process_count > 1));
+    // The whole-tree memory sum must be at least any single member's
+    let processes = first.processes.as_ref().expect("processes enabled");
+    let total_group_mem: u64 = groups.iter().map(|g| g.memory_bytes).sum();
+    let max_proc_mem = processes.iter().map(|p| p.memory_bytes).max().unwrap_or(0);
+    assert!(total_group_mem >= max_proc_mem);
+
+    // Between process refreshes the cached Arc is served verbatim
+    let second = collector.collect().expect("second collect");
+    assert!(Arc::ptr_eq(
+        first.process_groups.as_ref().expect("groups"),
+        second.process_groups.as_ref().expect("groups")
+    ));
+
+    // Toggle off: everything else still on, groups absent
+    let mut collector = LocalCollector::new(CollectorConfig {
+        collect_process_groups: false,
+        ..Default::default()
+    });
+    let snapshot = collector.collect().expect("collect");
+    assert!(snapshot.processes.is_some());
+    assert!(snapshot.process_groups.is_none());
 }
 
 #[test]
@@ -297,4 +378,132 @@ async fn collect_once_returns_snapshot_and_dispatches() {
     assert!(snapshot.memory.total_bytes > 0);
     // Dispatch works even without the background loop running
     assert!(rx.borrow().is_some());
+}
+
+/// Client side of the daemon protocol, exercised against a scripted fake
+/// server (the real server needs a full daemon; the wire format is what
+/// matters here)
+#[cfg(all(feature = "client", unix))]
+mod client_protocol {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
+    use zstats::SystemSnapshot;
+
+    fn snapshot_at(second: i64) -> SystemSnapshot {
+        let mut collector = zstats::LocalCollector::new(zstats::CollectorConfig {
+            collect_processes: false,
+            collect_disks: false,
+            collect_networks: false,
+            collect_temperatures: false,
+            ..Default::default()
+        });
+        let mut snapshot = zstats::Collector::collect(&mut collector).expect("collect");
+        snapshot.timestamp = jiff::Timestamp::from_second(second).expect("valid timestamp");
+        snapshot
+    }
+
+    fn test_socket(name: &str) -> std::path::PathBuf {
+        // Keep it short: unix socket paths cap at ~104 bytes
+        std::env::temp_dir().join(format!("zst-{}-{name}.sock", std::process::id()))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn attach_replays_history_then_streams_live() {
+        let path = test_socket("attach");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind test socket");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (reader, mut writer) = stream.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            let command = lines.next_line().await.expect("read").unwrap_or_default();
+            assert_eq!(command, "ATTACH");
+
+            writer.write_all(b"HISTORY 2\n").await.expect("header");
+            for second in [1, 2] {
+                let line = serde_json::to_string(&snapshot_at(second)).expect("serialize");
+                writer
+                    .write_all(format!("{line}\n").as_bytes())
+                    .await
+                    .expect("history line");
+            }
+            // A garbled line must be skipped by the client, then live data
+            writer.write_all(b"not json\n").await.expect("garbage");
+            let live = serde_json::to_string(&snapshot_at(3)).expect("serialize");
+            writer
+                .write_all(format!("{live}\n").as_bytes())
+                .await
+                .expect("live line");
+            // Dropping the writer closes the stream: client sees EOF
+        });
+
+        let mut stream = zstats::client::attach_at(&path).await.expect("attach");
+        assert_eq!(stream.history_len(), 2);
+        assert_eq!(stream.history_remaining(), 2);
+
+        let first = stream.next().await.expect("next").expect("history 1");
+        assert_eq!(first.timestamp.as_second(), 1);
+        assert_eq!(stream.history_remaining(), 1);
+
+        let second = stream.next().await.expect("next").expect("history 2");
+        assert_eq!(second.timestamp.as_second(), 2);
+        assert_eq!(stream.history_remaining(), 0);
+
+        // The garbled line is skipped transparently
+        let live = stream.next().await.expect("next").expect("live");
+        assert_eq!(live.timestamp.as_second(), 3);
+
+        assert!(stream.next().await.expect("eof").is_none());
+        server.await.expect("server task");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn attach_rejects_non_protocol_reply() {
+        let path = test_socket("proto");
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).expect("bind test socket");
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (reader, mut writer) = stream.into_split();
+            // Consume the command first so the client's ATTACH write can
+            // never race against this connection closing
+            let mut lines = BufReader::new(reader).lines();
+            let _ = lines.next_line().await;
+            writer.write_all(b"WHAT\n").await.expect("reply");
+        });
+
+        match zstats::client::attach_at(&path).await {
+            Err(zstats::ClientError::Protocol { reply }) => assert_eq!(reply, "WHAT"),
+            Err(other) => panic!("expected a protocol error, got: {other}"),
+            Ok(_) => panic!("attach unexpectedly succeeded"),
+        }
+        server.await.expect("server task");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn stop_reports_whether_a_daemon_was_reached() {
+        let path = test_socket("stop");
+        let _ = std::fs::remove_file(&path);
+
+        // No socket: nothing to stop, and that is a success
+        assert!(!zstats::client::stop_at(&path).await.expect("stop"));
+
+        let listener = UnixListener::bind(&path).expect("bind test socket");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (reader, mut writer) = stream.into_split();
+            let mut lines = BufReader::new(reader).lines();
+            let command = lines.next_line().await.expect("read").unwrap_or_default();
+            assert_eq!(command, "STOP");
+            writer.write_all(b"OK\n").await.expect("reply");
+        });
+
+        assert!(zstats::client::stop_at(&path).await.expect("stop"));
+        server.await.expect("server task");
+        let _ = std::fs::remove_file(&path);
+    }
 }

@@ -15,7 +15,7 @@
 //! Human-readable text rendering (CLI only; the library itself has no
 //! notion of presentation).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::io::{IsTerminal, Write as _};
 use std::sync::Mutex;
@@ -23,6 +23,7 @@ use std::time::{Duration, Instant};
 
 use jiff::tz::TimeZone;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use zstats::rolling::ProcessWindows;
 use zstats::{MetricSink, ProcessSnapshot, SinkError, SystemSnapshot, async_trait};
 
 /// PROC table: rows ranked by CPU, then rows ranked by memory
@@ -37,14 +38,16 @@ const CMD_MAX_WIDTH: usize = 50;
 const GAUGE_WIDTH: usize = 20;
 const DISK_GAUGE_WIDTH: usize = 14;
 
+/// NET table height: always the top-N interfaces by current traffic, so
+/// the section (and everything under it) never jumps as traffic starts
+/// and stops
+const NET_ROWS: usize = 6;
+
 /// Rolling window for per-process averages in watch mode
 const AVG_WINDOW: Duration = Duration::from_secs(60);
 
 /// Per-process rolling averages over [`AVG_WINDOW`]: (cpu %, memory bytes)
 type ProcAverages = HashMap<u32, (f32, u64)>;
-
-/// One recorded sample: (when, cpu %, memory bytes)
-type ProcSample = (Instant, f32, u64);
 
 /// Width of the section label column ("HOST  ", "DISK  ", ...)
 const LABEL_WIDTH: usize = 6;
@@ -233,13 +236,34 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
         .frequency_mhz
         .map(|f| format!(" @ {f} MHz"))
         .unwrap_or_default();
+    // P/E cluster split on heterogeneous CPUs, e.g. "P8 12% · E4 31%"
+    let levels = s
+        .cpu
+        .perf_levels
+        .as_ref()
+        .map(|levels| {
+            let parts: Vec<String> = levels
+                .iter()
+                .map(|l| {
+                    format!(
+                        "{}{} {:.0}%",
+                        l.name.chars().next().unwrap_or('?'),
+                        l.logical_cores,
+                        l.usage_percent
+                    )
+                })
+                .collect();
+            format!("  {}", parts.join(" · "))
+        })
+        .unwrap_or_default();
     let _ = writeln!(
         out,
-        "CPU   {}  {:>5.1}%  {} cores{}",
+        "CPU   {}  {:>5.1}%  {} cores{}{}",
         styled_gauge(f64::from(s.cpu.usage_percent) / 100.0, GAUGE_WIDTH, theme),
         s.cpu.usage_percent,
         s.cpu.logical_cores,
         freq,
+        levels,
     );
 
     let mem_fraction = if s.memory.total_bytes > 0 {
@@ -247,9 +271,22 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
     } else {
         0.0
     };
+    // Compressor footprint + the kernel's pressure verdict: growth there
+    // is the real "memory is tight" signal on macOS, not used%
+    let mut mem_extra = String::new();
+    if let Some(compressed) = s.memory.compressed_bytes {
+        let _ = write!(mem_extra, "  ·  zip {}", human_bytes(compressed));
+    }
+    match s.memory.pressure_level {
+        Some(2) => mem_extra.push_str(&theme.paint(YELLOW, "  ·  pressure: warning")),
+        Some(level) if level > 2 => {
+            mem_extra.push_str(&theme.paint(RED_BOLD, "  ·  pressure: critical"));
+        }
+        _ => {}
+    }
     let _ = writeln!(
         out,
-        "MEM   {}  {:>5.1}%  {} / {}",
+        "MEM   {}  {:>5.1}%  {} / {}{mem_extra}",
         styled_gauge(mem_fraction, GAUGE_WIDTH, theme),
         mem_fraction * 100.0,
         human_bytes(s.memory.used_bytes),
@@ -274,13 +311,18 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
     } else {
         0.0
     };
+    let procs = s
+        .total_processes
+        .map(|n| format!("  ·  {n} procs"))
+        .unwrap_or_default();
     let _ = writeln!(
         out,
-        "LOAD  {}  {:>6.2}  {:.2} · {:.2}",
+        "LOAD  {}  {:>6.2}  {:.2} · {:.2}{}",
         styled_gauge(load_fraction, GAUGE_WIDTH, theme),
         s.load.load1,
         s.load.load5,
         s.load.load15,
+        procs,
     );
 
     if let Some(temps) = &s.temperatures {
@@ -361,16 +403,40 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
     }
 
     if let Some(networks) = &s.networks {
-        // Only show interfaces with traffic (or errors) to avoid a wall of
-        // idle utun/lo entries
-        let rows: Vec<Vec<String>> = networks
+        // Fixed-height section: filtering to "interfaces with traffic"
+        // made the row count change every tick, so everything below
+        // jumped around in watch mode. Instead always show the top
+        // NET_ROWS interfaces ranked by current traffic (idle ones fill
+        // the rest, sorted by name for a stable order) — the height only
+        // changes when the OS adds or removes an interface
+        let total_rate = |n: &&zstats::NetworkSnapshot| {
+            n.received_bytes_per_sec
+                + n.transmitted_bytes_per_sec
+                + n.received_errors_per_sec.unwrap_or(0)
+                + n.transmitted_errors_per_sec.unwrap_or(0)
+        };
+        // Idle fill prefers meaningful interfaces: physical NICs (en* on
+        // macOS and modern Linux) and loopback before the anpi/awdl/ap
+        // house-keeping ones
+        let class = |name: &str| {
+            if name.starts_with("en") {
+                0
+            } else if name.starts_with("lo") {
+                1
+            } else {
+                2
+            }
+        };
+        let mut ranked: Vec<&zstats::NetworkSnapshot> = networks.iter().collect();
+        ranked.sort_by(|a, b| {
+            total_rate(b)
+                .cmp(&total_rate(a))
+                .then_with(|| class(&a.interface).cmp(&class(&b.interface)))
+                .then_with(|| a.interface.cmp(&b.interface))
+        });
+        let rows: Vec<Vec<String>> = ranked
             .iter()
-            .filter(|n| {
-                n.received_bytes_per_sec > 0
-                    || n.transmitted_bytes_per_sec > 0
-                    || n.received_errors_per_sec.unwrap_or(0) > 0
-                    || n.transmitted_errors_per_sec.unwrap_or(0) > 0
-            })
+            .take(NET_ROWS)
             .map(|n| {
                 let err_rx = n.received_errors_per_sec.unwrap_or(0);
                 let err_tx = n.transmitted_errors_per_sec.unwrap_or(0);
@@ -388,7 +454,7 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
             })
             .collect();
         if rows.is_empty() {
-            let _ = writeln!(out, "NET   (no active interfaces)");
+            let _ = writeln!(out, "NET   (no interfaces)");
         } else {
             write_table(
                 &mut out,
@@ -549,23 +615,27 @@ fn truncate_width(s: &str, max: usize) -> String {
 
 /// Sink that prints text output in watch mode.
 ///
-/// Keeps a rolling window ([`AVG_WINDOW`]) of per-process CPU/memory samples
-/// so the PROC table can rank by average instead of the latest value —
-/// smoothing lives here in the presentation layer, the library keeps
-/// delivering raw per-interval facts.
-#[derive(Default)]
+/// Keeps a rolling window ([`AVG_WINDOW`], via the lib's
+/// [`ProcessWindows`]) of per-process CPU/memory samples so the PROC
+/// table can rank by average instead of the latest value.
 pub struct TextSink {
-    history: Mutex<HashMap<u32, VecDeque<ProcSample>>>,
+    windows: Mutex<ProcessWindows>,
     /// On a TTY: enable colors and repaint in place instead of scrolling
     interactive: bool,
     /// Optional dim footer line (e.g. key hints in watch mode)
     footer: Option<String>,
 }
 
+impl Default for TextSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TextSink {
     pub fn new() -> Self {
         Self {
-            history: Mutex::new(HashMap::new()),
+            windows: Mutex::new(ProcessWindows::new(AVG_WINDOW)),
             interactive: std::io::stdout().is_terminal(),
             footer: None,
         }
@@ -580,6 +650,7 @@ impl TextSink {
     /// used to warm up from daemon history on attach. Samples are stamped
     /// with the absorb time, so a replayed backlog initially counts toward
     /// the window as if it had just been observed
+    #[cfg(unix)] // its only caller, attach, is unix-only
     pub fn absorb(&self, snapshot: &SystemSnapshot) {
         if let Some(processes) = snapshot.processes.as_deref() {
             let _ = self.averages(processes);
@@ -588,32 +659,12 @@ impl TextSink {
 
     /// Record the current samples and return per-PID rolling averages
     fn averages(&self, processes: &[ProcessSnapshot]) -> ProcAverages {
-        let mut history = self.history.lock().unwrap_or_else(|e| e.into_inner());
-        let now = Instant::now();
-
-        // Drop PIDs absent from this snapshot (dead, or fell out of the
-        // collector's selection) so the map doesn't grow forever
-        let current: HashSet<u32> = processes.iter().map(|p| p.pid).collect();
-        history.retain(|pid, _| current.contains(pid));
-
-        let mut averages = ProcAverages::with_capacity(processes.len());
-        for p in processes {
-            let samples = history.entry(p.pid).or_default();
-            samples.push_back((now, p.cpu_usage_percent, p.memory_bytes));
-            while let Some((t, ..)) = samples.front() {
-                if now.duration_since(*t) > AVG_WINDOW {
-                    samples.pop_front();
-                } else {
-                    break;
-                }
-            }
-
-            let n = samples.len() as f64;
-            let cpu_avg = samples.iter().map(|(_, c, _)| f64::from(*c)).sum::<f64>() / n;
-            let mem_avg = samples.iter().map(|(_, _, m)| *m as f64).sum::<f64>() / n;
-            averages.insert(p.pid, (cpu_avg as f32, mem_avg as u64));
-        }
-        averages
+        let mut windows = self.windows.lock().unwrap_or_else(|e| e.into_inner());
+        windows
+            .record(Instant::now(), processes)
+            .into_iter()
+            .map(|(pid, stat)| (pid, (stat.cpu_avg as f32, stat.memory_avg_bytes as u64)))
+            .collect()
     }
 }
 

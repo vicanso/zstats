@@ -1,0 +1,175 @@
+name: "Publish"
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+*"]
+  schedule:
+    # Daily nightly at 18:00 UTC (02:00 Beijing). Skipped when main has no
+    # new commits since the last nightly — see the gate in prepare_vars.
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Only the release job gets write access.
+permissions:
+  contents: read
+
+jobs:
+  # Decide what to publish: a version release for tag pushes, the rolling
+  # `nightly` prerelease for the schedule — and skip the nightly entirely
+  # when its tag already points at today's HEAD.
+  prepare_vars:
+    runs-on: ubuntu-latest
+    # The nightly only makes sense on the canonical repo, not forks
+    if: github.event_name != 'schedule' || github.repository_owner == 'vicanso'
+    outputs:
+      release_tag: ${{ steps.vars.outputs.release_tag }}
+      should_publish: ${{ steps.vars.outputs.should_publish }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Decide tag and nightly gate
+        id: vars
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "release_tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "release_tag=nightly" >> "$GITHUB_OUTPUT"
+          # The release job force-moves the nightly tag to the built
+          # commit, so "tag already at HEAD" means "nothing new to build"
+          last=$(git ls-remote origin 'refs/tags/nightly^{}' | awk '{print $1}')
+          [ -n "$last" ] || last=$(git ls-remote origin refs/tags/nightly | awk '{print $1}')
+          if [ "$last" = "${GITHUB_SHA}" ]; then
+            echo "nightly already at ${GITHUB_SHA} — skipping"
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  macos:
+    needs: prepare_vars
+    if: needs.prepare_vars.outputs.should_publish == 'true'
+    runs-on: macos-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            tag: darwin-aarch64
+          - target: x86_64-apple-darwin
+            tag: darwin-x86
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: publish-${{ matrix.target }}
+
+      - name: Build and package
+        run: |
+          cargo build --release --target ${{ matrix.target }}
+          mv "target/${{ matrix.target }}/release/zstats" "./zstats-${{ matrix.tag }}"
+          tar -czvf "zstats-${{ matrix.tag }}.tar.gz" "zstats-${{ matrix.tag }}"
+          shasum -a 256 "zstats-${{ matrix.tag }}.tar.gz" > "zstats-${{ matrix.tag }}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zstats-${{ matrix.tag }}
+          path: |
+            zstats-*.tar.gz
+            zstats-*.tar.gz.sha256
+          retention-days: 3
+
+  # Static Linux binaries; the musl-cross images cross-compile aarch64
+  # from the plain x86 runner, no arm runner needed
+  linux-musl:
+    needs: prepare_vars
+    if: needs.prepare_vars.outputs.should_publish == 'true'
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - image: x86_64-musl
+            target: x86_64-unknown-linux-musl
+            tag: linux-musl-x86
+          - image: aarch64-musl
+            target: aarch64-unknown-linux-musl
+            tag: linux-musl-aarch64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build (musl container)
+        uses: addnab/docker-run-action@v3
+        with:
+          image: messense/rust-musl-cross:${{ matrix.image }}
+          options: -v ${{ github.workspace }}:/home/rust/src
+          run: |
+            # The image's toolchain may lag behind rust-version (1.95)
+            rustup update stable
+            cargo build --release --target ${{ matrix.target }}
+            mv target/${{ matrix.target }}/release/zstats ./zstats-${{ matrix.tag }}
+
+      - name: Package
+        run: |
+          tar -czvf "zstats-${{ matrix.tag }}.tar.gz" "zstats-${{ matrix.tag }}"
+          shasum -a 256 "zstats-${{ matrix.tag }}.tar.gz" > "zstats-${{ matrix.tag }}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zstats-${{ matrix.tag }}
+          path: |
+            zstats-*.tar.gz
+            zstats-*.tar.gz.sha256
+          retention-days: 3
+
+  # Windows is deliberately absent: the platform policy is compile-only
+  # support there (no daemon / alerts), so shipping binaries would
+  # overpromise.
+
+  release:
+    name: release (${{ needs.prepare_vars.outputs.release_tag }})
+    needs: [prepare_vars, macos, linux-musl]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # move the nightly tag, create the release, upload assets
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Move the nightly tag to HEAD
+        if: needs.prepare_vars.outputs.release_tag == 'nightly'
+        run: |
+          git tag -f nightly
+          git push -f origin nightly
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ls -lh dist/
+          tag="${{ needs.prepare_vars.outputs.release_tag }}"
+          if [ "$tag" = "nightly" ]; then
+            # Rolling prerelease: recreate so the date and commit stay honest
+            gh release delete "$tag" --yes || true
+            gh release create "$tag" --prerelease \
+              --title "nightly ($(date -u +%F))" \
+              --notes "Automated nightly build of main @ ${GITHUB_SHA}." \
+              dist/*
+          else
+            # Re-runs of a version release just replace the assets
+            gh release create "$tag" --generate-notes dist/* ||
+              gh release upload "$tag" dist/* --clobber
+          fi

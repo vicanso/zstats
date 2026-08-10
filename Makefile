@@ -30,8 +30,9 @@ check-features: ## Verify each feature combination compiles independently
 	cargo check --no-default-features --features client
 	cargo check --no-default-features --features frontend
 
-# Needs the targets once: rustup target add x86_64-unknown-linux-gnu x86_64-pc-windows-msvc
 check-targets: ## Linux and Windows must keep compiling (warnings are errors)
+	@# Targets are per-toolchain; adding is idempotent and instant once installed
+	rustup target add x86_64-unknown-linux-gnu x86_64-pc-windows-msvc
 	RUSTFLAGS="-D warnings" cargo check --target x86_64-unknown-linux-gnu
 	RUSTFLAGS="-D warnings" cargo check --target x86_64-pc-windows-msvc
 

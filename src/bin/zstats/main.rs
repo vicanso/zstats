@@ -405,7 +405,11 @@ fn detach_self() -> ExitCode {
 }
 
 fn runtime() -> tokio::runtime::Runtime {
+    // The async work here is tiny — a collect tick, one UDS accept loop,
+    // a few attached clients. Two workers are plenty; the default would
+    // park one thread per logical core (12+ on a desktop) for nothing
     tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
         .enable_all()
         .build()
         .expect("failed to build tokio runtime")

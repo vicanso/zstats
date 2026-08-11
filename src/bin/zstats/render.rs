@@ -325,6 +325,34 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
         procs,
     );
 
+    if let Some(b) = &s.battery {
+        let fraction = f64::from(b.charge_percent) / 100.0;
+        // Low battery is the alarming direction, so the gauge colors are
+        // inverted relative to a utilization bar
+        let color = level_color(1.0 - fraction, 0.8, 0.9);
+        let mut extra = String::new();
+        if let Some(secs) = b.time_to_empty_secs.or(b.time_to_full_secs) {
+            let _ = write!(extra, "  ·  {}", human_uptime(secs));
+        }
+        if let Some(w) = b.power_watts.filter(|w| *w > 0.1) {
+            let _ = write!(extra, "  ·  {w:.1} W");
+        }
+        if let Some(h) = b.health_percent {
+            let _ = write!(extra, "  ·  health {h:.0}%");
+        }
+        if let Some(c) = b.cycle_count {
+            let _ = write!(extra, "  ·  {c} cycles");
+        }
+        let _ = writeln!(
+            out,
+            "BATT  {}  {:>5.1}%  {}{}",
+            theme.paint(color, &gauge(fraction, GAUGE_WIDTH)),
+            b.charge_percent,
+            b.state,
+            extra,
+        );
+    }
+
     if let Some(temps) = &s.temperatures {
         if temps.is_empty() {
             let _ = writeln!(out, "TEMP  (no sensors)");

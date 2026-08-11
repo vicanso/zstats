@@ -232,6 +232,23 @@ pub struct CollectorConfig {
     #[serde(with = "duration_serde")]
     pub network_refresh_interval: Duration,
 
+    /// Whether to collect battery state. Machines without a battery
+    /// simply report `None`.
+    ///
+    /// The field that earns this its keep is `power_watts`: it changes
+    /// second to second with load and macOS surfaces it nowhere, so it
+    /// is what pairs with the CPU numbers ("150% CPU while drawing
+    /// 22 W"). Charge percentage duplicates the menu bar, and health and
+    /// cycle count move over months — they ride along free in the same
+    /// read as a reference value, not as a time series. Deliberately no
+    /// alert rule: low-battery warnings are the OS's job (see CLAUDE.md).
+    pub collect_battery: bool,
+
+    /// How often to refresh the battery (~0.6ms per read). Zero
+    /// refreshes every collect.
+    #[serde(with = "duration_serde")]
+    pub battery_refresh_interval: Duration,
+
     /// Whether to collect hardware temperature sensors (sysinfo Components).
     /// Platform-dependent: macOS returns many named sensors with occasional
     /// garbage values (filtered); some environments report none.
@@ -269,6 +286,8 @@ impl Default for CollectorConfig {
             dedupe_disks: true,
             collect_networks: true,
             network_refresh_interval: Duration::ZERO,
+            collect_battery: true,
+            battery_refresh_interval: Duration::from_secs(30),
             collect_temperatures: true,
             // Temps drift over seconds/minutes, not milliseconds
             temperature_refresh_interval: Duration::from_secs(15),

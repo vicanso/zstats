@@ -66,14 +66,21 @@ Config keys for -add (also accepted as key=value). Durations take 500ms /
   network-interval <dur>      [collector] network cadence (default 0)
   temp-interval <dur>         [collector] temperature cadence (default 15s)
   cpu-freq-interval <dur>     [collector] CPU frequency cadence (default 30s)
+  battery-interval <dur>      [collector] battery cadence (default 30s)
   process-boost <cores>       [collector] busy-cores boost (default 2, 0 = off)
   max-processes <n>           [collector] kept processes (default 50)
   collect-processes | collect-disks | collect-networks | collect-temperatures
-  process-disk-io | process-groups | dedupe-disks | per-core-cpu   <true|false>
+  collect-battery | process-disk-io | process-groups | dedupe-disks
+  per-core-cpu                                         <true|false>
   alert-cpu <pct|name=pct>    [alerts] CPU rules: 5-min avg >= pct (chronic)
                               or 1-min avg >= 3x pct (runaway); name=pct sets
                               a per-process override, e.g. alert-cpu ghostty=100
   alert-mem <pct|name=pct>    [alerts] 5-min avg memory-share rule, same forms
+  alert-disk <pct|mount=pct>  [alerts] volume used-capacity crossing alert
+                              (default 90; re-arms 5 pts below; 0 disables)
+  alert-pressure <level>      [alerts] kernel memory-pressure alert, macOS:
+                              off | warning (default) | critical; alerts only
+                              once the level persists (5m / 1m at critical)
   alert-cooldown <dur>        [alerts] re-alert cooldown (default 10m)
   alert-template <bool>       [alerts] builtin per-app override template
                               (default true; your overrides always win)

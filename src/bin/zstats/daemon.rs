@@ -379,6 +379,7 @@ mod tests {
             processes: None,
             process_groups: None,
             total_processes: None,
+            battery: None,
             load: LoadSnapshot {
                 load1: 0.0,
                 load5: 0.0,

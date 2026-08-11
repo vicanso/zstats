@@ -29,6 +29,17 @@
 //! - chronic: 5-minute average CPU (or memory share) at or above the
 //!   effective threshold — "quietly always busy", confirmed by
 //!   persistence; self-limiting bursts never get that far.
+//!
+//! The volume-capacity rule is different in kind: capacity is a slow
+//! state, so it alerts on the upward crossing of the threshold and
+//! re-arms only after dropping [`DISK_REARM_MARGIN`] below — one
+//! notification per episode, no cooldown, per-mount overrides.
+//!
+//! System memory pressure is driven by the kernel's own verdict
+//! (`pressure_level`) but requires PERSISTENCE, not just a crossing: a
+//! memory-heavy machine sits at warning as its steady state and would
+//! otherwise alert all day. One alert per severity per episode
+//! (worsening escalates, lingering never nags), re-armed at normal.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -64,7 +75,14 @@ const RECORD_EVERY: Duration = Duration::from_secs(60);
 /// Builtin defaults when the config file leaves a value unset
 const DEFAULT_CPU_PERCENT: f32 = 30.0;
 const DEFAULT_MEMORY_FRACTION: f64 = 0.25;
+const DEFAULT_DISK_FRACTION: f32 = 0.90;
 const DEFAULT_COOLDOWN: Duration = Duration::from_secs(600);
+
+/// The disk rule is crossing-based, not windowed (capacity is a slow
+/// state, not a rate): one alert when a volume crosses its threshold,
+/// then silence until it drops this far below and crosses again — no
+/// "still full" nagging, no cooldown involved
+const DISK_REARM_MARGIN: f64 = 0.05;
 
 /// Builtin CPU-override template: resident apps that legitimately sustain
 /// high CPU in normal use. Applied below the user's own overrides (a
@@ -221,6 +239,11 @@ impl<T: Copy> Thresholds<T> {
 pub struct ActiveThresholds {
     pub cpu: Thresholds<f32>,
     pub memory: Thresholds<f64>,
+    /// Volume used-capacity fractions, override key = mount point
+    pub disk: Thresholds<f32>,
+    /// Kernel memory-pressure level at which to start alerting (2 =
+    /// warning, 4 = critical); None disables the rule
+    pub pressure: Option<u32>,
     /// Per (process, rule) re-alert cooldown while a condition persists
     pub cooldown: Duration,
 }
@@ -261,16 +284,33 @@ impl ActiveThresholds {
         for (name, pct) in &file.mem_overrides {
             memory = memory.with_override(name.clone(), (*pct > 0.0).then_some(*pct / 100.0));
         }
+        let disk_default = match file.disk {
+            Some(p) if p > 0.0 => Some(p / 100.0),
+            Some(_) => None,
+            None => Some(DEFAULT_DISK_FRACTION),
+        };
+        let mut disk = Thresholds::new(disk_default);
+        for (mount, pct) in &file.disk_overrides {
+            disk = disk.with_override(mount.clone(), (*pct > 0.0).then_some(*pct / 100.0));
+        }
 
         Self {
             cpu,
             memory,
+            disk,
+            pressure: file
+                .pressure
+                .unwrap_or(crate::settings::PressureAlert::Warning)
+                .level(),
             cooldown: file.cooldown.unwrap_or(DEFAULT_COOLDOWN),
         }
     }
 
     pub fn any_enabled(&self) -> bool {
-        self.cpu.any_enabled() || self.memory.any_enabled()
+        self.cpu.any_enabled()
+            || self.memory.any_enabled()
+            || self.disk.any_enabled()
+            || self.pressure.is_some()
     }
 }
 
@@ -285,6 +325,16 @@ pub struct AlertEngine {
     /// 5-minute windows: chronic rules
     slow: Option<ProcessWindows>,
     last_alert: HashMap<(u32, AlertKind), Instant>,
+    /// Mounts that already fired the disk alert and have not yet dropped
+    /// [`DISK_REARM_MARGIN`] below their threshold
+    disk_disarmed: std::collections::HashSet<String>,
+    /// When the current above-normal pressure episode began; None while
+    /// the kernel reports normal
+    pressure_since: Option<Instant>,
+    /// Highest memory-pressure level already alerted this episode; reset
+    /// to 0 when the kernel reports normal again. One alert per severity
+    /// per episode — worsening escalates, lingering does not nag
+    pressure_alerted: u32,
     /// When the last metrics-recording pass ran (`None` = record on the
     /// next evaluation)
     last_record: Option<Instant>,
@@ -316,6 +366,80 @@ impl AlertEngine {
         active: &ActiveThresholds,
     ) -> Evaluation {
         let mut evaluation = Evaluation::default();
+
+        // Disk capacity runs first: it does not depend on process data.
+        // Crossing detection with hysteresis — see DISK_REARM_MARGIN
+        if let Some(disks) = &snapshot.disks {
+            self.disk_disarmed
+                .retain(|mount| disks.iter().any(|d| d.mount_point == *mount));
+            for d in disks {
+                let Some(threshold) = active.disk.for_process(&d.mount_point) else {
+                    continue;
+                };
+                if d.total_bytes == 0 {
+                    continue;
+                }
+                let used =
+                    d.total_bytes.saturating_sub(d.available_bytes) as f64 / d.total_bytes as f64;
+                if self.disk_disarmed.contains(&d.mount_point) {
+                    if used < f64::from(threshold) - DISK_REARM_MARGIN {
+                        self.disk_disarmed.remove(&d.mount_point);
+                    }
+                } else if used >= f64::from(threshold) {
+                    self.disk_disarmed.insert(d.mount_point.clone());
+                    evaluation.events.push(AlertEvent {
+                        message: format!(
+                            "disk {} is {:.0}% full — {:.1} GiB free of {:.1} GiB",
+                            d.mount_point,
+                            used * 100.0,
+                            d.available_bytes as f64 / f64::from(1 << 30),
+                            d.total_bytes as f64 / f64::from(1 << 30),
+                        ),
+                    });
+                }
+            }
+        }
+
+        // System memory pressure: the kernel's own verdict, but only once
+        // it PERSISTS. A memory-heavy machine sits at warning as its
+        // normal state and crosses the line all day, and a build spike is
+        // over in a minute — neither is actionable, and plain crossing
+        // detection reports both. compressed_bytes deliberately has no
+        // rule of its own: the kernel already folds compressor growth
+        // into this level
+        if let Some(threshold) = active.pressure
+            && let Some(level) = snapshot.memory.pressure_level
+        {
+            if level <= 1 {
+                self.pressure_since = None;
+                self.pressure_alerted = 0;
+            } else {
+                let since = *self.pressure_since.get_or_insert(now);
+                let elapsed = now.duration_since(since);
+                // More severe means faster notification, mirroring the
+                // acute/chronic split of the per-process rules
+                let required = if level >= 4 { WINDOW } else { SLOW_WINDOW };
+                if level >= threshold && level > self.pressure_alerted && elapsed >= required {
+                    self.pressure_alerted = level;
+                    let label = if level >= 4 { "critical" } else { "warning" };
+                    let compressed = snapshot
+                        .memory
+                        .compressed_bytes
+                        .map(|b| format!(", compressor {:.1} GiB", b as f64 / f64::from(1 << 30)))
+                        .unwrap_or_default();
+                    evaluation.events.push(AlertEvent {
+                        message: format!(
+                            "system memory pressure: {label} for {} min — \
+                             swap {:.1}/{:.1} GiB{compressed}",
+                            elapsed.as_secs() / 60,
+                            snapshot.memory.swap_used_bytes as f64 / f64::from(1 << 30),
+                            snapshot.memory.swap_total_bytes as f64 / f64::from(1 << 30),
+                        ),
+                    });
+                }
+            }
+        }
+
         let Some(processes) = snapshot.processes.as_deref() else {
             tracing::debug!("alert evaluation skipped: snapshot has no processes");
             return evaluation;
@@ -518,6 +642,7 @@ mod tests {
             processes: Some(std::sync::Arc::new(processes)),
             process_groups: None,
             total_processes: None,
+            battery: None,
             load: LoadSnapshot {
                 load1: 0.0,
                 load5: 0.0,
@@ -536,8 +661,30 @@ mod tests {
         ActiveThresholds {
             cpu,
             memory,
+            disk: Thresholds::new(None),
+            pressure: None,
             cooldown,
         }
+    }
+
+    fn disk(mount: &str, total: u64, available: u64) -> crate::snapshot::DiskSnapshot {
+        crate::snapshot::DiskSnapshot {
+            name: "disk0".into(),
+            mount_point: mount.into(),
+            file_system: "apfs".into(),
+            kind: "SSD".into(),
+            is_removable: false,
+            total_bytes: total,
+            available_bytes: available,
+            read_bytes_per_sec: None,
+            write_bytes_per_sec: None,
+        }
+    }
+
+    fn snapshot_disks(disks: Vec<crate::snapshot::DiskSnapshot>) -> SystemSnapshot {
+        let mut s = snapshot(Vec::new(), 100);
+        s.disks = Some(disks);
+        s
     }
 
     /// Feed one sample every 2s for `steps` steps starting at
@@ -907,12 +1054,230 @@ mod tests {
     }
 
     #[test]
+    fn disk_crossing_alerts_once_then_rearms_below_margin() {
+        let active = ActiveThresholds {
+            cpu: Thresholds::new(None),
+            memory: Thresholds::new(None),
+            disk: Thresholds::new(Some(0.90)),
+            pressure: None,
+            cooldown: Duration::from_secs(600),
+        };
+        let mut engine = AlertEngine::new();
+        let base = Instant::now();
+        let mut step = |i: u64, used_pct: u64| {
+            engine
+                .evaluate(
+                    base + Duration::from_secs(2 * i),
+                    &snapshot_disks(vec![disk("/", 1000, 1000 - used_pct * 10)]),
+                    &active,
+                )
+                .events
+        };
+
+        assert!(step(0, 85).is_empty(), "below threshold");
+        let fired = step(1, 91);
+        assert_eq!(fired.len(), 1, "crossing fires once");
+        assert!(fired[0].message.contains("disk / is 91% full"));
+        assert!(step(2, 93).is_empty(), "still full: no nagging");
+        assert!(step(3, 87).is_empty(), "above the re-arm line: still quiet");
+        assert!(step(4, 84).is_empty(), "re-armed silently");
+        assert_eq!(step(5, 92).len(), 1, "second crossing fires again");
+    }
+
+    #[test]
+    fn disk_override_disables_backup_volume() {
+        // A Time-Machine-style volume runs full by design: override 0
+        // silences it while the system volume still alerts
+        let disk_rule = Thresholds::new(Some(0.90)).with_override("/Volumes/Backup".into(), None);
+        let active = ActiveThresholds {
+            cpu: Thresholds::new(None),
+            memory: Thresholds::new(None),
+            disk: disk_rule,
+            pressure: None,
+            cooldown: Duration::from_secs(600),
+        };
+        let mut engine = AlertEngine::new();
+        let events = engine
+            .evaluate(
+                Instant::now(),
+                &snapshot_disks(vec![disk("/Volumes/Backup", 1000, 10), disk("/", 1000, 50)]),
+                &active,
+            )
+            .events;
+        assert_eq!(events.len(), 1);
+        assert!(events[0].message.contains("disk / is 95% full"));
+    }
+
+    #[test]
+    fn pressure_alerts_on_warning_escalates_to_critical_then_rearms() {
+        let active = ActiveThresholds {
+            cpu: Thresholds::new(None),
+            memory: Thresholds::new(None),
+            disk: Thresholds::new(None),
+            pressure: Some(2),
+            cooldown: Duration::from_secs(600),
+        };
+        let mut engine = AlertEngine::new();
+        let base = Instant::now();
+        let mut step = |i: u64, level: u32| {
+            let mut s = snapshot(Vec::new(), 100);
+            s.memory.pressure_level = Some(level);
+            engine
+                .evaluate(base + Duration::from_secs(2 * i), &s, &active)
+                .events
+        };
+
+        // Steps are 2s apart and the episode starts at step 1 (t=2s), so
+        // the warning's SLOW_WINDOW (300s) is served at step 151
+        assert!(step(0, 1).is_empty(), "normal is silent");
+        for i in 1..151 {
+            assert!(
+                step(i, 2).is_empty(),
+                "transient warning must stay silent (t={}s)",
+                2 * i
+            );
+        }
+        let warn = step(151, 2);
+        assert_eq!(warn.len(), 1, "sustained warning alerts once");
+        assert!(
+            warn[0].message.contains("warning for 5 min"),
+            "got: {}",
+            warn[0].message
+        );
+        assert!(step(152, 2).is_empty(), "lingering warning does not nag");
+        let crit = step(153, 4);
+        assert_eq!(crit.len(), 1, "worsening escalates without waiting again");
+        assert!(crit[0].message.contains("critical"));
+        assert!(
+            step(154, 2).is_empty(),
+            "improving within the episode is silent"
+        );
+        assert!(step(155, 1).is_empty(), "back to normal re-arms silently");
+        // A new episode must serve its own persistence requirement
+        assert!(step(156, 2).is_empty(), "new episode restarts the clock");
+        assert_eq!(step(306, 2).len(), 1, "and alerts once sustained again");
+    }
+
+    #[test]
+    fn critical_pressure_alerts_faster_than_warning() {
+        // An episode that starts at critical needs only WINDOW (60s),
+        // not the 5 minutes a warning must persist
+        let active = ActiveThresholds {
+            cpu: Thresholds::new(None),
+            memory: Thresholds::new(None),
+            disk: Thresholds::new(None),
+            pressure: Some(2),
+            cooldown: Duration::from_secs(600),
+        };
+        let mut engine = AlertEngine::new();
+        let base = Instant::now();
+        let mut fired = 0;
+        for i in 0..40u64 {
+            let mut s = snapshot(Vec::new(), 100);
+            s.memory.pressure_level = Some(4);
+            let events = engine
+                .evaluate(base + Duration::from_secs(2 * i), &s, &active)
+                .events;
+            if 2 * i < 60 {
+                assert!(events.is_empty(), "not before 60s (t={}s)", 2 * i);
+            }
+            fired += events.len();
+        }
+        assert_eq!(fired, 1);
+    }
+
+    #[test]
+    fn critical_only_setting_ignores_sustained_warning() {
+        // The memory-heavy case: warning is this machine's normal state,
+        // so only critical should ever interrupt
+        let active = ActiveThresholds {
+            cpu: Thresholds::new(None),
+            memory: Thresholds::new(None),
+            disk: Thresholds::new(None),
+            pressure: Some(4),
+            cooldown: Duration::from_secs(600),
+        };
+        let mut engine = AlertEngine::new();
+        let base = Instant::now();
+        let mut fired = 0;
+        for i in 0..200u64 {
+            let mut s = snapshot(Vec::new(), 100);
+            // Warning for 400s straight, then critical
+            s.memory.pressure_level = Some(if i < 200 { 2 } else { 4 });
+            fired += engine
+                .evaluate(base + Duration::from_secs(2 * i), &s, &active)
+                .events
+                .len();
+        }
+        assert_eq!(fired, 0, "sustained warning never alerts at critical-only");
+    }
+
+    #[test]
+    fn pressure_rule_can_be_disabled_and_skips_absent_data() {
+        let mut active = ActiveThresholds {
+            cpu: Thresholds::new(None),
+            memory: Thresholds::new(None),
+            disk: Thresholds::new(None),
+            pressure: None,
+            cooldown: Duration::from_secs(600),
+        };
+        let mut engine = AlertEngine::new();
+        let mut s = snapshot(Vec::new(), 100);
+        s.memory.pressure_level = Some(4);
+        assert!(
+            engine
+                .evaluate(Instant::now(), &s, &active)
+                .events
+                .is_empty(),
+            "disabled rule stays silent even at critical"
+        );
+
+        // Enabled but the platform reports no level (non-macOS): silent
+        active.pressure = Some(2);
+        let s = snapshot(Vec::new(), 100);
+        assert!(
+            engine
+                .evaluate(Instant::now(), &s, &active)
+                .events
+                .is_empty()
+        );
+    }
+
+    #[test]
     fn from_config_uses_builtin_defaults_when_nothing_is_set() {
         let merged = ActiveThresholds::from_config(&AlertsConfig::default());
         assert_eq!(merged.cpu.for_process("any"), Some(30.0));
         assert_eq!(merged.memory.for_process("any"), Some(0.25));
+        assert_eq!(merged.disk.for_process("/"), Some(0.90));
+        assert_eq!(merged.pressure, Some(2));
         assert_eq!(merged.cooldown, Duration::from_secs(600));
         assert!(merged.any_enabled());
+
+        // The key's original boolean form still parses, and the
+        // three-way form maps to kernel levels
+        let off: AlertsConfig = toml::from_str("pressure = false").expect("bool form");
+        assert_eq!(ActiveThresholds::from_config(&off).pressure, None);
+        let warn: AlertsConfig = toml::from_str("pressure = true").expect("bool form");
+        assert_eq!(ActiveThresholds::from_config(&warn).pressure, Some(2));
+        let crit: AlertsConfig = toml::from_str(r#"pressure = "critical""#).expect("name form");
+        assert_eq!(ActiveThresholds::from_config(&crit).pressure, Some(4));
+        assert!(toml::from_str::<AlertsConfig>(r#"pressure = "loud""#).is_err());
+    }
+
+    #[test]
+    fn from_config_disk_zero_disables_and_overrides_map() {
+        let mut file = AlertsConfig {
+            disk: Some(0.0),
+            ..Default::default()
+        };
+        let merged = ActiveThresholds::from_config(&file);
+        assert_eq!(merged.disk.for_process("/"), None);
+
+        file.disk = Some(80.0);
+        file.disk_overrides.insert("/Volumes/Backup".into(), 0.0);
+        let merged = ActiveThresholds::from_config(&file);
+        assert_eq!(merged.disk.for_process("/"), Some(0.80));
+        assert_eq!(merged.disk.for_process("/Volumes/Backup"), None);
     }
 
     #[test]

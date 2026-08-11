@@ -60,6 +60,14 @@ dedupe_disks = true
 collect_networks = true
 network_refresh_interval = "0s"
 
+# -------------------------------------------------------------------- battery
+# Charge, health (wear), cycle count, temperature and present power flow.
+# Machines without a battery report nothing; costs one IOKit read per
+# refresh. Charge moves slowly — only plugging in changes state abruptly,
+# and a few seconds of lag there is harmless
+collect_battery = true
+battery_refresh_interval = "30s"
+
 # --------------------------------------------------------------- temperatures
 # Hardware sensors via sysinfo Components; platform-dependent, implausible
 # firmware readings are filtered out
@@ -103,6 +111,21 @@ cpu = 30.0
 # reaches this percentage (no runaway tier — transient legitimate spikes
 # must not alert). 0 disables
 mem = 25.0
+# Notification when a volume's used capacity crosses this percentage.
+# Crossing-based, not windowed: fires once, stays silent while the disk
+# remains full, re-arms after dropping 5 points below. 0 disables
+disk = 90.0
+# System memory-pressure alert, driven by the kernel's own verdict
+# (macOS). Which verdict is worth interrupting for:
+#   "off"       never
+#   "warning"   (default) warning and worse
+#   "critical"  only critical — the right setting on a memory-heavy
+#               machine that sits at warning as its normal state
+# Alerts only once the level PERSISTS: 5 minutes for warning, 1 minute
+# for critical (more severe, faster notification). Escalation from
+# warning to critical within the same episode notifies immediately;
+# lingering at one level never nags. `true`/`false` still parse
+pressure = "warning"
 # Minimum time between repeated alerts for the same process and rule
 cooldown = "10m"
 
@@ -214,3 +237,8 @@ template = true
 
 [alerts.mem_overrides]
 # "Google Chrome" = 50.0
+
+# Per-volume disk overrides by mount point. Backup volumes (Time
+# Machine) run near-full by design — silence them with 0
+[alerts.disk_overrides]
+# "/Volumes/Backup" = 0.0

@@ -28,8 +28,9 @@ use crate::collector::Collector;
 use crate::config::CollectorConfig;
 use crate::error::CollectError;
 use crate::snapshot::{
-    CpuSnapshot, DiskSnapshot, HostInfo, LoadSnapshot, MemorySnapshot, NetworkSnapshot,
-    PerfLevelSnapshot, ProcessGroupSnapshot, ProcessSnapshot, SystemSnapshot, TemperatureSnapshot,
+    BatterySnapshot, CpuSnapshot, DiskSnapshot, HostInfo, LoadSnapshot, MemorySnapshot,
+    NetworkSnapshot, PerfLevelSnapshot, ProcessGroupSnapshot, ProcessSnapshot, SystemSnapshot,
+    TemperatureSnapshot,
 };
 use crate::utils::rate::rate_per_sec;
 
@@ -96,6 +97,12 @@ pub struct LocalCollector {
     /// highest-performance level first; empty when the platform has
     /// fewer than two levels. Read once at startup
     perf_levels: Vec<(String, u32)>,
+    /// Battery access handle; None when the platform has no battery
+    /// support at all. Built once — creating it per collect would be
+    /// wasteful
+    battery_manager: Option<starship_battery::Manager>,
+    last_battery_refresh: Option<Instant>,
+    cached_battery: Option<BatterySnapshot>,
 }
 
 impl LocalCollector {
@@ -134,6 +141,7 @@ impl LocalCollector {
         // Temperatures are refreshed on their own slow cadence; start empty
         // so the first collect that is due performs a real read
         let components = Components::new();
+        let config_collect_battery = config.collect_battery;
 
         Self {
             config,
@@ -158,6 +166,19 @@ impl LocalCollector {
             cached_temperatures: None,
             cached_process_groups: None,
             perf_levels: detect_perf_levels(),
+            battery_manager: config_collect_battery
+                .then(starship_battery::Manager::new)
+                .and_then(|result| match result {
+                    Ok(manager) => Some(manager),
+                    Err(e) => {
+                        // Not fatal: a machine without battery support
+                        // just reports None forever
+                        let _ = e;
+                        None
+                    }
+                }),
+            last_battery_refresh: None,
+            cached_battery: None,
         }
     }
 
@@ -567,6 +588,41 @@ impl LocalCollector {
             .then(|| self.system.processes().len() as u32)
     }
 
+    /// Read the main battery on its own cadence, reusing the last
+    /// reading in between. `None` on machines without one
+    fn collect_battery(&mut self) -> Option<BatterySnapshot> {
+        let manager = self.battery_manager.as_ref()?;
+        let due = self.config.battery_refresh_interval.is_zero()
+            || self
+                .last_battery_refresh
+                .is_none_or(|t| t.elapsed() >= self.config.battery_refresh_interval);
+        if !due {
+            return self.cached_battery.clone();
+        }
+        self.last_battery_refresh = Some(Instant::now());
+
+        // First battery only: multi-battery machines are vanishingly rare
+        // outside of some laptops, and a merged total would be a lie
+        let battery = manager
+            .batteries()
+            .ok()?
+            .next()?
+            .ok()
+            .map(|b| BatterySnapshot {
+                state: b.state().to_string(),
+                charge_percent: b.state_of_charge().value * 100.0,
+                health_percent: Some(b.state_of_health().value * 100.0),
+                cycle_count: b.cycle_count(),
+                // The wrapper reports Kelvin
+                temperature_celsius: b.temperature().map(|t| t.value - 273.15),
+                power_watts: Some(b.energy_rate().value),
+                time_to_full_secs: b.time_to_full().map(|t| t.value as u64),
+                time_to_empty_secs: b.time_to_empty().map(|t| t.value as u64),
+            });
+        self.cached_battery = battery.clone();
+        battery
+    }
+
     fn collect_load(&self) -> LoadSnapshot {
         let load = System::load_average();
         LoadSnapshot {
@@ -906,6 +962,7 @@ impl Collector for LocalCollector {
             processes: self.collect_processes(processes_due, process_elapsed),
             process_groups: self.collect_process_groups(processes_due),
             total_processes: self.collect_total_processes(),
+            battery: self.collect_battery(),
             load: self.collect_load(),
             temperatures: self.collect_temperatures(),
             extras: HashMap::new(),

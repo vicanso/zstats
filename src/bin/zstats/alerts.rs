@@ -31,6 +31,8 @@ use crate::settings;
 /// Stat the config file's mtime once every this many collects (about a
 /// minute at the default 2s interval) and hot-reload thresholds on change
 const RELOAD_CHECK_EVERY: u32 = 30;
+/// Give the notification helper this long before assuming it is stuck
+const NOTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn config_mtime() -> Option<SystemTime> {
     std::fs::metadata(settings::path())
@@ -120,41 +122,60 @@ impl AlertSink {
     }
 }
 
-/// Fire a desktop notification, best-effort: macOS uses osascript (whose
-/// Script Editor identity reliably displays banners — notification-center
-/// APIs masquerading as Terminal.app get silently dropped on this setup),
-/// other unixes try notify-send. `spawn` doesn't block; failures are
-/// ignored — the daemon's stdio is detached anyway
-fn send_notification(message: &str) {
-    use std::process::{Command, Stdio};
+/// Fire a desktop notification: macOS uses osascript (whose Script Editor
+/// identity reliably displays banners — notification-center APIs
+/// masquerading as Terminal.app get silently dropped on this setup),
+/// other unixes try notify-send.
+///
+/// The exit status IS checked and failures are logged. Fire-and-forget
+/// would make "the rule fired" and "the user was actually told"
+/// indistinguishable after the fact — exactly the ambiguity that makes a
+/// missing notification impossible to diagnose from the daemon log. Note
+/// this only covers handing the message to the OS: whether the system
+/// then displays it immediately, defers it into a notification summary,
+/// or holds it behind a Focus mode is outside our reach.
+async fn send_notification(message: &str) {
+    use std::process::Stdio;
 
     #[cfg(target_os = "macos")]
-    {
-        let script = format!(
-            "display notification \"{}\" with title \"zstats\"",
-            escape_applescript(message)
-        );
-        let _ = Command::new("osascript")
-            .args(["-e", &script])
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-    }
+    let (program, args) = (
+        "osascript",
+        vec![
+            "-e".to_string(),
+            format!(
+                "display notification \"{}\" with title \"zstats\"",
+                escape_applescript(message)
+            ),
+        ],
+    );
+    #[cfg(not(target_os = "macos"))]
+    let (program, args) = (
+        "notify-send",
+        vec!["zstats".to_string(), message.to_string()],
+    );
 
-    #[cfg(all(unix, not(target_os = "macos")))]
-    {
-        let _ = Command::new("notify-send")
-            .args(["zstats", message])
+    // A wedged helper must not hold up the sink (the scheduler gives each
+    // sink 5s); osascript normally returns in well under a second
+    let result = tokio::time::timeout(
+        NOTIFY_TIMEOUT,
+        tokio::process::Command::new(program)
+            .args(&args)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
-    }
+            .output(),
+    )
+    .await;
 
-    #[cfg(not(unix))]
-    {
-        let _ = message;
+    match result {
+        Ok(Ok(out)) if out.status.success() => {
+            tracing::debug!("{program} accepted the notification");
+        }
+        Ok(Ok(out)) => tracing::warn!(
+            "{program} rejected the notification ({}): {}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr).trim()
+        ),
+        Ok(Err(e)) => tracing::warn!("failed to run {program}: {e}"),
+        Err(_) => tracing::warn!("{program} timed out after {NOTIFY_TIMEOUT:?}"),
     }
 }
 
@@ -179,7 +200,7 @@ impl MetricSink for AlertSink {
             // timestamp, and it separates "rule fired" from "notification
             // displayed" when debugging delivery issues
             tracing::info!("alert: {}", event.message);
-            send_notification(&event.message);
+            send_notification(&event.message).await;
         }
         if !evaluation.records.is_empty() {
             self.persist_records(&evaluation.records);

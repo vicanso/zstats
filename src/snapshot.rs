@@ -60,6 +60,11 @@ pub struct SystemSnapshot {
     #[serde(default)]
     pub total_processes: Option<u32>,
 
+    /// Main battery; None when battery collection is disabled or the
+    /// machine has no battery (desktop, VM)
+    #[serde(default)]
+    pub battery: Option<BatterySnapshot>,
+
     /// Load averages
     pub load: LoadSnapshot,
 
@@ -87,6 +92,32 @@ pub struct HostInfo {
     /// User-defined labels for distinguishing multiple machines
     #[serde(default)]
     pub labels: HashMap<String, String>,
+}
+
+/// The machine's main battery, when it has one.
+///
+/// Read through a safe cross-platform wrapper (IOKit on macOS, sysfs on
+/// Linux), so every field is optional where the platform may not report
+/// it. Desktops and VMs yield no battery at all.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatterySnapshot {
+    /// "Charging", "Discharging", "Full", "Empty" or "Unknown" — the
+    /// direction of travel; frontends derive "on AC" from it
+    pub state: String,
+    /// Current charge, 0-100
+    pub charge_percent: f32,
+    /// Full capacity relative to design capacity, 0-100: battery wear
+    pub health_percent: Option<f32>,
+    /// Charge cycles the battery has been through
+    pub cycle_count: Option<u32>,
+    /// Battery temperature in Celsius (separate from the CPU sensors)
+    pub temperature_celsius: Option<f32>,
+    /// Present power flow in watts (charging or discharging, per `state`)
+    pub power_watts: Option<f32>,
+    /// Estimated seconds until full (while charging)
+    pub time_to_full_secs: Option<u64>,
+    /// Estimated seconds until empty (while discharging)
+    pub time_to_empty_secs: Option<u64>,
 }
 
 /// Usage of one CPU performance level (Apple Silicon P/E clusters).

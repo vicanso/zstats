@@ -238,6 +238,44 @@ fn config_toggles_are_respected() {
 }
 
 #[test]
+fn battery_is_optional_and_cached_between_refreshes() {
+    let mut collector = LocalCollector::new(CollectorConfig {
+        collect_processes: false,
+        // Freeze the cadence after the first read
+        battery_refresh_interval: Duration::from_secs(3600),
+        ..Default::default()
+    });
+    let first = collector.collect().expect("first collect");
+    // Machines without a battery report None; where there is one, the
+    // values must be plausible
+    if let Some(b) = &first.battery {
+        assert!(!b.state.is_empty());
+        assert!((0.0..=100.0).contains(&b.charge_percent));
+        if let Some(h) = b.health_percent {
+            assert!((0.0..=100.0).contains(&h));
+        }
+        if let Some(t) = b.temperature_celsius {
+            assert!((-20.0..100.0).contains(&t), "implausible battery temp {t}");
+        }
+    }
+
+    std::thread::sleep(Duration::from_millis(50));
+    let second = collector.collect().expect("second collect");
+    // Between refreshes the cached reading is served verbatim
+    assert_eq!(
+        first.battery.as_ref().map(|b| b.charge_percent),
+        second.battery.as_ref().map(|b| b.charge_percent)
+    );
+
+    let mut collector = LocalCollector::new(CollectorConfig {
+        collect_battery: false,
+        collect_processes: false,
+        ..Default::default()
+    });
+    assert!(collector.collect().expect("collect").battery.is_none());
+}
+
+#[test]
 fn process_groups_aggregate_trees_and_respect_toggle_and_cache() {
     let max_processes = CollectorConfig::default().max_processes;
     let mut collector = LocalCollector::new(CollectorConfig {

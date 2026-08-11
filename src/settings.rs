@@ -56,6 +56,59 @@ pub fn config_path(dir: &Path) -> PathBuf {
     dir.join("config.toml")
 }
 
+/// Which kernel memory-pressure verdict is worth a notification.
+///
+/// A memory-heavy machine can sit at `warning` as its normal operating
+/// state, in which case only `critical` carries information — hence the
+/// choice. Deserializes from `"off"`/`"warning"`/`"critical"` and also
+/// from the booleans this key originally accepted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PressureAlert {
+    Off,
+    /// The kernel's "warning" verdict (level 2) and worse
+    Warning,
+    /// Only the kernel's "critical" verdict (level 4)
+    Critical,
+}
+
+impl PressureAlert {
+    /// Kernel level at which this setting starts alerting; None = off
+    pub fn level(self) -> Option<u32> {
+        match self {
+            Self::Off => None,
+            Self::Warning => Some(2),
+            Self::Critical => Some(4),
+        }
+    }
+
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" | "false" | "0" | "none" => Ok(Self::Off),
+            "warning" | "warn" | "true" | "1" => Ok(Self::Warning),
+            "critical" | "crit" => Ok(Self::Critical),
+            other => Err(format!("{other} (use off|warning|critical)")),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PressureAlert {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        // `pressure = true` predates the three-way setting; keep it working
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum Repr {
+            Bool(bool),
+            Name(String),
+        }
+        match Repr::deserialize(deserializer)? {
+            Repr::Bool(true) => Ok(Self::Warning),
+            Repr::Bool(false) => Ok(Self::Off),
+            Repr::Name(name) => Self::parse(&name).map_err(serde::de::Error::custom),
+        }
+    }
+}
+
 #[derive(Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct FileConfig {
@@ -108,10 +161,21 @@ pub struct AlertsConfig {
         skip_serializing_if = "Option::is_none"
     )]
     pub cooldown: Option<std::time::Duration>,
+    /// Volume used-capacity threshold in percent; absent = builtin
+    /// default (90). Fires once per upward crossing, re-arms 5 points
+    /// below. 0 disables
+    pub disk: Option<f32>,
+    /// Which kernel memory-pressure verdict starts alerting (macOS);
+    /// absent = warning. The levels are the kernel's own — the only
+    /// choice is which one is worth interrupting for
+    pub pressure: Option<PressureAlert>,
     /// Per-process CPU overrides, keyed by process name
     pub cpu_overrides: BTreeMap<String, f32>,
     /// Per-process memory overrides, keyed by process name
     pub mem_overrides: BTreeMap<String, f64>,
+    /// Per-volume disk overrides, keyed by mount point (backup volumes
+    /// run full by design — disable them with 0)
+    pub disk_overrides: BTreeMap<String, f32>,
     /// Apply the builtin per-app override template
     /// (`zstats::alerts::TEMPLATE_CPU_OVERRIDES`) beneath the user's own
     /// overrides; absent = true. Set false for a pure user config
@@ -122,10 +186,11 @@ pub struct AlertsConfig {
 /// and interactive key listings
 pub const KNOWN_KEYS: &str = "interval, history, detach, process-interval, \
 disk-interval, disk-storage-interval, network-interval, temp-interval, \
-cpu-freq-interval, process-boost, max-processes, collect-processes, \
-collect-disks, collect-networks, collect-temperatures, process-disk-io, \
+cpu-freq-interval, battery-interval, process-boost, max-processes, \
+collect-processes, collect-disks, collect-networks, collect-temperatures, \
+collect-battery, process-disk-io, \
 process-groups, dedupe-disks, per-core-cpu, alert-cpu, alert-mem, \
-alert-cooldown, alert-template";
+alert-disk, alert-pressure, alert-cooldown, alert-template";
 
 fn parse<T: std::str::FromStr>(key: &str, value: &str) -> Result<T, String> {
     value
@@ -171,6 +236,7 @@ pub fn apply_add(config: &mut FileConfig, key: &str, value: &str) -> Result<Stri
         }
         "network-interval" => collector_mut(config).network_refresh_interval = millis(key, value)?,
         "temp-interval" => collector_mut(config).temperature_refresh_interval = millis(key, value)?,
+        "battery-interval" => collector_mut(config).battery_refresh_interval = millis(key, value)?,
         "cpu-freq-interval" => {
             collector_mut(config).cpu_frequency_refresh_interval = millis(key, value)?
         }
@@ -190,6 +256,7 @@ pub fn apply_add(config: &mut FileConfig, key: &str, value: &str) -> Result<Stri
         "collect-disks" => collector_mut(config).collect_disks = parse(key, value)?,
         "collect-networks" => collector_mut(config).collect_networks = parse(key, value)?,
         "collect-temperatures" => collector_mut(config).collect_temperatures = parse(key, value)?,
+        "collect-battery" => collector_mut(config).collect_battery = parse(key, value)?,
         "process-disk-io" => collector_mut(config).collect_process_disk_io = parse(key, value)?,
         "process-groups" => collector_mut(config).collect_process_groups = parse(key, value)?,
         "dedupe-disks" => collector_mut(config).dedupe_disks = parse(key, value)?,
@@ -219,7 +286,24 @@ pub fn apply_add(config: &mut FileConfig, key: &str, value: &str) -> Result<Stri
                 config.alerts.mem = Some(pct);
             }
         }
+        "alert-disk" => {
+            if let Some((mount, pct)) = value.split_once('=') {
+                let mount = mount.trim();
+                if mount.is_empty() {
+                    return Err(format!("invalid value for {key}: {value} (empty mount)"));
+                }
+                let pct: f32 = parse(key, pct)?;
+                config.alerts.disk_overrides.insert(mount.to_string(), pct);
+                return Ok(format!("{key} override: {mount} = {pct}% (0 disables)"));
+            }
+            config.alerts.disk = Some(parse(key, value)?);
+        }
         "alert-cooldown" => config.alerts.cooldown = Some(millis(key, value)?),
+        "alert-pressure" => {
+            config.alerts.pressure = Some(
+                PressureAlert::parse(value).map_err(|e| format!("invalid value for {key}: {e}"))?,
+            )
+        }
         "alert-template" => config.alerts.template = Some(parse(key, value)?),
         other => return Err(format!("unknown key: {other} (known keys: {KNOWN_KEYS})")),
     }
@@ -238,7 +322,8 @@ pub fn apply_remove(
         let removed = match key {
             "alert-cpu" => config.alerts.cpu_overrides.remove(name).is_some(),
             "alert-mem" => config.alerts.mem_overrides.remove(name).is_some(),
-            other => return Err(format!("{other} has no per-process overrides")),
+            "alert-disk" => config.alerts.disk_overrides.remove(name).is_some(),
+            other => return Err(format!("{other} has no per-name overrides")),
         };
         return if removed {
             Ok(format!("removed {key} override for {name}"))
@@ -283,6 +368,10 @@ pub fn apply_remove(
         "collect-temperatures" => {
             collector_mut(config).collect_temperatures = defaults.collect_temperatures
         }
+        "collect-battery" => collector_mut(config).collect_battery = defaults.collect_battery,
+        "battery-interval" => {
+            collector_mut(config).battery_refresh_interval = defaults.battery_refresh_interval
+        }
         "process-disk-io" => {
             collector_mut(config).collect_process_disk_io = defaults.collect_process_disk_io
         }
@@ -293,7 +382,9 @@ pub fn apply_remove(
         "per-core-cpu" => collector_mut(config).per_core_cpu = defaults.per_core_cpu,
         "alert-cpu" => config.alerts.cpu = None,
         "alert-mem" => config.alerts.mem = None,
+        "alert-disk" => config.alerts.disk = None,
         "alert-cooldown" => config.alerts.cooldown = None,
+        "alert-pressure" => config.alerts.pressure = None,
         "alert-template" => config.alerts.template = None,
         other => return Err(format!("unknown key: {other} (known keys: {KNOWN_KEYS})")),
     }
@@ -423,6 +514,9 @@ detach = true
         settings_apply(&mut config, "collect-temperatures", "false");
         settings_apply(&mut config, "alert-cpu", "40");
         settings_apply(&mut config, "alert-cpu", "ghostty=100");
+        settings_apply(&mut config, "alert-disk", "95");
+        settings_apply(&mut config, "alert-disk", "/Volumes/Backup=0");
+        settings_apply(&mut config, "alert-pressure", "critical");
         settings_apply(&mut config, "alert-template", "false");
         settings_apply(&mut config, "process-boost", "0");
 
@@ -442,10 +536,19 @@ detach = true
         assert_eq!(collector.process_boost_cpu_cores, Some(0.0));
         assert_eq!(config.alerts.cpu, Some(40.0));
         assert_eq!(config.alerts.cpu_overrides["ghostty"], 100.0);
+        assert_eq!(config.alerts.disk, Some(95.0));
+        assert_eq!(config.alerts.disk_overrides["/Volumes/Backup"], 0.0);
+        assert_eq!(config.alerts.pressure, Some(PressureAlert::Critical));
         assert_eq!(config.alerts.template, Some(false));
 
+        apply_remove(&mut config, "alert-pressure", None).expect("reset pressure");
+        assert_eq!(config.alerts.pressure, None);
         apply_remove(&mut config, "alert-template", None).expect("reset template");
         assert_eq!(config.alerts.template, None);
+        apply_remove(&mut config, "alert-disk", Some("/Volumes/Backup")).expect("drop override");
+        assert!(config.alerts.disk_overrides.is_empty());
+        apply_remove(&mut config, "alert-disk", None).expect("reset disk");
+        assert_eq!(config.alerts.disk, None);
     }
 
     #[test]
@@ -456,6 +559,8 @@ detach = true
         assert!(apply_add(&mut config, "interval", "0").is_err());
         assert!(apply_add(&mut config, "collect-disks", "yes").is_err());
         assert!(apply_add(&mut config, "alert-cpu", "=100").is_err());
+        assert!(apply_add(&mut config, "alert-disk", "=90").is_err());
+        assert!(apply_add(&mut config, "alert-pressure", "loud").is_err());
         assert!(apply_add(&mut config, "process-boost", "-1").is_err());
     }
 

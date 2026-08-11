@@ -174,6 +174,73 @@ pub const TEMPLATE_CPU_OVERRIDES: &[(&str, f32)] = &[
     ("WindowServer", 100.0),
 ];
 
+/// Builtin whole-app CPU template, keyed on the process-tree ROOT name.
+/// Deliberately much shorter than [`TEMPLATE_CPU_OVERRIDES`]: the app
+/// thresholds already start high (200% / 40%), so only two situations
+/// need exempting — work you started yourself, and hosts whose whole job
+/// is to burn cores on someone else's behalf.
+///
+/// `login` is the important entry and the reason this table exists at
+/// all: on macOS every terminal session's descendants group under a
+/// `login` root, so a build sustains hundreds of percent under a name
+/// that is not an application. Silencing it costs nothing — a genuine
+/// runaway among its members is still caught by the per-process rules.
+pub const TEMPLATE_APP_CPU_OVERRIDES: &[(&str, f32)] = &[
+    // Terminal sessions: your own foreground work
+    ("login", 0.0),
+    ("sshd", 0.0),
+    ("tmux", 0.0),
+    ("screen", 0.0),
+    // VM / container hosts: guest workload is supposed to use cores
+    ("com.docker.backend", 0.0),
+    ("com.docker.virtualization", 0.0),
+    ("OrbStack Helper", 0.0),
+    ("qemu-system-aarch64", 0.0),
+    ("prl_vm_app", 0.0),
+    ("vmware-vmx", 0.0),
+    // Editors and browsers fan out across many helpers; a few cores
+    // during an index rebuild or a heavy page is normal
+    ("Xcode", 400.0),
+    ("idea", 400.0),
+    ("goland", 400.0),
+    ("clion", 400.0),
+    ("zed", 400.0),
+    ("Cursor", 400.0),
+    ("Code", 400.0),
+    ("Google Chrome", 400.0),
+    ("Microsoft Edge", 400.0),
+    ("Brave Browser", 400.0),
+    ("Arc", 400.0),
+    ("firefox", 400.0),
+    ("Safari", 400.0),
+];
+
+/// Builtin whole-app memory template (percent of total), keyed on the
+/// tree root name. Browsers and IDEs legitimately hold a large share of
+/// a machine's RAM; the system memory-pressure rule is what catches
+/// "actually too much", so these only need to not cry wolf.
+pub const TEMPLATE_APP_MEM_OVERRIDES: &[(&str, f64)] = &[
+    // Your own terminal work — the pressure rule covers real trouble
+    ("login", 0.0),
+    ("sshd", 0.0),
+    ("tmux", 0.0),
+    ("screen", 0.0),
+    ("com.docker.backend", 0.0),
+    ("com.docker.virtualization", 0.0),
+    ("OrbStack Helper", 0.0),
+    ("qemu-system-aarch64", 0.0),
+    ("prl_vm_app", 0.0),
+    ("vmware-vmx", 0.0),
+    // A browser with many tabs routinely passes 40% of RAM
+    ("Google Chrome", 60.0),
+    ("Microsoft Edge", 60.0),
+    ("Brave Browser", 60.0),
+    ("Arc", 60.0),
+    ("firefox", 60.0),
+    ("Safari", 60.0),
+    ("Xcode", 60.0),
+];
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum AlertKind {
     Cpu,
@@ -314,6 +381,11 @@ impl ActiveThresholds {
         for (name, pct) in &file.app_cpu_overrides {
             app_cpu = app_cpu.with_override(name.clone(), (*pct > 0.0).then_some(*pct));
         }
+        if file.template.unwrap_or(true) {
+            for (name, pct) in TEMPLATE_APP_CPU_OVERRIDES {
+                app_cpu = app_cpu.with_override((*name).to_string(), (*pct > 0.0).then_some(*pct));
+            }
+        }
         let app_mem_default = match file.app_mem {
             Some(p) if p > 0.0 => Some(p / 100.0),
             Some(_) => None,
@@ -323,6 +395,12 @@ impl ActiveThresholds {
         for (name, pct) in &file.app_mem_overrides {
             app_memory =
                 app_memory.with_override(name.clone(), (*pct > 0.0).then_some(*pct / 100.0));
+        }
+        if file.template.unwrap_or(true) {
+            for (name, pct) in TEMPLATE_APP_MEM_OVERRIDES {
+                app_memory = app_memory
+                    .with_override((*name).to_string(), (*pct > 0.0).then_some(*pct / 100.0));
+            }
         }
 
         Self {
@@ -1576,6 +1654,42 @@ mod tests {
         assert_eq!(merged.cpu.for_process("mds_stores"), Some(50.0));
         // Untouched template entries stay active
         assert_eq!(merged.cpu.for_process("gopls"), Some(100.0));
+    }
+
+    #[test]
+    fn app_template_silences_terminal_sessions_and_raises_browsers() {
+        let merged = ActiveThresholds::from_config(&AlertsConfig::default());
+        // Terminal sessions group under a `login` root on macOS: a build
+        // there is your own work, and its members still have per-process
+        // rules, so the whole-app rules stay out of it
+        assert_eq!(merged.app_cpu.for_process("login"), None);
+        assert_eq!(merged.app_memory.for_process("login"), None);
+        // Browsers get a raised bar, not an exemption
+        assert_eq!(merged.app_cpu.for_process("Google Chrome"), Some(400.0));
+        assert_eq!(merged.app_memory.for_process("Google Chrome"), Some(0.60));
+        // Anything untemplated falls through to the base values
+        assert_eq!(merged.app_cpu.for_process("some-app"), Some(200.0));
+        assert_eq!(merged.app_memory.for_process("some-app"), Some(0.40));
+    }
+
+    #[test]
+    fn user_app_overrides_shadow_the_app_template() {
+        let mut file = AlertsConfig::default();
+        file.app_cpu_overrides.insert("login".into(), 800.0);
+        file.app_mem_overrides.insert("Google Chrome".into(), 30.0);
+        let merged = ActiveThresholds::from_config(&file);
+        assert_eq!(merged.app_cpu.for_process("login"), Some(800.0));
+        assert_eq!(merged.app_memory.for_process("Google Chrome"), Some(0.30));
+
+        // ... and the template layer goes away with the same switch that
+        // controls the per-process one
+        let off = AlertsConfig {
+            template: Some(false),
+            ..Default::default()
+        };
+        let merged = ActiveThresholds::from_config(&off);
+        assert_eq!(merged.app_cpu.for_process("login"), Some(200.0));
+        assert_eq!(merged.app_memory.for_process("Google Chrome"), Some(0.40));
     }
 
     #[test]

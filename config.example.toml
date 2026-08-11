@@ -252,9 +252,23 @@ template = true
 # "/Volumes/Backup" = 0.0
 
 # Per-application overrides for the whole-app rules, keyed by the group's
-# root process name (0 disables that app)
+# ROOT process name — not the process name. Check `zstats --json` first:
+# on macOS every terminal session's descendants group under a `login`
+# root, so "the cargo build I started" is a `login` group, not `ghostty`.
+#
+# The builtin app template (same `template` switch as above) already
+# covers the two cases that matter, reproduced here for reference:
+# terminal sessions and VM hosts are silenced (0 — you started that work,
+# and its members still have per-process rules), browsers and IDEs get a
+# raised bar rather than an exemption.
 [alerts.app_cpu_overrides]
+# login = 0.0
+# tmux = 0.0
+# "com.docker.backend" = 0.0
 # "Google Chrome" = 400.0
+# zed = 400.0
 
 [alerts.app_mem_overrides]
+# login = 0.0
 # "Google Chrome" = 60.0
+# Xcode = 60.0

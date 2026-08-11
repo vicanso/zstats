@@ -43,6 +43,10 @@ const DISK_GAUGE_WIDTH: usize = 14;
 /// and stops
 const NET_ROWS: usize = 6;
 
+/// Temperature verdict cutoffs, as a fraction of 100°C
+const TEMP_WARM: f64 = 0.65;
+const TEMP_HOT: f64 = 0.85;
+
 /// Rolling window for per-process averages in watch mode
 const AVG_WINDOW: Duration = Duration::from_secs(60);
 
@@ -277,10 +281,14 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
     if let Some(compressed) = s.memory.compressed_bytes {
         let _ = write!(mem_extra, "  ·  zip {}", human_bytes(compressed));
     }
+    // Always show the verdict, not just the bad ones: a high used% is
+    // normal on macOS (it caches aggressively), so "80% used" without
+    // "pressure normal" next to it reads as a problem when it is not
     match s.memory.pressure_level {
-        Some(2) => mem_extra.push_str(&theme.paint(YELLOW, "  ·  pressure: warning")),
+        Some(1) => mem_extra.push_str("  ·  pressure normal"),
+        Some(2) => mem_extra.push_str(&theme.paint(YELLOW, "  ·  pressure warning")),
         Some(level) if level > 2 => {
-            mem_extra.push_str(&theme.paint(RED_BOLD, "  ·  pressure: critical"));
+            mem_extra.push_str(&theme.paint(RED_BOLD, "  ·  pressure critical"));
         }
         _ => {}
     }
@@ -330,9 +338,19 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
         // Low battery is the alarming direction, so the gauge colors are
         // inverted relative to a utilization bar
         let color = level_color(1.0 - fraction, 0.8, 0.9);
+        // "discharging" is library vocabulary; what the user wants to
+        // know is whether the machine is on wall power, and how long the
+        // current state has left
+        let (state, remaining) = match b.state.to_ascii_lowercase().as_str() {
+            "charging" => ("charging", b.time_to_full_secs.map(|s| (s, "to full"))),
+            "discharging" => ("on battery", b.time_to_empty_secs.map(|s| (s, "left"))),
+            "full" => ("full, on AC", None),
+            "empty" => ("empty", None),
+            _ => ("unknown state", None),
+        };
         let mut extra = String::new();
-        if let Some(secs) = b.time_to_empty_secs.or(b.time_to_full_secs) {
-            let _ = write!(extra, "  ·  {}", human_uptime(secs));
+        if let Some((secs, label)) = remaining {
+            let _ = write!(extra, "  ·  {} {label}", human_uptime(secs));
         }
         if let Some(w) = b.power_watts.filter(|w| *w > 0.1) {
             let _ = write!(extra, "  ·  {w:.1} W");
@@ -348,35 +366,41 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
             "BATT  {}  {:>5.1}%  {}{}",
             theme.paint(color, &gauge(fraction, GAUGE_WIDTH)),
             b.charge_percent,
-            b.state,
+            state,
             extra,
         );
     }
 
     if let Some(temps) = &s.temperatures {
-        if temps.is_empty() {
-            let _ = writeln!(out, "TEMP  (no sensors)");
-        } else {
-            // Show the hottest few; full list is in JSON
-            const SHOW: usize = 4;
-            let parts: Vec<String> = temps
-                .iter()
-                .take(SHOW)
-                .map(|t| {
-                    let color = level_color(f64::from(t.celsius) / 100.0, 0.65, 0.85);
-                    format!(
-                        "{} {}",
-                        theme.paint(color, &format!("{:.1}°C", t.celsius)),
-                        t.label
-                    )
-                })
-                .collect();
-            let more = if temps.len() > SHOW {
-                format!("  (+{} more)", temps.len() - SHOW)
-            } else {
-                String::new()
-            };
-            let _ = writeln!(out, "TEMP  {}{}", parts.join("  ·  "), more);
+        // The question a temperature line answers is "is this machine
+        // hot?", and raw firmware sensor names ("PMU tdie8") answer it
+        // for nobody. Lead with the hottest reading and a verdict; the
+        // sensor that produced it is demoted to a parenthetical, and the
+        // full list stays in the JSON output
+        match temps.first() {
+            None => {
+                let _ = writeln!(out, "TEMP  (no sensors)");
+            }
+            Some(hottest) => {
+                let fraction = f64::from(hottest.celsius) / 100.0;
+                let color = level_color(fraction, TEMP_WARM, TEMP_HOT);
+                let verdict = if fraction >= TEMP_HOT {
+                    "hot"
+                } else if fraction >= TEMP_WARM {
+                    "warm"
+                } else {
+                    "normal"
+                };
+                let _ = writeln!(
+                    out,
+                    "TEMP  {}  {:>5.1}°C  {}  ·  {} sensors (max {})",
+                    theme.paint(color, &gauge(fraction, GAUGE_WIDTH)),
+                    hottest.celsius,
+                    theme.paint(color, verdict),
+                    temps.len(),
+                    hottest.label,
+                );
+            }
         }
     }
 
@@ -883,6 +907,7 @@ TOP   NAME            MEM
             virtual_memory_bytes: mem,
             run_time_secs: 0,
             parent_pid: None,
+            user_id: None,
             status: "Runnable".into(),
             read_bytes_per_sec: None,
             write_bytes_per_sec: None,

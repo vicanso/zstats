@@ -111,6 +111,14 @@ cpu = 30.0
 # reaches this percentage (no runaway tier — transient legitimate spikes
 # must not alert). 0 disables
 mem = 25.0
+# Whole-application rules, evaluated over process TREES (see
+# collect_process_groups): a browser split across 37 helpers can hold
+# gigabytes and several cores while no single member trips the
+# per-process rules above. Chronic only (5-minute average) — a runaway
+# member is already the per-process runaway tier's job. 0 disables
+app_cpu = 200.0
+app_mem = 40.0
+
 # Notification when a volume's used capacity crosses this percentage.
 # Crossing-based, not windowed: fires once, stays silent while the disk
 # remains full, re-arms after dropping 5 points below. 0 disables
@@ -242,3 +250,11 @@ template = true
 # Machine) run near-full by design — silence them with 0
 [alerts.disk_overrides]
 # "/Volumes/Backup" = 0.0
+
+# Per-application overrides for the whole-app rules, keyed by the group's
+# root process name (0 disables that app)
+[alerts.app_cpu_overrides]
+# "Google Chrome" = 400.0
+
+[alerts.app_mem_overrides]
+# "Google Chrome" = 60.0

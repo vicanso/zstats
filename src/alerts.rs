@@ -76,6 +76,11 @@ const RECORD_EVERY: Duration = Duration::from_secs(60);
 const DEFAULT_CPU_PERCENT: f32 = 30.0;
 const DEFAULT_MEMORY_FRACTION: f64 = 0.25;
 const DEFAULT_DISK_FRACTION: f32 = 0.90;
+/// Whole-app defaults sit well above the per-process ones: an app is
+/// allowed to be bigger than any one of its processes, and the point of
+/// this rule is the total that per-process thresholds cannot see
+const DEFAULT_APP_CPU_PERCENT: f32 = 200.0;
+const DEFAULT_APP_MEMORY_FRACTION: f64 = 0.40;
 const DEFAULT_COOLDOWN: Duration = Duration::from_secs(600);
 
 /// The disk rule is crossing-based, not windowed (capacity is a slow
@@ -173,6 +178,9 @@ pub const TEMPLATE_CPU_OVERRIDES: &[(&str, f32)] = &[
 pub enum AlertKind {
     Cpu,
     Memory,
+    /// Whole-application totals, keyed by the group's root pid
+    AppCpu,
+    AppMemory,
 }
 
 /// An alert that should reach the user now
@@ -244,6 +252,9 @@ pub struct ActiveThresholds {
     /// Kernel memory-pressure level at which to start alerting (2 =
     /// warning, 4 = critical); None disables the rule
     pub pressure: Option<u32>,
+    /// Whole-application totals, override key = the group's root name
+    pub app_cpu: Thresholds<f32>,
+    pub app_memory: Thresholds<f64>,
     /// Per (process, rule) re-alert cooldown while a condition persists
     pub cooldown: Duration,
 }
@@ -294,10 +305,32 @@ impl ActiveThresholds {
             disk = disk.with_override(mount.clone(), (*pct > 0.0).then_some(*pct / 100.0));
         }
 
+        let app_cpu_default = match file.app_cpu {
+            Some(p) if p > 0.0 => Some(p),
+            Some(_) => None,
+            None => Some(DEFAULT_APP_CPU_PERCENT),
+        };
+        let mut app_cpu = Thresholds::new(app_cpu_default);
+        for (name, pct) in &file.app_cpu_overrides {
+            app_cpu = app_cpu.with_override(name.clone(), (*pct > 0.0).then_some(*pct));
+        }
+        let app_mem_default = match file.app_mem {
+            Some(p) if p > 0.0 => Some(p / 100.0),
+            Some(_) => None,
+            None => Some(DEFAULT_APP_MEMORY_FRACTION),
+        };
+        let mut app_memory = Thresholds::new(app_mem_default);
+        for (name, pct) in &file.app_mem_overrides {
+            app_memory =
+                app_memory.with_override(name.clone(), (*pct > 0.0).then_some(*pct / 100.0));
+        }
+
         Self {
             cpu,
             memory,
             disk,
+            app_cpu,
+            app_memory,
             pressure: file
                 .pressure
                 .unwrap_or(crate::settings::PressureAlert::Warning)
@@ -310,6 +343,8 @@ impl ActiveThresholds {
         self.cpu.any_enabled()
             || self.memory.any_enabled()
             || self.disk.any_enabled()
+            || self.app_cpu.any_enabled()
+            || self.app_memory.any_enabled()
             || self.pressure.is_some()
     }
 }
@@ -324,6 +359,8 @@ pub struct AlertEngine {
     fast: Option<ProcessWindows>,
     /// 5-minute windows: chronic rules
     slow: Option<ProcessWindows>,
+    /// 5-minute windows over whole-application totals, keyed by root pid
+    apps: Option<ProcessWindows>,
     last_alert: HashMap<(u32, AlertKind), Instant>,
     /// Mounts that already fired the disk alert and have not yet dropped
     /// [`DISK_REARM_MARGIN`] below their threshold
@@ -366,6 +403,14 @@ impl AlertEngine {
         active: &ActiveThresholds,
     ) -> Evaluation {
         let mut evaluation = Evaluation::default();
+        let total_memory = snapshot.memory.total_bytes;
+        let mem_share = |avg_bytes: f64| {
+            if total_memory > 0 {
+                avg_bytes / total_memory as f64
+            } else {
+                0.0
+            }
+        };
 
         // Disk capacity runs first: it does not depend on process data.
         // Crossing detection with hysteresis — see DISK_REARM_MARGIN
@@ -440,17 +485,96 @@ impl AlertEngine {
             }
         }
 
+        // Whole-application totals: a browser split across 37 helpers can
+        // hold gigabytes and cores while every member stays under the
+        // per-process bar. Chronic only — a runaway member is already the
+        // per-process acute rule's job, and adding an acute tier here
+        // would just notify twice about one event
+        if let Some(groups) = snapshot.process_groups.as_deref()
+            && (active.app_cpu.any_enabled() || active.app_memory.any_enabled())
+        {
+            // ProcessWindows keys on pid; a group's root pid plays that
+            // role, so the same rolling-average machinery applies
+            let as_processes: Vec<crate::snapshot::ProcessSnapshot> = groups
+                .iter()
+                .map(|g| crate::snapshot::ProcessSnapshot {
+                    pid: g.root_pid,
+                    name: g.name.clone(),
+                    cmd: String::new(),
+                    cpu_usage_percent: g.cpu_usage_percent,
+                    memory_bytes: g.memory_bytes,
+                    virtual_memory_bytes: 0,
+                    run_time_secs: 0,
+                    parent_pid: None,
+                    user_id: None,
+                    status: String::new(),
+                    read_bytes_per_sec: None,
+                    write_bytes_per_sec: None,
+                })
+                .collect();
+            let stats = self
+                .apps
+                .get_or_insert_with(|| ProcessWindows::new(SLOW_WINDOW))
+                .record(now, &as_processes);
+            self.last_alert.retain(|(pid, kind), _| {
+                !matches!(kind, AlertKind::AppCpu | AlertKind::AppMemory) || stats.contains_key(pid)
+            });
+
+            for g in groups {
+                let Some(stat) = stats.get(&g.root_pid) else {
+                    continue;
+                };
+                if stat.span < SLOW_MIN_SPAN {
+                    continue;
+                }
+                if let Some(threshold) = active.app_cpu.for_process(&g.name)
+                    && stat.cpu_avg >= f64::from(threshold)
+                    && cooldown_elapsed(
+                        &mut self.last_alert,
+                        (g.root_pid, AlertKind::AppCpu),
+                        now,
+                        active.cooldown,
+                    )
+                {
+                    evaluation.events.push(AlertEvent {
+                        message: format!(
+                            "{} ({} processes) averaged {:.0}% CPU over the last {} minutes \
+                             (threshold {threshold:.0}%)",
+                            g.name,
+                            g.process_count,
+                            stat.cpu_avg,
+                            SLOW_WINDOW.as_secs() / 60,
+                        ),
+                    });
+                }
+                if let Some(fraction) = active.app_memory.for_process(&g.name)
+                    && total_memory > 0
+                    && mem_share(stat.memory_avg_bytes) >= fraction
+                    && cooldown_elapsed(
+                        &mut self.last_alert,
+                        (g.root_pid, AlertKind::AppMemory),
+                        now,
+                        active.cooldown,
+                    )
+                {
+                    evaluation.events.push(AlertEvent {
+                        message: format!(
+                            "{} ({} processes) averaged {:.1} GiB — {:.0}% of total memory — \
+                             over the last {} minutes",
+                            g.name,
+                            g.process_count,
+                            stat.memory_avg_bytes / f64::from(1 << 30),
+                            mem_share(stat.memory_avg_bytes) * 100.0,
+                            SLOW_WINDOW.as_secs() / 60,
+                        ),
+                    });
+                }
+            }
+        }
+
         let Some(processes) = snapshot.processes.as_deref() else {
             tracing::debug!("alert evaluation skipped: snapshot has no processes");
             return evaluation;
-        };
-        let total_memory = snapshot.memory.total_bytes;
-        let mem_share = |avg_bytes: f64| {
-            if total_memory > 0 {
-                avg_bytes / total_memory as f64
-            } else {
-                0.0
-            }
         };
 
         // Once a minute, qualifying processes become metric records
@@ -470,9 +594,13 @@ impl AlertEngine {
             .get_or_insert_with(|| ProcessWindows::new(SLOW_WINDOW))
             .record(now, processes);
 
-        // Forget cooldowns of processes that disappeared
-        self.last_alert
-            .retain(|(pid, _), _| fast_stats.contains_key(pid));
+        // Forget cooldowns of processes that disappeared — but only the
+        // per-process ones: an app group is keyed by its ROOT pid, which
+        // need not appear in the top-N process list at all, and wiping
+        // those entries here would re-fire every group alert every round
+        self.last_alert.retain(|(pid, kind), _| {
+            matches!(kind, AlertKind::AppCpu | AlertKind::AppMemory) || fast_stats.contains_key(pid)
+        });
 
         for p in processes {
             let (Some(fast), Some(slow)) = (fast_stats.get(&p.pid), slow_stats.get(&p.pid)) else {
@@ -602,6 +730,7 @@ mod tests {
             virtual_memory_bytes: mem,
             run_time_secs: 0,
             parent_pid: None,
+            user_id: None,
             status: "Runnable".into(),
             read_bytes_per_sec: None,
             write_bytes_per_sec: None,
@@ -662,6 +791,8 @@ mod tests {
             cpu,
             memory,
             disk: Thresholds::new(None),
+            app_cpu: Thresholds::new(None),
+            app_memory: Thresholds::new(None),
             pressure: None,
             cooldown,
         }
@@ -1059,6 +1190,8 @@ mod tests {
             cpu: Thresholds::new(None),
             memory: Thresholds::new(None),
             disk: Thresholds::new(Some(0.90)),
+            app_cpu: Thresholds::new(None),
+            app_memory: Thresholds::new(None),
             pressure: None,
             cooldown: Duration::from_secs(600),
         };
@@ -1093,6 +1226,8 @@ mod tests {
             cpu: Thresholds::new(None),
             memory: Thresholds::new(None),
             disk: disk_rule,
+            app_cpu: Thresholds::new(None),
+            app_memory: Thresholds::new(None),
             pressure: None,
             cooldown: Duration::from_secs(600),
         };
@@ -1108,12 +1243,127 @@ mod tests {
         assert!(events[0].message.contains("disk / is 95% full"));
     }
 
+    use crate::snapshot::ProcessGroupSnapshot;
+
+    fn group(root_pid: u32, name: &str, count: u32, cpu: f32, mem: u64) -> ProcessGroupSnapshot {
+        ProcessGroupSnapshot {
+            root_pid,
+            name: name.into(),
+            process_count: count,
+            cpu_usage_percent: cpu,
+            memory_bytes: mem,
+            read_bytes_per_sec: None,
+            write_bytes_per_sec: None,
+        }
+    }
+
+    fn app_thresholds(cpu: Thresholds<f32>, memory: Thresholds<f64>) -> ActiveThresholds {
+        ActiveThresholds {
+            cpu: Thresholds::new(None),
+            memory: Thresholds::new(None),
+            disk: Thresholds::new(None),
+            app_cpu: cpu,
+            app_memory: memory,
+            pressure: None,
+            cooldown: Duration::from_secs(600),
+        }
+    }
+
+    #[test]
+    fn app_group_alerts_on_the_total_no_member_reaches() {
+        // Chrome-shaped: 12 helpers at 20% each is 240% for the app, and
+        // not one of them would trip a per-process rule
+        let active = app_thresholds(Thresholds::new(Some(200.0)), Thresholds::new(None));
+        let mut engine = AlertEngine::new();
+        let base = Instant::now();
+        let mut messages = Vec::new();
+
+        for i in 0..160u64 {
+            let mut s = snapshot(Vec::new(), 100);
+            s.process_groups = Some(std::sync::Arc::new(vec![group(
+                10,
+                "Google Chrome",
+                12,
+                240.0,
+                0,
+            )]));
+            messages.extend(
+                engine
+                    .evaluate(base + Duration::from_secs(2 * i), &s, &active)
+                    .events
+                    .into_iter()
+                    .map(|e| e.message),
+            );
+        }
+        assert_eq!(messages.len(), 1, "chronic app rule fires once");
+        assert!(
+            messages[0].contains("Google Chrome (12 processes) averaged 240% CPU"),
+            "got: {}",
+            messages[0]
+        );
+    }
+
+    #[test]
+    fn app_group_rules_respect_overrides_and_window() {
+        let cpu = Thresholds::new(Some(200.0)).with_override("Google Chrome".into(), None);
+        let active = app_thresholds(cpu, Thresholds::new(Some(0.40)));
+        let mut engine = AlertEngine::new();
+        let base = Instant::now();
+        let mut messages = Vec::new();
+
+        for i in 0..160u64 {
+            let mut s = snapshot(Vec::new(), 100);
+            s.process_groups = Some(std::sync::Arc::new(vec![
+                // CPU rule disabled for this app; memory rule still applies
+                group(10, "Google Chrome", 12, 240.0, 50),
+                // Under both thresholds
+                group(20, "Finder", 1, 10.0, 5),
+            ]));
+            let events = engine
+                .evaluate(base + Duration::from_secs(2 * i), &s, &active)
+                .events;
+            if 2 * i < 250 {
+                assert!(
+                    events.is_empty(),
+                    "not before the slow window (t={}s)",
+                    2 * i
+                );
+            }
+            messages.extend(events.into_iter().map(|e| e.message));
+        }
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0].contains("50% of total memory"),
+            "got: {}",
+            messages[0]
+        );
+    }
+
+    #[test]
+    fn app_group_rules_are_skipped_without_group_data() {
+        let active = app_thresholds(Thresholds::new(Some(1.0)), Thresholds::new(Some(0.01)));
+        let mut engine = AlertEngine::new();
+        let base = Instant::now();
+        for i in 0..160u64 {
+            // process_groups is None (collection disabled)
+            let s = snapshot(Vec::new(), 100);
+            assert!(
+                engine
+                    .evaluate(base + Duration::from_secs(2 * i), &s, &active)
+                    .events
+                    .is_empty()
+            );
+        }
+    }
+
     #[test]
     fn pressure_alerts_on_warning_escalates_to_critical_then_rearms() {
         let active = ActiveThresholds {
             cpu: Thresholds::new(None),
             memory: Thresholds::new(None),
             disk: Thresholds::new(None),
+            app_cpu: Thresholds::new(None),
+            app_memory: Thresholds::new(None),
             pressure: Some(2),
             cooldown: Duration::from_secs(600),
         };
@@ -1166,6 +1416,8 @@ mod tests {
             cpu: Thresholds::new(None),
             memory: Thresholds::new(None),
             disk: Thresholds::new(None),
+            app_cpu: Thresholds::new(None),
+            app_memory: Thresholds::new(None),
             pressure: Some(2),
             cooldown: Duration::from_secs(600),
         };
@@ -1194,6 +1446,8 @@ mod tests {
             cpu: Thresholds::new(None),
             memory: Thresholds::new(None),
             disk: Thresholds::new(None),
+            app_cpu: Thresholds::new(None),
+            app_memory: Thresholds::new(None),
             pressure: Some(4),
             cooldown: Duration::from_secs(600),
         };
@@ -1218,6 +1472,8 @@ mod tests {
             cpu: Thresholds::new(None),
             memory: Thresholds::new(None),
             disk: Thresholds::new(None),
+            app_cpu: Thresholds::new(None),
+            app_memory: Thresholds::new(None),
             pressure: None,
             cooldown: Duration::from_secs(600),
         };

@@ -77,6 +77,10 @@ Config keys for -add (also accepted as key=value). Durations take 500ms /
                               or 1-min avg >= 3x pct (runaway); name=pct sets
                               a per-process override, e.g. alert-cpu ghostty=100
   alert-mem <pct|name=pct>    [alerts] 5-min avg memory-share rule, same forms
+  alert-app-cpu <pct|name=pct>  [alerts] whole-app CPU rule over a process
+                              tree (default 200; catches the browser whose
+                              helpers each stay under the per-process bar)
+  alert-app-mem <pct|name=pct>  [alerts] whole-app memory-share rule (40)
   alert-disk <pct|mount=pct>  [alerts] volume used-capacity crossing alert
                               (default 90; re-arms 5 pts below; 0 disables)
   alert-pressure <level>      [alerts] kernel memory-pressure alert, macOS:

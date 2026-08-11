@@ -116,6 +116,7 @@ mod tests {
             virtual_memory_bytes: mem,
             run_time_secs: 0,
             parent_pid: None,
+            user_id: None,
             status: "Runnable".into(),
             read_bytes_per_sec: None,
             write_bytes_per_sec: None,

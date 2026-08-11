@@ -209,10 +209,13 @@ impl LocalCollector {
         // NOT fetch cmd (and wastes time on disk_usage/exe we don't
         // always need). cmd is immutable per process, so OnlyIfNotSet
         // fetches it exactly once per process.
+        // cmd and user are immutable per process, so OnlyIfNotSet fetches
+        // each exactly once per process
         let mut kind = ProcessRefreshKind::nothing()
             .with_memory()
             .with_cpu()
-            .with_cmd(UpdateKind::OnlyIfNotSet);
+            .with_cmd(UpdateKind::OnlyIfNotSet)
+            .with_user(UpdateKind::OnlyIfNotSet);
         if self.config.collect_process_disk_io {
             kind = kind.with_disk_usage();
         }
@@ -514,6 +517,7 @@ impl LocalCollector {
                 virtual_memory_bytes: p.virtual_memory(),
                 run_time_secs: p.run_time(),
                 parent_pid: p.parent().map(|pp| pp.as_u32()),
+                user_id: p.user_id().map(|uid| uid.to_string()),
                 status: p.status().to_string(),
                 read_bytes_per_sec,
                 write_bytes_per_sec,
@@ -539,6 +543,7 @@ impl LocalCollector {
     fn collect_process_groups(
         &mut self,
         refreshed: bool,
+        process_elapsed: Option<Duration>,
     ) -> Option<Arc<Vec<ProcessGroupSnapshot>>> {
         if !(self.config.collect_processes && self.config.collect_process_groups) {
             return None;
@@ -549,12 +554,21 @@ impl LocalCollector {
 
         let mut table = HashMap::with_capacity(self.system.processes().len());
         for p in self.system.processes().values() {
+            let pid = p.pid().as_u32();
+            // Per-process IO rates were computed for the selected top-N
+            // only; the full table diffs its own counters here so a group
+            // total covers every member, not just the ranked ones
+            let io = self.config.collect_process_disk_io.then(|| {
+                let usage = p.disk_usage();
+                (usage.read_bytes, usage.written_bytes)
+            });
             table.insert(
-                p.pid().as_u32(),
+                pid,
                 ProcNode {
                     parent: p.parent().map(|pp| pp.as_u32()),
                     cpu: p.cpu_usage(),
                     mem: p.memory(),
+                    io,
                 },
             );
         }
@@ -565,12 +579,22 @@ impl LocalCollector {
                 .into_iter()
                 .filter_map(|g| {
                     let root = self.system.process(Pid::from(g.root_pid as usize))?;
+                    // Bytes since the previous refresh become a rate only
+                    // once there is an interval to divide by
+                    let rate = |bytes: Option<u64>| match (bytes, process_elapsed) {
+                        (Some(b), Some(elapsed)) if !elapsed.is_zero() => {
+                            Some((b as f64 / elapsed.as_secs_f64()) as u64)
+                        }
+                        _ => None,
+                    };
                     Some(ProcessGroupSnapshot {
                         root_pid: g.root_pid,
                         name: root.name().to_string_lossy().to_string(),
                         process_count: g.process_count,
                         cpu_usage_percent: g.cpu,
                         memory_bytes: g.mem,
+                        read_bytes_per_sec: rate(g.read_bytes),
+                        write_bytes_per_sec: rate(g.written_bytes),
                     })
                 })
                 .collect();
@@ -749,6 +773,9 @@ struct ProcNode {
     parent: Option<u32>,
     cpu: f32,
     mem: u64,
+    /// Bytes read/written since the previous process refresh; None when
+    /// process disk IO collection is off
+    io: Option<(u64, u64)>,
 }
 
 /// Aggregated tree totals before name materialization
@@ -758,6 +785,10 @@ struct GroupTotals {
     process_count: u32,
     cpu: f32,
     mem: u64,
+    /// Summed bytes since the previous refresh (turned into rates by the
+    /// caller, which knows the elapsed time)
+    read_bytes: Option<u64>,
+    written_bytes: Option<u64>,
 }
 
 /// Pid of init / launchd — the boundary that defines application roots
@@ -805,10 +836,16 @@ fn aggregate_process_groups(table: &HashMap<u32, ProcNode>, max: usize) -> Vec<G
             process_count: 0,
             cpu: 0.0,
             mem: 0,
+            read_bytes: None,
+            written_bytes: None,
         });
         entry.process_count += 1;
         entry.cpu += node.cpu;
         entry.mem = entry.mem.saturating_add(node.mem);
+        if let Some((read, written)) = node.io {
+            entry.read_bytes = Some(entry.read_bytes.unwrap_or(0).saturating_add(read));
+            entry.written_bytes = Some(entry.written_bytes.unwrap_or(0).saturating_add(written));
+        }
     }
 
     let mut groups: Vec<GroupTotals> = totals.into_values().collect();
@@ -960,7 +997,7 @@ impl Collector for LocalCollector {
             disks: self.collect_disks(),
             networks: self.collect_networks(),
             processes: self.collect_processes(processes_due, process_elapsed),
-            process_groups: self.collect_process_groups(processes_due),
+            process_groups: self.collect_process_groups(processes_due, process_elapsed),
             total_processes: self.collect_total_processes(),
             battery: self.collect_battery(),
             load: self.collect_load(),
@@ -983,7 +1020,12 @@ mod tests {
     }
 
     fn node(parent: Option<u32>, cpu: f32, mem: u64) -> ProcNode {
-        ProcNode { parent, cpu, mem }
+        ProcNode {
+            parent,
+            cpu,
+            mem,
+            io: None,
+        }
     }
 
     #[test]

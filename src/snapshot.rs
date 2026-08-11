@@ -222,6 +222,11 @@ pub struct ProcessSnapshot {
     #[serde(default)]
     pub run_time_secs: u64,
     pub parent_pid: Option<u32>,
+    /// Owning user identifier, as text because platforms disagree on the
+    /// type: a numeric uid on unix ("501"), a security identifier on
+    /// Windows ("S-1-5-18"). None when permissions hide it
+    #[serde(default)]
+    pub user_id: Option<String>,
     pub status: String,
     /// Per-process disk IO rates; None when process disk IO collection
     /// is disabled or on the first sample for that pid
@@ -252,6 +257,12 @@ pub struct ProcessGroupSnapshot {
     pub cpu_usage_percent: f32,
     /// Sum of member resident memory
     pub memory_bytes: u64,
+    /// Sum of member disk read/write rates; None unless
+    /// `collect_process_disk_io` is enabled
+    #[serde(default)]
+    pub read_bytes_per_sec: Option<u64>,
+    #[serde(default)]
+    pub write_bytes_per_sec: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

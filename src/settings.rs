@@ -169,6 +169,13 @@ pub struct AlertsConfig {
     /// absent = warning. The levels are the kernel's own — the only
     /// choice is which one is worth interrupting for
     pub pressure: Option<PressureAlert>,
+    /// Whole-application CPU threshold in single-core percent; absent =
+    /// builtin default (200, i.e. two cores). Catches the multi-process
+    /// app whose members each stay under the per-process bar. 0 disables
+    pub app_cpu: Option<f32>,
+    /// Whole-application memory threshold as a percentage of total;
+    /// absent = builtin default (40). 0 disables
+    pub app_mem: Option<f64>,
     /// Per-process CPU overrides, keyed by process name
     pub cpu_overrides: BTreeMap<String, f32>,
     /// Per-process memory overrides, keyed by process name
@@ -176,6 +183,10 @@ pub struct AlertsConfig {
     /// Per-volume disk overrides, keyed by mount point (backup volumes
     /// run full by design — disable them with 0)
     pub disk_overrides: BTreeMap<String, f32>,
+    /// Per-application overrides for the whole-app rules, keyed by the
+    /// group's root process name
+    pub app_cpu_overrides: BTreeMap<String, f32>,
+    pub app_mem_overrides: BTreeMap<String, f64>,
     /// Apply the builtin per-app override template
     /// (`zstats::alerts::TEMPLATE_CPU_OVERRIDES`) beneath the user's own
     /// overrides; absent = true. Set false for a pure user config
@@ -190,7 +201,8 @@ cpu-freq-interval, battery-interval, process-boost, max-processes, \
 collect-processes, collect-disks, collect-networks, collect-temperatures, \
 collect-battery, process-disk-io, \
 process-groups, dedupe-disks, per-core-cpu, alert-cpu, alert-mem, \
-alert-disk, alert-pressure, alert-cooldown, alert-template";
+alert-app-cpu, alert-app-mem, alert-disk, alert-pressure, alert-cooldown, \
+alert-template";
 
 fn parse<T: std::str::FromStr>(key: &str, value: &str) -> Result<T, String> {
     value
@@ -262,6 +274,33 @@ pub fn apply_add(config: &mut FileConfig, key: &str, value: &str) -> Result<Stri
         "dedupe-disks" => collector_mut(config).dedupe_disks = parse(key, value)?,
         "per-core-cpu" => collector_mut(config).per_core_cpu = parse(key, value)?,
         // [alerts]
+        "alert-app-cpu" | "alert-app-mem" => {
+            if let Some((name, pct)) = value.split_once('=') {
+                let name = name.trim();
+                if name.is_empty() {
+                    return Err(format!("invalid value for {key}: {value} (empty name)"));
+                }
+                let pct: f64 = parse(key, pct)?;
+                if key == "alert-app-cpu" {
+                    config
+                        .alerts
+                        .app_cpu_overrides
+                        .insert(name.to_string(), pct as f32);
+                } else {
+                    config
+                        .alerts
+                        .app_mem_overrides
+                        .insert(name.to_string(), pct);
+                }
+                return Ok(format!("{key} override: {name} = {pct}% (0 disables)"));
+            }
+            let pct: f64 = parse(key, value)?;
+            if key == "alert-app-cpu" {
+                config.alerts.app_cpu = Some(pct as f32);
+            } else {
+                config.alerts.app_mem = Some(pct);
+            }
+        }
         "alert-cpu" | "alert-mem" => {
             if let Some((name, pct)) = value.split_once('=') {
                 let name = name.trim();
@@ -323,6 +362,8 @@ pub fn apply_remove(
             "alert-cpu" => config.alerts.cpu_overrides.remove(name).is_some(),
             "alert-mem" => config.alerts.mem_overrides.remove(name).is_some(),
             "alert-disk" => config.alerts.disk_overrides.remove(name).is_some(),
+            "alert-app-cpu" => config.alerts.app_cpu_overrides.remove(name).is_some(),
+            "alert-app-mem" => config.alerts.app_mem_overrides.remove(name).is_some(),
             other => return Err(format!("{other} has no per-name overrides")),
         };
         return if removed {
@@ -382,6 +423,8 @@ pub fn apply_remove(
         "per-core-cpu" => collector_mut(config).per_core_cpu = defaults.per_core_cpu,
         "alert-cpu" => config.alerts.cpu = None,
         "alert-mem" => config.alerts.mem = None,
+        "alert-app-cpu" => config.alerts.app_cpu = None,
+        "alert-app-mem" => config.alerts.app_mem = None,
         "alert-disk" => config.alerts.disk = None,
         "alert-cooldown" => config.alerts.cooldown = None,
         "alert-pressure" => config.alerts.pressure = None,

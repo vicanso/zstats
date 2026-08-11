@@ -6,6 +6,19 @@ cost tunable down to tray-app levels.
 
 ## Install
 
+Prebuilt binaries (macOS arm64/x86_64, static-musl Linux arm64/x86_64):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/vicanso/zstats/main/install.sh | sh
+```
+
+The script picks the asset for your platform from the latest release,
+verifies its published SHA-256, and installs to `/usr/local/bin`. Override
+with `ZSTATS_INSTALL_DIR=~/.local/bin` or pin a release with
+`ZSTATS_VERSION=v0.1.0`.
+
+### From source
+
 Requires Rust **1.95+** (MSRV; driven by sysinfo 0.39).
 
 ```bash

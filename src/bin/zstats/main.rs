@@ -54,6 +54,7 @@ Options:
   --foreground         serve: stay in the foreground
   --json / --pretty    Print one JSON snapshot instead of the live view
   -h, --help           Show this help
+  -V, --version        Print the version
 
 Config keys for -add (also accepted as key=value). Durations take 500ms /
 2s / 5m / 1h, or a bare integer meaning milliseconds; 0 = every collect:
@@ -132,6 +133,10 @@ fn parse_args(raw: Vec<String>) -> Result<CliArgs, String> {
             "--pretty" => args.format = OutputFormat::JsonPretty,
             "-h" | "--help" => {
                 print!("{USAGE}");
+                std::process::exit(0);
+            }
+            "-V" | "--version" => {
+                println!("zstats {}", env!("CARGO_PKG_VERSION"));
                 std::process::exit(0);
             }
             other => return Err(format!("unknown argument: {other} (use -h for help)")),

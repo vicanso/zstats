@@ -22,6 +22,15 @@
 //! is deliberately the frontend's business, as is persisting the returned
 //! [`MetricRecord`]s (see [`crate::records`]).
 //!
+//! [`AlertEvent`] is pure data — [`AlertSubject`] (whose pid / process
+//! tree / volume) plus [`AlertDetail`] (every number the rule looked at,
+//! in its own units). No wording is stored: [`AlertEvent::summary`]
+//! renders the default English line on demand, and a frontend with its
+//! own layout, language or gauges reads the fields instead.
+//! [`AlertEvent::kind`] and [`AlertEvent::severity`] are derived, so they
+//! cannot disagree with the data. Everything serialises, so events can
+//! cross an IPC boundary or be logged structurally.
+//!
 //! Only sustained behavior alerts, in two tiers sharing one threshold
 //! and one cooldown per (pid, kind):
 //! - acute/runaway: 1-minute average CPU ≥ [`ACUTE_FACTOR`] × the
@@ -43,6 +52,8 @@
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
+
+use serde::{Deserialize, Serialize};
 
 use crate::records::MetricRecord;
 use crate::rolling::ProcessWindows;
@@ -71,6 +82,10 @@ const SLOW_MIN_SPAN: Duration = Duration::from_secs(MIN_SPAN.as_secs() * SLOW_FA
 const ACUTE_FACTOR: f64 = 3.0;
 /// How often qualifying processes are reported as metric records
 const RECORD_EVERY: Duration = Duration::from_secs(60);
+/// A condition still true this long after it first notified earns one
+/// follow-up — insurance against the first notification being missed,
+/// well clear of the cooldown so it can never feel like nagging
+const PERSIST_REMINDER: Duration = Duration::from_secs(30 * 60);
 
 /// Builtin defaults when the config file leaves a value unset
 const DEFAULT_CPU_PERCENT: f32 = 30.0;
@@ -122,7 +137,11 @@ pub const TEMPLATE_CPU_OVERRIDES: &[(&str, f32)] = &[
     ("QQ Helper (Renderer)", 100.0),
     ("Lark Helper (Renderer)", 100.0),
     ("DingTalk", 100.0),
+    // 企业微信 runs as `wwmapp`, not under a "WeCom Helper" name —
+    // vendor process names are worth confirming with `zstats --json`
+    // rather than guessing from the app's title
     ("WeCom Helper (Renderer)", 100.0),
+    ("wwmapp", 100.0),
     // Editors / IDEs / language servers: re-index after every edit burst
     ("Cursor Helper (Renderer)", 100.0),
     ("Code Helper (Renderer)", 100.0),
@@ -130,7 +149,9 @@ pub const TEMPLATE_CPU_OVERRIDES: &[(&str, f32)] = &[
     ("rust-analyzer", 100.0),
     ("clangd", 100.0),
     ("sourcekit-lsp", 100.0),
+    ("Xcode", 200.0),
     ("SourceKitService", 200.0),
+    ("swift-frontend", 200.0),
     ("idea", 200.0),
     ("goland", 200.0),
     ("clion", 200.0),
@@ -159,9 +180,19 @@ pub const TEMPLATE_CPU_OVERRIDES: &[(&str, f32)] = &[
     ("HandBrake", 0.0),
     ("Final Cut Pro", 0.0),
     ("ollama", 0.0),
-    // macOS periodic system work: not actionable, history only
+    // macOS periodic system work: not actionable, history only.
+    // Spotlight is a family, not one process — `spotlightknowledged`
+    // alone was the single noisiest alerter on a real machine while
+    // only two of its siblings were listed
+    ("mds", 0.0),
     ("mds_stores", 0.0),
+    ("mdworker", 0.0),
     ("mdworker_shared", 0.0),
+    ("spotlightknowledged", 0.0),
+    ("corespotlightd", 0.0),
+    ("knowledgeconstructiond", 0.0),
+    ("suggestd", 0.0),
+    ("parsecd", 0.0),
     ("photoanalysisd", 0.0),
     ("mediaanalysisd", 0.0),
     ("backupd", 0.0),
@@ -241,19 +272,233 @@ pub const TEMPLATE_APP_MEM_OVERRIDES: &[(&str, f64)] = &[
     ("Xcode", 60.0),
 ];
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+/// Which rule produced an alert — the category a frontend groups,
+/// filters or picks an icon by.
+///
+/// `Cpu`/`Memory`/`AppCpu`/`AppMemory` double as [`EpisodeState`] keys;
+/// `Disk` and `Pressure` have their own state machines and appear only
+/// on events.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AlertKind {
     Cpu,
     Memory,
     /// Whole-application totals, keyed by the group's root pid
     AppCpu,
     AppMemory,
+    /// A volume crossing its used-capacity threshold
+    Disk,
+    /// The kernel's system memory-pressure verdict
+    Pressure,
 }
 
-/// An alert that should reach the user now
-#[derive(Debug)]
+/// How alarming this is — enough for a frontend to choose a color
+/// without parsing the message
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Severity {
+    /// Sustained behavior worth knowing about
+    Warning,
+    /// A runaway process, or the kernel calling memory pressure critical
+    Critical,
+}
+
+/// What the alert is about, so a frontend can link the notification back
+/// to a row in its process table, a volume, or the machine itself
+#[derive(Clone, PartialEq, Eq, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "type")]
+pub enum AlertSubject {
+    Process {
+        pid: u32,
+        name: String,
+    },
+    /// A whole process tree; `root_pid` matches
+    /// `ProcessGroupSnapshot::root_pid`
+    App {
+        root_pid: u32,
+        name: String,
+        process_count: u32,
+    },
+    Volume {
+        mount_point: String,
+    },
+    /// The machine as a whole (memory pressure)
+    System,
+}
+
+/// The measurement behind an alert — every number the rule looked at,
+/// in its own units, so a frontend can render a gauge, a chart or its
+/// own wording without parsing text back apart
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "measure")]
+pub enum AlertDetail {
+    Cpu {
+        /// Average over `window`, single-core percent (100 = one core)
+        avg_percent: f64,
+        /// The bar actually crossed — already multiplied by
+        /// [`ACUTE_FACTOR`] when `runaway`
+        threshold_percent: f64,
+        /// The averaging window this came from
+        window: Duration,
+        /// The fast tier: several times the configured threshold
+        runaway: bool,
+    },
+    Memory {
+        avg_bytes: u64,
+        share_percent: f64,
+        threshold_percent: f64,
+        window: Duration,
+    },
+    Disk {
+        used_percent: f64,
+        threshold_percent: f64,
+        available_bytes: u64,
+        total_bytes: u64,
+    },
+    Pressure {
+        /// The kernel's verdict: 2 = warning, 4 = critical. Not a scale,
+        /// which is why there is no percentage here
+        level: u32,
+        /// How long the episode had lasted when this fired
+        sustained: Duration,
+        swap_used_bytes: u64,
+        swap_total_bytes: u64,
+        compressed_bytes: Option<u64>,
+    },
+}
+
+/// An alert that should reach the user now.
+///
+/// Pure data: what happened ([`AlertDetail`]) and to whom
+/// ([`AlertSubject`]). Wording is not baked in — [`AlertEvent::summary`]
+/// renders the default English one-liner on demand (and `Display` does
+/// the same), while a frontend that wants its own layout, its own
+/// language, or a gauge instead of a sentence reads the fields directly.
+/// [`AlertEvent::kind`] and [`AlertEvent::severity`] are derived, so they
+/// can never disagree with the data.
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AlertEvent {
-    pub message: String,
+    pub subject: AlertSubject,
+    pub detail: AlertDetail,
+    /// Set when this is the [`PERSIST_REMINDER`] follow-up rather than a
+    /// newly crossed condition, carrying how long it had been going — a
+    /// frontend may want to style or collapse those differently
+    pub repeat_after: Option<Duration>,
+}
+
+impl AlertEvent {
+    /// The category to group, filter or pick an icon by
+    pub fn kind(&self) -> AlertKind {
+        let app = matches!(self.subject, AlertSubject::App { .. });
+        match self.detail {
+            AlertDetail::Cpu { .. } if app => AlertKind::AppCpu,
+            AlertDetail::Cpu { .. } => AlertKind::Cpu,
+            AlertDetail::Memory { .. } if app => AlertKind::AppMemory,
+            AlertDetail::Memory { .. } => AlertKind::Memory,
+            AlertDetail::Disk { .. } => AlertKind::Disk,
+            AlertDetail::Pressure { .. } => AlertKind::Pressure,
+        }
+    }
+
+    /// How alarming this is — enough to choose a color
+    pub fn severity(&self) -> Severity {
+        match self.detail {
+            AlertDetail::Cpu { runaway: true, .. } => Severity::Critical,
+            AlertDetail::Pressure { level, .. } if level >= 4 => Severity::Critical,
+            _ => Severity::Warning,
+        }
+    }
+
+    /// The default one-line rendering, in English. A frontend with its
+    /// own layout or language should build from the fields instead
+    pub fn summary(&self) -> String {
+        let who = self.subject.label();
+        let mut text = match &self.detail {
+            AlertDetail::Cpu {
+                avg_percent,
+                threshold_percent,
+                window,
+                runaway,
+            } => format!(
+                "{who}{} averaged {avg_percent:.0}% CPU over {} (threshold {threshold_percent:.0}%)",
+                if *runaway { " runaway:" } else { "" },
+                window_label(*window),
+            ),
+            AlertDetail::Memory {
+                avg_bytes,
+                share_percent,
+                threshold_percent,
+                window,
+            } => format!(
+                "{who} averaged {:.1} GiB — {share_percent:.0}% of total memory — over {} \
+                 (threshold {threshold_percent:.0}%)",
+                *avg_bytes as f64 / f64::from(1 << 30),
+                window_label(*window),
+            ),
+            AlertDetail::Disk {
+                used_percent,
+                available_bytes,
+                total_bytes,
+                ..
+            } => format!(
+                "{who} is {used_percent:.0}% full — {:.1} GiB free of {:.1} GiB",
+                *available_bytes as f64 / f64::from(1 << 30),
+                *total_bytes as f64 / f64::from(1 << 30),
+            ),
+            AlertDetail::Pressure {
+                level,
+                sustained,
+                swap_used_bytes,
+                swap_total_bytes,
+                compressed_bytes,
+            } => format!(
+                "{who} memory pressure: {} for {} min — swap {:.1}/{:.1} GiB{}",
+                if *level >= 4 { "critical" } else { "warning" },
+                sustained.as_secs() / 60,
+                *swap_used_bytes as f64 / f64::from(1 << 30),
+                *swap_total_bytes as f64 / f64::from(1 << 30),
+                compressed_bytes
+                    .map(|b| format!(", compressor {:.1} GiB", b as f64 / f64::from(1 << 30)))
+                    .unwrap_or_default(),
+            ),
+        };
+        if let Some(elapsed) = self.repeat_after {
+            text.push_str(&format!(
+                " — still going after {} min",
+                elapsed.as_secs() / 60
+            ));
+        }
+        text
+    }
+}
+
+impl std::fmt::Display for AlertEvent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.summary())
+    }
+}
+
+impl AlertSubject {
+    /// How this subject is named in a sentence
+    fn label(&self) -> String {
+        match self {
+            Self::Process { pid, name } => format!("{name} (pid {pid})"),
+            Self::App {
+                name,
+                process_count,
+                ..
+            } => format!("{name} ({process_count} processes)"),
+            Self::Volume { mount_point } => format!("disk {mount_point}"),
+            Self::System => "system".to_string(),
+        }
+    }
+}
+
+fn window_label(window: Duration) -> String {
+    match window.as_secs() / 60 {
+        0 | 1 => "the last minute".to_string(),
+        minutes => format!("the last {minutes} minutes"),
+    }
 }
 
 /// Result of one evaluation pass
@@ -353,7 +598,11 @@ impl ActiveThresholds {
         for (name, pct) in &file.cpu_overrides {
             cpu = cpu.with_override(name.clone(), (*pct > 0.0).then_some(*pct));
         }
-        if file.template.unwrap_or(true) {
+        // The template is a refinement of the base rule, not a source of
+        // alerts in its own right: disabling the base value must not
+        // leave ~60 templated apps still firing. An explicit user
+        // override is different — that one is a request, and it stands
+        if file.template.unwrap_or(true) && cpu_default.is_some() {
             for (name, pct) in TEMPLATE_CPU_OVERRIDES {
                 cpu = cpu.with_override((*name).to_string(), (*pct > 0.0).then_some(*pct));
             }
@@ -381,7 +630,7 @@ impl ActiveThresholds {
         for (name, pct) in &file.app_cpu_overrides {
             app_cpu = app_cpu.with_override(name.clone(), (*pct > 0.0).then_some(*pct));
         }
-        if file.template.unwrap_or(true) {
+        if file.template.unwrap_or(true) && app_cpu_default.is_some() {
             for (name, pct) in TEMPLATE_APP_CPU_OVERRIDES {
                 app_cpu = app_cpu.with_override((*name).to_string(), (*pct > 0.0).then_some(*pct));
             }
@@ -396,7 +645,7 @@ impl ActiveThresholds {
             app_memory =
                 app_memory.with_override(name.clone(), (*pct > 0.0).then_some(*pct / 100.0));
         }
-        if file.template.unwrap_or(true) {
+        if file.template.unwrap_or(true) && app_mem_default.is_some() {
             for (name, pct) in TEMPLATE_APP_MEM_OVERRIDES {
                 app_memory = app_memory
                     .with_override((*name).to_string(), (*pct > 0.0).then_some(*pct / 100.0));
@@ -439,7 +688,7 @@ pub struct AlertEngine {
     slow: Option<ProcessWindows>,
     /// 5-minute windows over whole-application totals, keyed by root pid
     apps: Option<ProcessWindows>,
-    last_alert: HashMap<(u32, AlertKind), Instant>,
+    episodes: EpisodeState,
     /// Mounts that already fired the disk alert and have not yet dropped
     /// [`DISK_REARM_MARGIN`] below their threshold
     disk_disarmed: std::collections::HashSet<String>,
@@ -511,13 +760,16 @@ impl AlertEngine {
                 } else if used >= f64::from(threshold) {
                     self.disk_disarmed.insert(d.mount_point.clone());
                     evaluation.events.push(AlertEvent {
-                        message: format!(
-                            "disk {} is {:.0}% full — {:.1} GiB free of {:.1} GiB",
-                            d.mount_point,
-                            used * 100.0,
-                            d.available_bytes as f64 / f64::from(1 << 30),
-                            d.total_bytes as f64 / f64::from(1 << 30),
-                        ),
+                        subject: AlertSubject::Volume {
+                            mount_point: d.mount_point.clone(),
+                        },
+                        detail: AlertDetail::Disk {
+                            used_percent: used * 100.0,
+                            threshold_percent: f64::from(threshold) * 100.0,
+                            available_bytes: d.available_bytes,
+                            total_bytes: d.total_bytes,
+                        },
+                        repeat_after: None,
                     });
                 }
             }
@@ -544,20 +796,16 @@ impl AlertEngine {
                 let required = if level >= 4 { WINDOW } else { SLOW_WINDOW };
                 if level >= threshold && level > self.pressure_alerted && elapsed >= required {
                     self.pressure_alerted = level;
-                    let label = if level >= 4 { "critical" } else { "warning" };
-                    let compressed = snapshot
-                        .memory
-                        .compressed_bytes
-                        .map(|b| format!(", compressor {:.1} GiB", b as f64 / f64::from(1 << 30)))
-                        .unwrap_or_default();
                     evaluation.events.push(AlertEvent {
-                        message: format!(
-                            "system memory pressure: {label} for {} min — \
-                             swap {:.1}/{:.1} GiB{compressed}",
-                            elapsed.as_secs() / 60,
-                            snapshot.memory.swap_used_bytes as f64 / f64::from(1 << 30),
-                            snapshot.memory.swap_total_bytes as f64 / f64::from(1 << 30),
-                        ),
+                        subject: AlertSubject::System,
+                        detail: AlertDetail::Pressure {
+                            level,
+                            sustained: elapsed,
+                            swap_used_bytes: snapshot.memory.swap_used_bytes,
+                            swap_total_bytes: snapshot.memory.swap_total_bytes,
+                            compressed_bytes: snapshot.memory.compressed_bytes,
+                        },
+                        repeat_after: None,
                     });
                 }
             }
@@ -594,7 +842,7 @@ impl AlertEngine {
                 .apps
                 .get_or_insert_with(|| ProcessWindows::new(SLOW_WINDOW))
                 .record(now, &as_processes);
-            self.last_alert.retain(|(pid, kind), _| {
+            self.episodes.retain(|(pid, kind)| {
                 !matches!(kind, AlertKind::AppCpu | AlertKind::AppMemory) || stats.contains_key(pid)
             });
 
@@ -605,47 +853,50 @@ impl AlertEngine {
                 if stat.span < SLOW_MIN_SPAN {
                     continue;
                 }
-                if let Some(threshold) = active.app_cpu.for_process(&g.name)
-                    && stat.cpu_avg >= f64::from(threshold)
-                    && cooldown_elapsed(
-                        &mut self.last_alert,
-                        (g.root_pid, AlertKind::AppCpu),
-                        now,
-                        active.cooldown,
-                    )
-                {
-                    evaluation.events.push(AlertEvent {
-                        message: format!(
-                            "{} ({} processes) averaged {:.0}% CPU over the last {} minutes \
-                             (threshold {threshold:.0}%)",
-                            g.name,
-                            g.process_count,
-                            stat.cpu_avg,
-                            SLOW_WINDOW.as_secs() / 60,
-                        ),
-                    });
+                if let Some(threshold) = active.app_cpu.for_process(&g.name) {
+                    let key = (g.root_pid, AlertKind::AppCpu);
+                    if stat.cpu_avg < f64::from(threshold) {
+                        self.episodes.clear(key);
+                    } else if let Some(notify) = self.episodes.notify(key, now, active.cooldown) {
+                        evaluation.events.push(AlertEvent {
+                            subject: AlertSubject::App {
+                                root_pid: g.root_pid,
+                                name: g.name.clone(),
+                                process_count: g.process_count,
+                            },
+                            detail: AlertDetail::Cpu {
+                                avg_percent: stat.cpu_avg,
+                                threshold_percent: f64::from(threshold),
+                                window: SLOW_WINDOW,
+                                runaway: false,
+                            },
+                            repeat_after: notify.elapsed(),
+                        });
+                    }
                 }
                 if let Some(fraction) = active.app_memory.for_process(&g.name)
                     && total_memory > 0
-                    && mem_share(stat.memory_avg_bytes) >= fraction
-                    && cooldown_elapsed(
-                        &mut self.last_alert,
-                        (g.root_pid, AlertKind::AppMemory),
-                        now,
-                        active.cooldown,
-                    )
                 {
-                    evaluation.events.push(AlertEvent {
-                        message: format!(
-                            "{} ({} processes) averaged {:.1} GiB — {:.0}% of total memory — \
-                             over the last {} minutes",
-                            g.name,
-                            g.process_count,
-                            stat.memory_avg_bytes / f64::from(1 << 30),
-                            mem_share(stat.memory_avg_bytes) * 100.0,
-                            SLOW_WINDOW.as_secs() / 60,
-                        ),
-                    });
+                    let key = (g.root_pid, AlertKind::AppMemory);
+                    let share = mem_share(stat.memory_avg_bytes);
+                    if share < fraction {
+                        self.episodes.clear(key);
+                    } else if let Some(notify) = self.episodes.notify(key, now, active.cooldown) {
+                        evaluation.events.push(AlertEvent {
+                            subject: AlertSubject::App {
+                                root_pid: g.root_pid,
+                                name: g.name.clone(),
+                                process_count: g.process_count,
+                            },
+                            detail: AlertDetail::Memory {
+                                avg_bytes: stat.memory_avg_bytes as u64,
+                                share_percent: share * 100.0,
+                                threshold_percent: fraction * 100.0,
+                                window: SLOW_WINDOW,
+                            },
+                            repeat_after: notify.elapsed(),
+                        });
+                    }
                 }
             }
         }
@@ -676,7 +927,7 @@ impl AlertEngine {
         // per-process ones: an app group is keyed by its ROOT pid, which
         // need not appear in the top-N process list at all, and wiping
         // those entries here would re-fire every group alert every round
-        self.last_alert.retain(|(pid, kind), _| {
+        self.episodes.retain(|(pid, kind)| {
             matches!(kind, AlertKind::AppCpu | AlertKind::AppMemory) || fast_stats.contains_key(pid)
         });
 
@@ -700,56 +951,55 @@ impl AlertEngine {
                 let acute =
                     fast.span >= MIN_SPAN && fast.cpu_avg >= ACUTE_FACTOR * f64::from(threshold);
                 let chronic = slow.span >= SLOW_MIN_SPAN && slow.cpu_avg >= f64::from(threshold);
-                if (acute || chronic)
-                    && cooldown_elapsed(
-                        &mut self.last_alert,
-                        (p.pid, AlertKind::Cpu),
-                        now,
-                        active.cooldown,
-                    )
-                {
-                    let message = if acute {
-                        format!(
-                            "{} (pid {}) runaway: averaged {:.0}% CPU over the last minute \
-                             ({ACUTE_FACTOR:.0}x the {threshold:.0}% threshold)",
-                            p.name, p.pid, fast.cpu_avg
-                        )
-                    } else {
-                        format!(
-                            "{} (pid {}) averaged {:.0}% CPU over the last {} minutes \
-                             (threshold {threshold:.0}%)",
-                            p.name,
-                            p.pid,
-                            slow.cpu_avg,
-                            SLOW_WINDOW.as_secs() / 60
-                        )
-                    };
-                    evaluation.events.push(AlertEvent { message });
+                let key = (p.pid, AlertKind::Cpu);
+                if !(acute || chronic) {
+                    // Back under the bar: this episode is over
+                    self.episodes.clear(key);
+                } else if let Some(notify) = self.episodes.notify(key, now, active.cooldown) {
+                    evaluation.events.push(AlertEvent {
+                        subject: AlertSubject::Process {
+                            pid: p.pid,
+                            name: p.name.clone(),
+                        },
+                        // The tier that fired decides which window and
+                        // which bar the numbers refer to
+                        detail: AlertDetail::Cpu {
+                            avg_percent: if acute { fast.cpu_avg } else { slow.cpu_avg },
+                            threshold_percent: if acute {
+                                ACUTE_FACTOR * f64::from(threshold)
+                            } else {
+                                f64::from(threshold)
+                            },
+                            window: if acute { WINDOW } else { SLOW_WINDOW },
+                            runaway: acute,
+                        },
+                        repeat_after: notify.elapsed(),
+                    });
                 }
             }
 
             if let Some(fraction) = active.memory.for_process(&p.name)
                 && total_memory > 0
                 && slow.span >= SLOW_MIN_SPAN
-                && mem_share(slow.memory_avg_bytes) >= fraction
-                && cooldown_elapsed(
-                    &mut self.last_alert,
-                    (p.pid, AlertKind::Memory),
-                    now,
-                    active.cooldown,
-                )
             {
-                evaluation.events.push(AlertEvent {
-                    message: format!(
-                        "{} (pid {}) averaged {:.1} GiB — {:.0}% of total memory — \
-                         over the last {} minutes",
-                        p.name,
-                        p.pid,
-                        slow.memory_avg_bytes / f64::from(1 << 30),
-                        mem_share(slow.memory_avg_bytes) * 100.0,
-                        SLOW_WINDOW.as_secs() / 60
-                    ),
-                });
+                let key = (p.pid, AlertKind::Memory);
+                if mem_share(slow.memory_avg_bytes) < fraction {
+                    self.episodes.clear(key);
+                } else if let Some(notify) = self.episodes.notify(key, now, active.cooldown) {
+                    evaluation.events.push(AlertEvent {
+                        subject: AlertSubject::Process {
+                            pid: p.pid,
+                            name: p.name.clone(),
+                        },
+                        detail: AlertDetail::Memory {
+                            avg_bytes: slow.memory_avg_bytes as u64,
+                            share_percent: mem_share(slow.memory_avg_bytes) * 100.0,
+                            threshold_percent: fraction * 100.0,
+                            window: SLOW_WINDOW,
+                        },
+                        repeat_after: notify.elapsed(),
+                    });
+                }
             }
 
             // Metrics recording: 1-minute window, BASE thresholds only
@@ -777,20 +1027,107 @@ impl AlertEngine {
     }
 }
 
-/// True (and records `now`) when the cooldown for this key has elapsed
-fn cooldown_elapsed(
-    last_alert: &mut HashMap<(u32, AlertKind), Instant>,
-    key: (u32, AlertKind),
-    now: Instant,
-    cooldown: Duration,
-) -> bool {
-    if let Some(previous) = last_alert.get(&key)
-        && now.duration_since(*previous) < cooldown
-    {
-        return false;
+/// One ongoing alerted condition
+#[derive(Debug, Clone, Copy)]
+struct Episode {
+    started: Instant,
+    /// Whether the single [`PERSIST_REMINDER`] follow-up already went out
+    reminded: bool,
+}
+
+/// Why a notification is due
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Notify {
+    /// The condition just crossed its threshold
+    New,
+    /// Still true after [`PERSIST_REMINDER`], carrying how long it has
+    /// been going
+    Reminder(Duration),
+}
+
+/// Per-(process, rule) alert bookkeeping: which conditions are currently
+/// inside an alerted episode, and when each last notified
+#[derive(Default)]
+struct EpisodeState {
+    /// Conditions already notified and not yet cleared
+    active: HashMap<(u32, AlertKind), Episode>,
+    last_alert: HashMap<(u32, AlertKind), Instant>,
+}
+
+impl EpisodeState {
+    /// Whether this condition should notify now, and why.
+    ///
+    /// A crossing notifies once. Repeating that every cooldown adds
+    /// nothing — you either acted or decided not to — but going silent
+    /// forever is its own failure mode, because a single notification
+    /// can be missed (macOS defers them behind Focus modes and
+    /// summaries). So exactly one follow-up goes out if the condition
+    /// is still true after [`PERSIST_REMINDER`], and then it is quiet
+    /// until the condition actually clears.
+    fn notify(
+        &mut self,
+        key: (u32, AlertKind),
+        now: Instant,
+        cooldown: Duration,
+    ) -> Option<Notify> {
+        let decision = match self.active.get_mut(&key) {
+            Some(episode) => {
+                let elapsed = now.duration_since(episode.started);
+                if episode.reminded || elapsed < PERSIST_REMINDER {
+                    None
+                } else {
+                    episode.reminded = true;
+                    Some(Notify::Reminder(elapsed))
+                }
+            }
+            // Floor between episodes, so a value hovering at the
+            // threshold cannot alert on every crossing
+            None => {
+                let too_soon = self
+                    .last_alert
+                    .get(&key)
+                    .is_some_and(|previous| now.duration_since(*previous) < cooldown);
+                (!too_soon).then_some(Notify::New)
+            }
+        };
+
+        if decision.is_some() {
+            self.last_alert.insert(key, now);
+        }
+        if decision == Some(Notify::New) {
+            self.active.insert(
+                key,
+                Episode {
+                    started: now,
+                    reminded: false,
+                },
+            );
+        }
+        decision
     }
-    last_alert.insert(key, now);
-    true
+
+    /// The condition no longer holds: the episode is over, so the next
+    /// crossing may notify again
+    fn clear(&mut self, key: (u32, AlertKind)) {
+        self.active.remove(&key);
+    }
+
+    /// Forget everything about keys that no longer exist
+    fn retain(&mut self, keep: impl Fn(&(u32, AlertKind)) -> bool) {
+        self.active.retain(|k, _| keep(k));
+        self.last_alert.retain(|k, _| keep(k));
+    }
+}
+
+impl Notify {
+    /// How long the condition had been going, for a follow-up; None for
+    /// a freshly crossed one
+    fn elapsed(self) -> Option<Duration> {
+        match self {
+            Self::New => None,
+            Self::Reminder(elapsed) => Some(elapsed),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -966,7 +1303,7 @@ mod tests {
             if 2 * i < 50 {
                 assert!(events.is_empty(), "no alert before t=50s (t={}s)", 2 * i);
             }
-            messages.extend(events.into_iter().map(|e| e.message));
+            messages.extend(events.into_iter().map(|e| e.summary()));
         }
         assert_eq!(messages.len(), 1);
         assert!(messages[0].contains("runaway"), "got: {}", messages[0]);
@@ -992,7 +1329,7 @@ mod tests {
                     .evaluate(now, &snapshot(vec![ghostty, other], 100), &active)
                     .events
                     .into_iter()
-                    .map(|e| e.message),
+                    .map(|e| e.summary()),
             );
         }
         assert_eq!(messages.len(), 1);
@@ -1104,7 +1441,7 @@ mod tests {
                 .evaluate(now, &snapshot(vec![ghostty, other], 100), &active)
                 .events
             {
-                messages.push(event.message);
+                messages.push(event.summary());
             }
         }
         assert_eq!(messages.len(), 1);
@@ -1129,25 +1466,230 @@ mod tests {
     }
 
     #[test]
-    fn custom_cooldown_controls_realert_rate() {
+    fn a_persisting_condition_notifies_once_not_every_cooldown() {
+        // The behaviour a real machine exposed: a system daemon pegged
+        // for an hour used to produce one notification per cooldown.
+        // Being told once is the point; repeats add nothing
         let active = thresholds(
             Thresholds::new(None),
             Thresholds::new(Some(0.25)),
             Duration::from_secs(20),
         );
         let mut engine = AlertEngine::new();
-        // Sustained hog for 320s at a 2s cadence with a 20s cooldown:
-        // fires at 250s (slow window full), then at 270s, 290s, 310s
         let fired = drive(
             &mut engine,
             &active,
             Instant::now(),
             Duration::ZERO,
-            160,
+            400,
             |_| proc(1, 0.0, 30),
             100,
         );
-        assert_eq!(fired, 4);
+        assert_eq!(fired, 1, "800s of sustained overload is still one event");
+    }
+
+    #[test]
+    fn events_carry_structure_a_gui_can_render_without_parsing_text() {
+        let active = ActiveThresholds {
+            cpu: Thresholds::new(Some(30.0)),
+            memory: Thresholds::new(None),
+            disk: Thresholds::new(Some(0.90)),
+            app_cpu: Thresholds::new(None),
+            app_memory: Thresholds::new(None),
+            pressure: Some(2),
+            cooldown: Duration::from_secs(600),
+        };
+        let mut engine = AlertEngine::new();
+        let base = Instant::now();
+        let mut events = Vec::new();
+
+        for i in 0..40u64 {
+            let mut s = snapshot(vec![proc(1, 150.0, 0)], 100);
+            s.disks = Some(vec![disk("/", 1000, 50)]);
+            events.extend(
+                engine
+                    .evaluate(base + Duration::from_secs(2 * i), &s, &active)
+                    .events,
+            );
+        }
+
+        let cpu = events
+            .iter()
+            .find(|e| e.kind() == AlertKind::Cpu)
+            .expect("cpu event");
+        // 150% is 3x the 30% threshold: the runaway tier
+        assert_eq!(cpu.severity(), Severity::Critical);
+        assert_eq!(
+            cpu.subject,
+            AlertSubject::Process {
+                pid: 1,
+                name: "p1".into()
+            }
+        );
+        let AlertDetail::Cpu {
+            avg_percent,
+            threshold_percent,
+            window,
+            runaway,
+        } = cpu.detail
+        else {
+            panic!("expected a CPU measurement, got {:?}", cpu.detail);
+        };
+        assert!((avg_percent - 150.0).abs() < 0.5);
+        // The runaway bar is the effective threshold, already multiplied
+        assert_eq!(threshold_percent, 90.0);
+        assert_eq!(window, WINDOW);
+        assert!(runaway);
+        assert!(cpu.repeat_after.is_none());
+
+        let disk_event = events
+            .iter()
+            .find(|e| e.kind() == AlertKind::Disk)
+            .expect("disk event");
+        assert_eq!(disk_event.severity(), Severity::Warning);
+        assert_eq!(
+            disk_event.subject,
+            AlertSubject::Volume {
+                mount_point: "/".into()
+            }
+        );
+        let AlertDetail::Disk { used_percent, .. } = disk_event.detail else {
+            panic!("expected a disk measurement");
+        };
+        assert!((used_percent - 95.0).abs() < 0.5);
+
+        // The default rendering is derived, not stored
+        assert!(
+            cpu.summary()
+                .contains("p1 (pid 1) runaway: averaged 150% CPU"),
+            "got: {}",
+            cpu.summary()
+        );
+        assert_eq!(cpu.summary(), cpu.to_string());
+
+        // The whole event round-trips as JSON, so it can cross an IPC
+        // boundary or be logged structurally — and carries no prose
+        let json = serde_json::to_string(cpu).expect("serialize");
+        assert!(json.contains("\"measure\":\"cpu\""), "got: {json}");
+        assert!(json.contains("\"type\":\"process\""), "got: {json}");
+        assert!(!json.contains("runaway:"), "no baked wording: {json}");
+    }
+
+    #[test]
+    fn a_long_episode_earns_exactly_one_follow_up() {
+        // Going silent forever is its own failure mode: a single
+        // notification can be missed. One reminder at 30 minutes, then
+        // quiet again however long it lasts
+        let active = thresholds(
+            Thresholds::new(None),
+            Thresholds::new(Some(0.25)),
+            Duration::from_secs(20),
+        );
+        let mut engine = AlertEngine::new();
+        let base = Instant::now();
+        let mut messages = Vec::new();
+
+        // 2 hours of unbroken overload at a 2s cadence
+        for i in 0..3600u64 {
+            messages.extend(
+                engine
+                    .evaluate(
+                        base + Duration::from_secs(2 * i),
+                        &snapshot(vec![proc(1, 0.0, 30)], 100),
+                        &active,
+                    )
+                    .events
+                    .into_iter()
+                    .map(|e| e.summary()),
+            );
+        }
+        assert_eq!(messages.len(), 2, "one crossing plus one follow-up");
+        assert!(!messages[0].contains("still going"));
+        assert!(
+            messages[1].contains("still going after 30 min"),
+            "got: {}",
+            messages[1]
+        );
+    }
+
+    #[test]
+    fn a_new_episode_notifies_again_once_the_condition_cleared() {
+        let active = thresholds(
+            Thresholds::new(None),
+            Thresholds::new(Some(0.25)),
+            Duration::from_secs(20),
+        );
+        let mut engine = AlertEngine::new();
+        let base = Instant::now();
+
+        // Over the bar long enough to alert once
+        assert_eq!(
+            drive(
+                &mut engine,
+                &active,
+                base,
+                Duration::ZERO,
+                160,
+                |_| proc(1, 0.0, 30),
+                100
+            ),
+            1
+        );
+        // Drops back under for a while: the episode ends (silently), and
+        // the slow window refills with the low value
+        assert_eq!(
+            drive(
+                &mut engine,
+                &active,
+                base,
+                Duration::from_secs(320),
+                160,
+                |_| proc(1, 0.0, 5),
+                100
+            ),
+            0
+        );
+        // Rising again is a NEW event and notifies
+        assert_eq!(
+            drive(
+                &mut engine,
+                &active,
+                base,
+                Duration::from_secs(640),
+                160,
+                |_| proc(1, 0.0, 30),
+                100
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn cooldown_still_floors_flapping_between_episodes() {
+        // Straddling the threshold must not alert on every crossing:
+        // the cooldown is the floor between episodes
+        let active = thresholds(
+            Thresholds::new(None),
+            Thresholds::new(Some(0.25)),
+            Duration::from_secs(600),
+        );
+        let mut engine = AlertEngine::new();
+        let base = Instant::now();
+        let mut fired = 0;
+        // 800s alternating high/low every 60s (30 samples), so the
+        // 5-minute average crosses repeatedly
+        for i in 0..400u64 {
+            let mem = if (i / 30) % 2 == 0 { 40 } else { 0 };
+            fired += engine
+                .evaluate(
+                    base + Duration::from_secs(2 * i),
+                    &snapshot(vec![proc(1, 0.0, mem)], 100),
+                    &active,
+                )
+                .events
+                .len();
+        }
+        assert!(fired <= 2, "cooldown must bound flapping, got {fired}");
     }
 
     #[test]
@@ -1288,7 +1830,7 @@ mod tests {
         assert!(step(0, 85).is_empty(), "below threshold");
         let fired = step(1, 91);
         assert_eq!(fired.len(), 1, "crossing fires once");
-        assert!(fired[0].message.contains("disk / is 91% full"));
+        assert!(fired[0].summary().contains("disk / is 91% full"));
         assert!(step(2, 93).is_empty(), "still full: no nagging");
         assert!(step(3, 87).is_empty(), "above the re-arm line: still quiet");
         assert!(step(4, 84).is_empty(), "re-armed silently");
@@ -1318,7 +1860,7 @@ mod tests {
             )
             .events;
         assert_eq!(events.len(), 1);
-        assert!(events[0].message.contains("disk / is 95% full"));
+        assert!(events[0].summary().contains("disk / is 95% full"));
     }
 
     use crate::snapshot::ProcessGroupSnapshot;
@@ -1370,7 +1912,7 @@ mod tests {
                     .evaluate(base + Duration::from_secs(2 * i), &s, &active)
                     .events
                     .into_iter()
-                    .map(|e| e.message),
+                    .map(|e| e.summary()),
             );
         }
         assert_eq!(messages.len(), 1, "chronic app rule fires once");
@@ -1407,7 +1949,7 @@ mod tests {
                     2 * i
                 );
             }
-            messages.extend(events.into_iter().map(|e| e.message));
+            messages.extend(events.into_iter().map(|e| e.summary()));
         }
         assert_eq!(messages.len(), 1);
         assert!(
@@ -1468,14 +2010,14 @@ mod tests {
         let warn = step(151, 2);
         assert_eq!(warn.len(), 1, "sustained warning alerts once");
         assert!(
-            warn[0].message.contains("warning for 5 min"),
+            warn[0].summary().contains("warning for 5 min"),
             "got: {}",
-            warn[0].message
+            warn[0].summary()
         );
         assert!(step(152, 2).is_empty(), "lingering warning does not nag");
         let crit = step(153, 4);
         assert_eq!(crit.len(), 1, "worsening escalates without waiting again");
-        assert!(crit[0].message.contains("critical"));
+        assert!(crit[0].summary().contains("critical"));
         assert!(
             step(154, 2).is_empty(),
             "improving within the episode is silent"
@@ -1690,6 +2232,35 @@ mod tests {
         let merged = ActiveThresholds::from_config(&off);
         assert_eq!(merged.app_cpu.for_process("login"), Some(200.0));
         assert_eq!(merged.app_memory.for_process("Google Chrome"), Some(0.40));
+    }
+
+    #[test]
+    fn disabling_a_base_rule_also_retires_its_template() {
+        // `alert-cpu 0` means "no CPU alerts", so the ~60 templated apps
+        // must not keep firing behind the user's back
+        let file = AlertsConfig {
+            cpu: Some(0.0),
+            app_cpu: Some(0.0),
+            app_mem: Some(0.0),
+            ..Default::default()
+        };
+        let merged = ActiveThresholds::from_config(&file);
+        assert_eq!(merged.cpu.for_process("Google Chrome"), None);
+        assert!(!merged.cpu.any_enabled());
+        assert_eq!(merged.app_cpu.for_process("Google Chrome"), None);
+        assert!(!merged.app_cpu.any_enabled());
+        assert!(!merged.app_memory.any_enabled());
+
+        // An explicit user override is a request, not a default: it
+        // still applies over a disabled base
+        let mut file = AlertsConfig {
+            cpu: Some(0.0),
+            ..Default::default()
+        };
+        file.cpu_overrides.insert("ghostty".into(), 100.0);
+        let merged = ActiveThresholds::from_config(&file);
+        assert_eq!(merged.cpu.for_process("ghostty"), Some(100.0));
+        assert_eq!(merged.cpu.for_process("Google Chrome"), None);
     }
 
     #[test]

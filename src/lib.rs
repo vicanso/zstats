@@ -59,6 +59,8 @@ pub mod collector;
 pub mod config;
 pub mod error;
 #[cfg(feature = "frontend")]
+pub mod monitor;
+#[cfg(feature = "frontend")]
 pub mod records;
 #[cfg(feature = "frontend")]
 pub mod rolling;
@@ -76,6 +78,8 @@ pub mod utils;
 #[cfg(feature = "runtime")]
 pub use async_trait::async_trait;
 
+#[cfg(feature = "frontend")]
+pub use alerts::{AlertDetail, AlertEvent, AlertKind, AlertSubject, Severity};
 #[cfg(all(feature = "client", unix))]
 pub use client::DaemonStream;
 pub use collector::{Collector, LocalCollector};
@@ -83,6 +87,8 @@ pub use config::CollectorConfig;
 #[cfg(all(feature = "client", unix))]
 pub use error::ClientError;
 pub use error::{CollectError, ConfigError, SchedulerError, SinkError};
+#[cfg(feature = "frontend")]
+pub use monitor::{Monitor, Tick};
 #[cfg(feature = "runtime")]
 pub use scheduler::Scheduler;
 #[cfg(feature = "runtime")]

@@ -86,7 +86,10 @@ Config keys for -add (also accepted as key=value). Durations take 500ms /
   alert-pressure <level>      [alerts] kernel memory-pressure alert, macOS:
                               off | warning (default) | critical; alerts only
                               once the level persists (5m / 1m at critical)
-  alert-cooldown <dur>        [alerts] re-alert cooldown (default 10m)
+  alert-cooldown <dur>        [alerts] minimum gap between EPISODES for one
+                              process+rule (default 10m); a persisting
+                              condition notifies once, plus one follow-up
+                              after 30m — never on every cooldown
   alert-template <bool>       [alerts] builtin per-app override template
                               (default true; your overrides always win)
 ";
@@ -420,6 +423,28 @@ fn detach_self() -> ExitCode {
     }
 }
 
+/// Log timestamps in the machine's local zone. The daemon log gets read
+/// by a person lining it up against what they saw on screen, and UTC
+/// makes that mental arithmetic. The offset stays in the output, so a
+/// pasted line is still unambiguous.
+///
+/// Uses jiff rather than tracing-subscriber's own `LocalTime`, whose
+/// backing crate refuses to resolve the local offset in a multi-threaded
+/// process and silently drops the timestamp instead.
+#[cfg(unix)]
+struct LocalTime;
+
+#[cfg(unix)]
+impl tracing_subscriber::fmt::time::FormatTime for LocalTime {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        write!(
+            w,
+            "{}",
+            jiff::Zoned::now().strftime("%Y-%m-%dT%H:%M:%S%.6f%:z")
+        )
+    }
+}
+
 fn runtime() -> tokio::runtime::Runtime {
     // The async work here is tiny — a collect tick, one UDS accept loop,
     // a few attached clients. Two workers are plenty; the default would
@@ -526,6 +551,7 @@ fn main() -> ExitCode {
                 .unwrap_or(tracing::Level::INFO);
             let _ = tracing_subscriber::fmt()
                 .with_max_level(level)
+                .with_timer(LocalTime)
                 .with_writer(std::io::stderr)
                 .with_ansi(std::io::stderr().is_terminal())
                 .try_init();

@@ -1,6 +1,6 @@
 [package]
 name = "zstats"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 # sysinfo 0.39 requires Rust 1.95+
 rust-version = "1.95.0"
@@ -76,7 +76,7 @@ libc = { version = "0.2", optional = true }
 sysctl = "0.7.1"
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 
 [[bin]]
 name = "zstats"

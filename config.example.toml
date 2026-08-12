@@ -134,7 +134,14 @@ disk = 90.0
 # warning to critical within the same episode notifies immediately;
 # lingering at one level never nags. `true`/`false` still parse
 pressure = "warning"
-# Minimum time between repeated alerts for the same process and rule
+# Minimum time between EPISODES for the same process and rule. A
+# condition that simply persists notifies once, plus exactly one
+# follow-up if it is still true 30 minutes later (insurance against the
+# first notification being missed — macOS defers notifications behind
+# Focus modes and summaries). The episode ends when the value falls back
+# under the threshold (or the process exits); this value then floors how
+# soon the next one may notify, so a value straddling the line cannot
+# alert on every crossing
 cooldown = "10m"
 
 # Apply the builtin per-app override template beneath your own overrides.
@@ -181,6 +188,7 @@ template = true
 # "Lark Helper (Renderer)" = 100.0            # Feishu
 # DingTalk = 100.0
 # "WeCom Helper (Renderer)" = 100.0
+# wwmapp = 100.0                              # 企业微信's real process name
 
 # --- editors / IDEs / language servers: re-index after every edit burst
 # "Cursor Helper (Renderer)" = 100.0
@@ -189,7 +197,9 @@ template = true
 # rust-analyzer = 100.0
 # clangd = 100.0
 # sourcekit-lsp = 100.0
+# Xcode = 200.0
 # SourceKitService = 200.0                    # Xcode indexing eats cores
+# swift-frontend = 200.0
 # idea = 200.0                                # JetBrains IDEs run under their
 # goland = 200.0                              #   own binary name (pycharm,
 # clion = 200.0                               #   webstorm, ... same story)
@@ -224,8 +234,17 @@ template = true
 # ollama = 0.0                                # local LLM inference pegs cores
 
 # --- macOS periodic system work: not actionable, keep the history only
+# Spotlight is a FAMILY of daemons — spotlightknowledged alone was the
+# noisiest alerter observed on a real machine
+# mds = 0.0
 # mds_stores = 0.0                            # Spotlight indexing
+# mdworker = 0.0
 # mdworker_shared = 0.0                       #   ...and its worker pool
+# spotlightknowledged = 0.0                   # semantic index
+# corespotlightd = 0.0
+# knowledgeconstructiond = 0.0
+# suggestd = 0.0
+# parsecd = 0.0
 # photoanalysisd = 0.0                        # Photos ML pass after imports
 # mediaanalysisd = 0.0                        # its video-analysis twin
 # backupd = 0.0                               # Time Machine

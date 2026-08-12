@@ -20,22 +20,21 @@
 //!
 //! The dependency shape this models is
 //! `zstats = { default-features = false, features = ["frontend", "client"] }`:
-//! no CLI, no `runtime`, and the consumer never touches tokio — collection
-//! is a plain thread driving the synchronous `LocalCollector`, and the
-//! channel receiver plays the role of the UI thread's callback.
+//! no CLI, no `runtime`, and the consumer never touches tokio.
+//! [`zstats::Monitor`] wires collection, the alert rules, rolling
+//! averages and history persistence together; the caller owns the loop,
+//! so a GUI decides which thread ticks and which thread paints.
 //!
-//! One embedded collector must be the ONLY collector: running this next to
-//! `zstats serve` would duplicate notifications and metrics records. A
+//! One embedded collector must be the ONLY collector: running this next
+//! to `zstats serve` would duplicate notifications and metrics records. A
 //! real frontend checks `zstats::client::is_running()` at startup and
 //! takes over (`zstats::client::stop()`, async — bring a small tokio
 //! runtime or spawn `zstats stop`) before collecting.
 
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use zstats::alerts::{ActiveThresholds, AlertEngine};
-use zstats::rolling::ProcessWindows;
-use zstats::{Collector, CollectorConfig, LocalCollector};
+use zstats::Monitor;
 
 fn main() {
     // Isolated config dir so the example never touches ~/.zstats or a
@@ -48,86 +47,63 @@ fn main() {
     zstats::settings::apply_add(&mut file, "alert-cpu", "40").expect("set threshold");
     zstats::settings::apply_add(&mut file, "alert-cpu", "ghostty=100").expect("set override");
     zstats::settings::save(&config_dir, &file).expect("save settings");
-    let file = zstats::settings::load(&config_dir).expect("reload settings");
-    println!(
-        "settings: alert-cpu={:?} overrides={:?}",
-        file.alerts.cpu, file.alerts.cpu_overrides
-    );
 
-    // -------- alert engine driven by those settings ---------------------
-    // Thresholds are passed per evaluate() call: after a settings-panel
-    // save, rebuild them — no engine state is lost
-    let thresholds = ActiveThresholds::from_config(&file.alerts);
-    let mut engine = AlertEngine::new();
-
-    // -------- rolling 1-minute averages for a process table -------------
-    let mut windows = ProcessWindows::new(Duration::from_secs(60));
-
-    // -------- collection: a plain thread + channel is the "callback" ----
+    // -------- collection thread: a plain thread is the "callback" -------
+    // tick() blocks (collection is a syscall), so it runs off the UI
+    // thread and hands finished work over a channel
     let (tx, rx) = mpsc::channel();
-    let collect_thread = std::thread::spawn(move || {
-        let mut collector = LocalCollector::new(CollectorConfig::default());
-        for _ in 0..4 {
-            match collector.collect() {
-                Ok(snapshot) => {
-                    if tx.send(snapshot).is_err() {
-                        break; // receiver dropped = tray quit: stop collecting
+    let collect_thread = std::thread::spawn({
+        let config_dir = config_dir.clone();
+        move || {
+            let mut monitor = Monitor::new(&config_dir).expect("monitor");
+            println!(
+                "settings: alert-cpu={:?} overrides={:?} alerts_enabled={}",
+                monitor.settings().alerts.cpu,
+                monitor.settings().alerts.cpu_overrides,
+                monitor.alerts_enabled(),
+            );
+            for _ in 0..4 {
+                match monitor.tick() {
+                    // Everything the UI needs, already evaluated and
+                    // persisted: raw sample, alerts to deliver, smoothed
+                    // per-process averages to rank a table by
+                    Ok(tick) => {
+                        if tx.send(tick).is_err() {
+                            break; // receiver dropped = tray quit
+                        }
                     }
+                    Err(e) => eprintln!("collect failed: {e}"),
                 }
-                Err(e) => eprintln!("collect failed: {e}"),
+                std::thread::sleep(Duration::from_millis(500));
             }
-            std::thread::sleep(Duration::from_millis(500));
         }
     });
 
-    // -------- the "UI thread": consume snapshots ------------------------
+    // -------- the "UI thread": consume ticks ----------------------------
     let mut rounds = 0;
-    while let Ok(snapshot) = rx.recv() {
+    while let Ok(tick) = rx.recv() {
         rounds += 1;
-        let evaluation = engine.evaluate(Instant::now(), &snapshot, &thresholds);
-        let averaged = snapshot
-            .processes
-            .as_deref()
-            .map(|ps| windows.record(Instant::now(), ps).len())
-            .unwrap_or(0);
         println!(
             "round {rounds}: cpu {:5.1}%  {} procs averaged  {} alerts  {} records",
-            snapshot.cpu.usage_percent,
-            averaged,
-            evaluation.events.len(),
-            evaluation.records.len(),
+            tick.snapshot.cpu.usage_percent,
+            tick.process_stats.len(),
+            tick.alerts.len(),
+            tick.records.len(),
         );
-        // A real frontend delivers evaluation.events its own way (in-app
-        // banner / system notification) and persists the records:
-        if !evaluation.records.is_empty() {
-            let today = jiff::Zoned::now().date();
-            zstats::records::append(&config_dir, today, &evaluation.records)
-                .expect("append records");
+        // A real frontend delivers these its own way — in-app banner,
+        // system notification, a log line. Persisting them already
+        // happened inside tick()
+        for alert in &tick.alerts {
+            println!("  ALERT: {}", alert.summary());
         }
     }
     collect_thread.join().expect("collector thread");
 
-    // -------- history: write + read back through the shared format ------
-    // (a fabricated record, since the rules need a ~50s-full window and
-    // this demo only runs a few seconds)
+    // -------- history: what a chart view reads --------------------------
     let today = jiff::Zoned::now().date();
-    let sample = zstats::records::MetricRecord {
-        timestamp: jiff::Timestamp::now(),
-        pid: 1,
-        name: "demo".into(),
-        cpu_avg_percent: 42.0,
-        memory_avg_bytes: 1 << 20,
-        memory_share_percent: 4.2,
-    };
-    zstats::records::append(&config_dir, today, &[sample]).expect("append history");
-    let history = zstats::records::read_range(&config_dir, today, today).expect("read history");
-    println!(
-        "history: {} record(s), first = {}",
-        history.len(),
-        history[0].name
-    );
-    let removed = zstats::records::cleanup(&config_dir, today, 30);
-    println!("cleanup: {} expired file(s)", removed.len());
+    let monitor = Monitor::new(&config_dir).expect("monitor");
+    let history = monitor.history(today, today).expect("history");
+    println!("history for {today}: {} record(s)", history.len());
 
     // -------- daemon takeover check (sync — no tokio runtime) -----------
     #[cfg(unix)]

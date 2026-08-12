@@ -196,11 +196,18 @@ impl MetricSink for AlertSink {
                 .evaluate(Instant::now(), snapshot, &active)
         };
         for event in &evaluation.events {
-            // Also log the alert: visible in the daemon log with a
-            // timestamp, and it separates "rule fired" from "notification
+            // Also log the alert, with the structured fields alongside
+            // the text: `ZSTATS_LOG` output stays greppable by rule and
+            // severity, and it separates "rule fired" from "notification
             // displayed" when debugging delivery issues
-            tracing::info!("alert: {}", event.message);
-            send_notification(&event.message).await;
+            tracing::info!(
+                kind = ?event.kind(),
+                severity = ?event.severity(),
+                repeat = event.repeat_after.is_some(),
+                "alert: {}",
+                event.summary()
+            );
+            send_notification(&event.summary()).await;
         }
         if !evaluation.records.is_empty() {
             self.persist_records(&evaluation.records);

@@ -20,6 +20,15 @@
 //! module owns that file format — writing, reading back by date range,
 //! and retention cleanup — so every frontend sees the same history.
 //!
+//! Two time bases meet here, on purpose. The FILE is named by the LOCAL
+//! date, because "what happened on my Monday" should be one file; each
+//! record's `timestamp` is UTC, because it is copied verbatim from the
+//! snapshot and has to mean the same thing on every machine. So a file
+//! legitimately contains two UTC dates — east of UTC, everything before
+//! local 08:00 carries yesterday's UTC date. Group by day with
+//! [`read_range`] (it selects by file, i.e. by local day) rather than by
+//! slicing the timestamp string, and convert to local only for display.
+//!
 //! Retention is built into writing: [`append`] runs a sweep deleting
 //! files older than [`RETENTION_DAYS`] whenever the date differs from
 //! the last sweep's (tracked in process memory per config dir), so every
@@ -51,6 +60,8 @@ static LAST_CLEANUP: LazyLock<Mutex<HashMap<PathBuf, jiff::civil::Date>>> =
 /// the base alert thresholds at recording time
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MetricRecord {
+    /// Sampling time in UTC (the snapshot's own timestamp) — note the
+    /// containing file is named by LOCAL date, so the two can disagree
     pub timestamp: jiff::Timestamp,
     pub pid: u32,
     pub name: String,

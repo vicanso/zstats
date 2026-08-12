@@ -150,10 +150,28 @@ about 0% with only CPU/memory/load enabled.
 Library consumers who drive their own scheduling can depend on
 `default-features = false`; add `runtime` for the async pipeline.
 
-For a single-process frontend (e.g. a tray GUI) that embeds collection —
-plain-thread collection loop, alert engine, metrics history, settings,
-all without tokio — see `examples/embedded.rs`
-(`cargo run --example embedded`).
+For a single-process frontend (e.g. a tray GUI) that embeds collection,
+`Monitor` wires collection, the alert rules, rolling averages and history
+persistence into one call — no tokio, no callbacks, the caller owns the
+loop and therefore decides which thread touches the UI:
+
+```rust
+fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let mut monitor = zstats::Monitor::new(zstats::settings::default_dir())?;
+    loop {
+        let tick = monitor.tick()?;
+        for alert in &tick.alerts {
+            println!("{}", alert.message); // deliver however you like
+        }
+        // tick.snapshot / tick.process_stats drive the views;
+        // tick.records are already persisted
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+```
+
+See `examples/embedded.rs` (`cargo run --example embedded`) for the full
+skeleton, including reading history back for charts.
 
 With the `client` feature, any frontend can attach to a running
 `zstats serve` daemon and receive typed snapshots — buffered history

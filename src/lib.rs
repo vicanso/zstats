@@ -94,7 +94,7 @@ pub use scheduler::Scheduler;
 #[cfg(feature = "runtime")]
 pub use sink::{LocalChannelSink, MetricSink, StdoutSink};
 pub use snapshot::{
-    BatterySnapshot, CpuSnapshot, DiskSnapshot, HostInfo, LoadSnapshot, MemorySnapshot,
-    NetworkSnapshot, PerfLevelSnapshot, ProcessGroupSnapshot, ProcessSnapshot, SystemSnapshot,
-    TemperatureSnapshot,
+    BatterySnapshot, CpuSnapshot, DiskSnapshot, HostInfo, IoTotalsSnapshot, LoadSnapshot,
+    MemorySnapshot, NetworkSnapshot, PerfLevelSnapshot, ProcessGroupSnapshot, ProcessSnapshot,
+    SystemSnapshot, TemperatureSnapshot,
 };

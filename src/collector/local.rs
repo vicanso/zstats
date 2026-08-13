@@ -28,9 +28,9 @@ use crate::collector::Collector;
 use crate::config::CollectorConfig;
 use crate::error::CollectError;
 use crate::snapshot::{
-    BatterySnapshot, CpuSnapshot, DiskSnapshot, HostInfo, LoadSnapshot, MemorySnapshot,
-    NetworkSnapshot, PerfLevelSnapshot, ProcessGroupSnapshot, ProcessSnapshot, SystemSnapshot,
-    TemperatureSnapshot,
+    BatterySnapshot, CpuSnapshot, DiskSnapshot, HostInfo, IoTotalsSnapshot, LoadSnapshot,
+    MemorySnapshot, NetworkSnapshot, PerfLevelSnapshot, ProcessGroupSnapshot, ProcessSnapshot,
+    SystemSnapshot, TemperatureSnapshot,
 };
 use crate::utils::rate::rate_per_sec;
 
@@ -236,8 +236,19 @@ impl LocalCollector {
         } else {
             Vec::new()
         };
-        // Some platforms report no frequency (0); map that to None uniformly
-        let frequency_mhz = cpus.iter().map(|c| c.frequency()).find(|f| *f > 0);
+        // Frequencies refresh on a slow cadence with usage; 0 means unknown
+        let per_core_frequency_mhz: Vec<u64> = cpus.iter().map(|c| c.frequency()).collect();
+        let frequency_mhz = per_core_frequency_mhz.iter().copied().find(|f| *f > 0);
+        let per_core_frequency_mhz = if frequency_mhz.is_some() {
+            per_core_frequency_mhz
+        } else {
+            Vec::new()
+        };
+        let brand = cpus
+            .iter()
+            .map(|c| c.brand().trim())
+            .find(|b| !b.is_empty())
+            .map(|b| b.to_string());
 
         CpuSnapshot {
             usage_percent: self.system.global_cpu_usage(),
@@ -245,18 +256,26 @@ impl LocalCollector {
             logical_cores: cpus.len() as u32,
             physical_cores: System::physical_core_count().map(|n| n as u32),
             frequency_mhz,
+            per_core_frequency_mhz,
+            brand,
             perf_levels,
         }
     }
 
     fn collect_memory(&self) -> MemorySnapshot {
         let (compressed_bytes, pressure_level) = memory_pressure();
+        let total_bytes = self.system.total_memory();
+        let used_bytes = self.system.used_memory();
+        let swap_total_bytes = self.system.total_swap();
+        let swap_used_bytes = self.system.used_swap();
         MemorySnapshot {
-            total_bytes: self.system.total_memory(),
-            used_bytes: self.system.used_memory(),
+            total_bytes,
+            used_bytes,
             available_bytes: self.system.available_memory(),
-            swap_total_bytes: self.system.total_swap(),
-            swap_used_bytes: self.system.used_swap(),
+            swap_total_bytes,
+            swap_used_bytes,
+            used_percent: ratio_percent(used_bytes, total_bytes),
+            swap_used_percent: ratio_percent(swap_used_bytes, swap_total_bytes),
             compressed_bytes,
             pressure_level,
         }
@@ -321,14 +340,18 @@ impl LocalCollector {
                 };
 
             counters.insert(key, current);
+            let total_bytes = disk.total_space();
+            let available_bytes = disk.available_space();
+            let used_bytes = total_bytes.saturating_sub(available_bytes);
             snapshots.push(DiskSnapshot {
                 name,
                 mount_point,
                 file_system: disk.file_system().to_string_lossy().to_string(),
                 kind: disk.kind().to_string(),
                 is_removable: disk.is_removable(),
-                total_bytes: disk.total_space(),
-                available_bytes: disk.available_space(),
+                total_bytes,
+                available_bytes,
+                used_percent: ratio_percent(used_bytes, total_bytes),
                 read_bytes_per_sec,
                 write_bytes_per_sec,
             });
@@ -513,6 +536,9 @@ impl LocalCollector {
                     .collect::<Vec<_>>()
                     .join(" "),
                 cpu_usage_percent: p.cpu_usage(),
+                // Free: sysinfo fills this from the same task_info call
+                // that produces cpu_usage, under the same refresh kind
+                cpu_time_ms: p.accumulated_cpu_time(),
                 memory_bytes: p.memory(),
                 virtual_memory_bytes: p.virtual_memory(),
                 run_time_secs: p.run_time(),
@@ -704,6 +730,66 @@ impl LocalCollector {
 /// Reject NaN/inf and firmware garbage outside a sane silicon/ambient range
 fn is_plausible_celsius(t: f32) -> bool {
     t.is_finite() && (TEMP_CELSIUS_MIN..=TEMP_CELSIUS_MAX).contains(&t)
+}
+
+/// `used / total * 100`, or 0 when total is zero
+fn ratio_percent(used: u64, total: u64) -> f32 {
+    if total == 0 {
+        0.0
+    } else {
+        (used as f64 / total as f64 * 100.0) as f32
+    }
+}
+
+/// Sum optional rates: None when every input is None (or the list is empty /
+/// missing); otherwise the sum of present values (missing treated as 0 once
+/// at least one rate is known).
+fn sum_optional_rates<'a>(rates: impl IntoIterator<Item = Option<&'a u64>>) -> Option<u64> {
+    let mut any = false;
+    let mut sum = 0u64;
+    for &v in rates.into_iter().flatten() {
+        any = true;
+        sum = sum.saturating_add(v);
+    }
+    any.then_some(sum)
+}
+
+fn io_totals_from(
+    disks: Option<&[DiskSnapshot]>,
+    networks: Option<&[NetworkSnapshot]>,
+) -> IoTotalsSnapshot {
+    let (disk_read_bytes_per_sec, disk_write_bytes_per_sec) = match disks {
+        Some(disks) => (
+            sum_optional_rates(disks.iter().map(|d| d.read_bytes_per_sec.as_ref())),
+            sum_optional_rates(disks.iter().map(|d| d.write_bytes_per_sec.as_ref())),
+        ),
+        None => (None, None),
+    };
+    let (network_received_bytes_per_sec, network_transmitted_bytes_per_sec) = match networks {
+        // Network rates are plain u64 (0 on the first sample), so a present
+        // list always yields a total — including 0 on the baseline frame
+        Some(networks) => (
+            Some(
+                networks
+                    .iter()
+                    .map(|n| n.received_bytes_per_sec)
+                    .fold(0u64, u64::saturating_add),
+            ),
+            Some(
+                networks
+                    .iter()
+                    .map(|n| n.transmitted_bytes_per_sec)
+                    .fold(0u64, u64::saturating_add),
+            ),
+        ),
+        None => (None, None),
+    };
+    IoTotalsSnapshot {
+        disk_read_bytes_per_sec,
+        disk_write_bytes_per_sec,
+        network_received_bytes_per_sec,
+        network_transmitted_bytes_per_sec,
+    }
 }
 
 /// Whether overall load (in logical-core units) should force a process
@@ -989,19 +1075,24 @@ impl Collector for LocalCollector {
                     .is_none_or(|t| t.elapsed() >= self.config.process_refresh_interval));
         let process_elapsed = self.refresh_process_table(processes_due);
 
+        let disks = self.collect_disks();
+        let networks = self.collect_networks();
+        let io_totals = io_totals_from(disks.as_deref(), networks.as_deref());
+
         Ok(SystemSnapshot {
             timestamp: Timestamp::now(),
             host: self.collect_host(),
             cpu: self.collect_cpu(),
             memory: self.collect_memory(),
-            disks: self.collect_disks(),
-            networks: self.collect_networks(),
+            disks,
+            networks,
             processes: self.collect_processes(processes_due, process_elapsed),
             process_groups: self.collect_process_groups(processes_due, process_elapsed),
             total_processes: self.collect_total_processes(),
             battery: self.collect_battery(),
             load: self.collect_load(),
             temperatures: self.collect_temperatures(),
+            io_totals,
             extras: HashMap::new(),
         })
     }
@@ -1181,6 +1272,7 @@ mod tests {
                 is_removable: false,
                 total_bytes: 100,
                 available_bytes: 40,
+                used_percent: 60.0,
                 read_bytes_per_sec: Some(1),
                 write_bytes_per_sec: Some(2),
             },
@@ -1192,6 +1284,7 @@ mod tests {
                 is_removable: false,
                 total_bytes: 100,
                 available_bytes: 40,
+                used_percent: 60.0,
                 read_bytes_per_sec: Some(3),
                 write_bytes_per_sec: Some(4),
             },
@@ -1203,6 +1296,7 @@ mod tests {
                 is_removable: true,
                 total_bytes: 50,
                 available_bytes: 10,
+                used_percent: 80.0,
                 read_bytes_per_sec: None,
                 write_bytes_per_sec: None,
             },
@@ -1213,5 +1307,68 @@ mod tests {
         assert_eq!(d0.mount_point, "/");
         assert_eq!(d0.read_bytes_per_sec, Some(3));
         assert!(out.iter().any(|d| d.name == "disk1"));
+    }
+
+    #[test]
+    fn ratio_percent_handles_zero_total() {
+        assert!((ratio_percent(50, 100) - 50.0).abs() < f32::EPSILON);
+        assert_eq!(ratio_percent(1, 0), 0.0);
+        assert_eq!(ratio_percent(0, 0), 0.0);
+    }
+
+    #[test]
+    fn io_totals_sums_known_rates() {
+        let disks = [
+            DiskSnapshot {
+                name: "a".into(),
+                mount_point: "/".into(),
+                file_system: "apfs".into(),
+                kind: "SSD".into(),
+                is_removable: false,
+                total_bytes: 1,
+                available_bytes: 0,
+                used_percent: 100.0,
+                read_bytes_per_sec: Some(10),
+                write_bytes_per_sec: Some(20),
+            },
+            DiskSnapshot {
+                name: "b".into(),
+                mount_point: "/data".into(),
+                file_system: "apfs".into(),
+                kind: "SSD".into(),
+                is_removable: false,
+                total_bytes: 1,
+                available_bytes: 0,
+                used_percent: 100.0,
+                read_bytes_per_sec: Some(5),
+                write_bytes_per_sec: None,
+            },
+        ];
+        let nets = [
+            NetworkSnapshot {
+                interface: "en0".into(),
+                received_bytes_per_sec: 100,
+                transmitted_bytes_per_sec: 50,
+                received_packets_per_sec: None,
+                transmitted_packets_per_sec: None,
+                received_errors_per_sec: None,
+                transmitted_errors_per_sec: None,
+            },
+            NetworkSnapshot {
+                interface: "lo0".into(),
+                received_bytes_per_sec: 3,
+                transmitted_bytes_per_sec: 3,
+                received_packets_per_sec: None,
+                transmitted_packets_per_sec: None,
+                received_errors_per_sec: None,
+                transmitted_errors_per_sec: None,
+            },
+        ];
+        let totals = io_totals_from(Some(&disks), Some(&nets));
+        assert_eq!(totals.disk_read_bytes_per_sec, Some(15));
+        assert_eq!(totals.disk_write_bytes_per_sec, Some(20));
+        assert_eq!(totals.network_received_bytes_per_sec, Some(103));
+        assert_eq!(totals.network_transmitted_bytes_per_sec, Some(53));
+        assert!(io_totals_from(None, None).disk_read_bytes_per_sec.is_none());
     }
 }

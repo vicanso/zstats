@@ -71,6 +71,25 @@ pub struct MetricRecord {
     pub memory_avg_bytes: u64,
     /// `memory_avg_bytes` as a percentage of total memory
     pub memory_share_percent: f32,
+    /// The process's LIFETIME CPU counter at this sample, in single-core
+    /// milliseconds — an absolute value, not this window's share.
+    ///
+    /// Answers "what actually burned the CPU today", which neither an
+    /// average nor a peak can: a steady 8% outspends a ten-minute 100%
+    /// spike several times over while never looking alarming in any one
+    /// sample. Subtract one pid's earliest record of the day from its
+    /// latest to get exactly what it consumed in between.
+    ///
+    /// Storing the counter rather than a per-window delta is deliberate:
+    /// a process is only recorded on the minutes it qualifies, so
+    /// summing deltas would silently undercount everything that drifts
+    /// in and out of the selection — whereas differencing a cumulative
+    /// counter stays exact across any gap. A DECREASE for a given pid
+    /// means the pid was reused by a new process; treat the two sides as
+    /// unrelated. Absent from files written before this field existed,
+    /// where it reads 0
+    #[serde(default)]
+    pub cpu_time_ms: u64,
 }
 
 /// Where the daily files live: `<config_dir>/data`
@@ -189,6 +208,7 @@ mod tests {
             cpu_avg_percent: 50.0,
             memory_avg_bytes: 1024,
             memory_share_percent: 10.0,
+            cpu_time_ms: 30_000,
         }
     }
 

@@ -74,9 +74,29 @@ pub struct SystemSnapshot {
     #[serde(default)]
     pub temperatures: Option<Vec<TemperatureSnapshot>>,
 
+    /// Machine-wide disk and network byte rates, summed from the per-device
+    /// lists after collection (and after disk dedupe when enabled). Pure
+    /// aggregation — no extra system calls. Fields are None when the
+    /// subsystem is disabled or rates are not yet available (first sample).
+    #[serde(default)]
+    pub io_totals: IoTotalsSnapshot,
+
     /// Extension fields (reserved)
     #[serde(default)]
     pub extras: HashMap<String, serde_json::Value>,
+}
+
+/// Summed disk/network throughput for the whole machine.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct IoTotalsSnapshot {
+    #[serde(default)]
+    pub disk_read_bytes_per_sec: Option<u64>,
+    #[serde(default)]
+    pub disk_write_bytes_per_sec: Option<u64>,
+    #[serde(default)]
+    pub network_received_bytes_per_sec: Option<u64>,
+    #[serde(default)]
+    pub network_transmitted_bytes_per_sec: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -147,8 +167,17 @@ pub struct CpuSnapshot {
     /// Number of physical cores (if available)
     pub physical_cores: Option<u32>,
     /// Current frequency (MHz, optional). Refreshed on a slower cadence
-    /// than usage; may lag a few tens of seconds.
+    /// than usage; may lag a few tens of seconds. First non-zero core
+    /// frequency when available (see also `per_core_frequency_mhz`).
     pub frequency_mhz: Option<u64>,
+    /// Per-core frequency in MHz (0 when the platform does not report one
+    /// for that core). Same length as logical cores when any frequency is
+    /// known; empty otherwise. Refreshed with `frequency_mhz`.
+    #[serde(default)]
+    pub per_core_frequency_mhz: Vec<u64>,
+    /// CPU brand string from the OS (e.g. "Apple M3 Pro"), when available
+    #[serde(default)]
+    pub brand: Option<String>,
     /// Per-performance-level usage (heterogeneous CPUs, e.g. Apple
     /// Silicon P/E clusters), highest-performance level first. None when
     /// the platform reports fewer than two levels
@@ -163,6 +192,12 @@ pub struct MemorySnapshot {
     pub available_bytes: u64,
     pub swap_total_bytes: u64,
     pub swap_used_bytes: u64,
+    /// `used_bytes / total_bytes * 100` (0 when total is 0)
+    #[serde(default)]
+    pub used_percent: f32,
+    /// `swap_used_bytes / swap_total_bytes * 100` (0 when no swap)
+    #[serde(default)]
+    pub swap_used_percent: f32,
     /// Bytes held by the OS memory compressor (macOS). Growth here is the
     /// first sign of real memory pressure — long before "used" looks bad.
     /// None on platforms without a compressor metric
@@ -188,6 +223,9 @@ pub struct DiskSnapshot {
     pub is_removable: bool,
     pub total_bytes: u64,
     pub available_bytes: u64,
+    /// Capacity used: `(total - available) / total * 100` (0 when total is 0)
+    #[serde(default)]
+    pub used_percent: f32,
     /// Read/write byte rates since the last sample (computed by diffing
     /// inside the Collector; None on the first sample)
     pub read_bytes_per_sec: Option<u64>,
@@ -214,6 +252,19 @@ pub struct ProcessSnapshot {
     pub name: String,
     pub cmd: String,
     pub cpu_usage_percent: f32,
+    /// Total CPU time consumed since the process started, in single-core
+    /// milliseconds (2000 = two core-seconds). A COUNTER, not a rate:
+    /// diff two samples to get what was burned in between.
+    ///
+    /// This is the field that makes "quietly 10% for twelve hours"
+    /// visible. `cpu_usage_percent` never crosses any threshold there,
+    /// but the integral does: 10% for 12h is 1.2 core-hours — seven
+    /// times what a process pegged at 100% for ten minutes costs, and
+    /// the latter is the one that alerts today. Counts only time
+    /// actually spent running, so system sleep and the collector's own
+    /// cadence cannot distort it.
+    #[serde(default)]
+    pub cpu_time_ms: u64,
     pub memory_bytes: u64,
     /// Virtual address space size (when available)
     #[serde(default)]

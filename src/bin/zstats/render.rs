@@ -240,6 +240,13 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
         .frequency_mhz
         .map(|f| format!(" @ {f} MHz"))
         .unwrap_or_default();
+    let brand = s
+        .cpu
+        .brand
+        .as_deref()
+        .filter(|b| !b.is_empty())
+        .map(|b| format!("  {b}"))
+        .unwrap_or_default();
     // P/E cluster split on heterogeneous CPUs, e.g. "P8 12% · E4 31%"
     let levels = s
         .cpu
@@ -262,19 +269,16 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
         .unwrap_or_default();
     let _ = writeln!(
         out,
-        "CPU   {}  {:>5.1}%  {} cores{}{}",
+        "CPU   {}  {:>5.1}%  {} cores{}{}{}",
         styled_gauge(f64::from(s.cpu.usage_percent) / 100.0, GAUGE_WIDTH, theme),
         s.cpu.usage_percent,
         s.cpu.logical_cores,
         freq,
+        brand,
         levels,
     );
 
-    let mem_fraction = if s.memory.total_bytes > 0 {
-        s.memory.used_bytes as f64 / s.memory.total_bytes as f64
-    } else {
-        0.0
-    };
+    let mem_fraction = f64::from(s.memory.used_percent) / 100.0;
     // Compressor footprint + the kernel's pressure verdict: growth there
     // is the real "memory is tight" signal on macOS, not used%
     let mut mem_extra = String::new();
@@ -296,18 +300,18 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
         out,
         "MEM   {}  {:>5.1}%  {} / {}{mem_extra}",
         styled_gauge(mem_fraction, GAUGE_WIDTH, theme),
-        mem_fraction * 100.0,
+        s.memory.used_percent,
         human_bytes(s.memory.used_bytes),
         human_bytes(s.memory.total_bytes),
     );
 
     if s.memory.swap_total_bytes > 0 {
-        let swap_fraction = s.memory.swap_used_bytes as f64 / s.memory.swap_total_bytes as f64;
+        let swap_fraction = f64::from(s.memory.swap_used_percent) / 100.0;
         let _ = writeln!(
             out,
             "SWP   {}  {:>5.1}%  {} / {}",
             styled_gauge(swap_fraction, GAUGE_WIDTH, theme),
-            swap_fraction * 100.0,
+            s.memory.swap_used_percent,
             human_bytes(s.memory.swap_used_bytes),
             human_bytes(s.memory.swap_total_bytes),
         );
@@ -404,16 +408,28 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
         }
     }
 
+    // Machine-wide disk/net rates (pure sums of the per-device lists)
+    let io = &s.io_totals;
+    if io.disk_read_bytes_per_sec.is_some()
+        || io.disk_write_bytes_per_sec.is_some()
+        || io.network_received_bytes_per_sec.is_some()
+        || io.network_transmitted_bytes_per_sec.is_some()
+    {
+        let _ = writeln!(
+            out,
+            "IO    disk {}↓ {}↑  ·  net {}↓ {}↑",
+            human_rate(io.disk_read_bytes_per_sec),
+            human_rate(io.disk_write_bytes_per_sec),
+            human_rate(io.network_received_bytes_per_sec),
+            human_rate(io.network_transmitted_bytes_per_sec),
+        );
+    }
+
     if let Some(disks) = &s.disks {
         let rows: Vec<Vec<String>> = disks
             .iter()
             .map(|d| {
-                let used = d.total_bytes.saturating_sub(d.available_bytes);
-                let fraction = if d.total_bytes > 0 {
-                    used as f64 / d.total_bytes as f64
-                } else {
-                    0.0
-                };
+                let fraction = f64::from(d.used_percent) / 100.0;
                 // Highlight disks over 90% usage in bold red
                 let color = level_color(fraction, 0.7, 0.9);
                 let kind = if d.kind.is_empty() {
@@ -425,7 +441,7 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
                     d.mount_point.clone(),
                     kind,
                     theme.paint(color, &gauge(fraction, DISK_GAUGE_WIDTH)),
-                    theme.paint(color, &format!("{:.1}%", fraction * 100.0)),
+                    theme.paint(color, &format!("{:.1}%", d.used_percent)),
                     human_bytes(d.available_bytes),
                     human_bytes(d.total_bytes),
                     human_rate(d.read_bytes_per_sec),
@@ -903,6 +919,7 @@ TOP   NAME            MEM
             name: format!("p{pid}"),
             cmd: String::new(),
             cpu_usage_percent: cpu,
+            cpu_time_ms: 0,
             memory_bytes: mem,
             virtual_memory_bytes: mem,
             run_time_secs: 0,

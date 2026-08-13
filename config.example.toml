@@ -155,9 +155,11 @@ template = true
 # rule for that process only. Overrides silence the notification but the
 # data point is still recorded in <config-dir>/data/.
 #
-# Only LONG-RUNNING apps need overrides: short-lived bursts (a single
-# rustc, an ffmpeg one-shot) exit before the 50s alert window fills and
-# never notify anyway.
+# Only processes that can outlive the 50s alert window need overrides —
+# anything shorter never notifies anyway. The dividing line for 0 is WHO
+# ASKED: you typed the build command, so a busy compiler tells you
+# nothing, while a background indexer pegged for minutes is a real
+# failure and keeps a raised bar instead of an exemption.
 #
 # The list below IS BUILT IN as the template (default on, see above) —
 # it is reproduced here as reference only; uncommenting an entry makes it
@@ -199,7 +201,10 @@ template = true
 # sourcekit-lsp = 100.0
 # Xcode = 200.0
 # SourceKitService = 200.0                    # Xcode indexing eats cores
-# swift-frontend = 200.0
+# swift-frontend = 200.0                      # 200 not 0: this one name covers
+#                                             #   builds AND background indexing
+# XCBBuildService = 200.0                     # Xcode's build orchestrator
+# XCPreviewAgent = 200.0                      # SwiftUI Previews rebuild in a loop
 # idea = 200.0                                # JetBrains IDEs run under their
 # goland = 200.0                              #   own binary name (pycharm,
 # clion = 200.0                               #   webstorm, ... same story)
@@ -211,6 +216,13 @@ template = true
 # qemu-system-aarch64 = 200.0                 # UTM / Lima / colima
 # prl_vm_app = 200.0                          # Parallels
 # vmware-vmx = 200.0
+
+# --- iOS Simulator
+# Simulator = 100.0                           # renders the device screen
+# "com.apple.CoreSimulator.CoreSimulatorService" = 100.0
+#   ...deliberately NOT 0: a wedged CoreSimulatorService spinning at a full
+#   core with no simulator running is a known Xcode failure, and the fix is
+#   to kill it — one of the few genuinely actionable alerts here
 
 # --- terminals rendering streaming AI output, and the AI CLIs themselves
 # ghostty = 100.0
@@ -225,6 +237,35 @@ template = true
 # "Microsoft Teams" = 100.0
 # TencentMeeting = 100.0
 # avconferenced = 100.0                       # FaceTime's encoder
+
+# --- toolchains: a build is supposed to saturate cores
+# rustc = 0.0                                 # LTO / codegen-units=1 easily
+# cargo = 0.0                                 #   outlives the 50s window
+# clippy-driver = 0.0
+# rustdoc = 0.0
+# clang = 0.0
+# "clang++" = 0.0
+# cc1plus = 0.0                               # gcc's C++ compiler proper
+# gcc = 0.0
+# "g++" = 0.0
+# ld = 0.0                                    # link steps are single-threaded
+# lld = 0.0                                   #   and long on big binaries
+# make = 0.0
+# cmake = 0.0
+# ninja = 0.0
+# go = 0.0
+# esbuild = 0.0
+# git = 0.0                                   # auto-gc / repack on a big repo
+# xcodebuild = 0.0                            # Xcode's build-time tools
+# swift-driver = 0.0
+# actool = 0.0                                # asset catalogs on a big app
+# ibtool = 0.0
+# ibtoold = 0.0
+# dsymutil = 0.0                              # DWARF linking: single-threaded
+# ld-classic = 0.0                            #   and long after an archive
+# NOTE tsc, gradle, webpack etc. are deliberately ABSENT: they run under
+# node/java, and overriding those names would silence half the real
+# runaways (see the note at the end of this section)
 
 # --- long jobs you started yourself: never actionable, history only
 # OBS = 0.0                                   # streaming / recording
@@ -286,8 +327,12 @@ template = true
 # "com.docker.backend" = 0.0
 # "Google Chrome" = 400.0
 # zed = 400.0
+# Simulator = 400.0                           # a booted simulator is a whole
+# "com.apple.CoreSimulator.CoreSimulatorService" = 400.0    # device's daemons
 
 [alerts.app_mem_overrides]
 # login = 0.0
 # "Google Chrome" = 60.0
 # Xcode = 60.0
+# Simulator = 60.0
+# "com.apple.CoreSimulator.CoreSimulatorService" = 60.0

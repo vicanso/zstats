@@ -363,6 +363,8 @@ mod tests {
                 logical_cores: 0,
                 physical_cores: None,
                 frequency_mhz: None,
+                per_core_frequency_mhz: Vec::new(),
+                brand: None,
                 perf_levels: None,
             },
             memory: MemorySnapshot {
@@ -371,6 +373,8 @@ mod tests {
                 available_bytes: 0,
                 swap_total_bytes: 0,
                 swap_used_bytes: 0,
+                used_percent: 0.0,
+                swap_used_percent: 0.0,
                 compressed_bytes: None,
                 pressure_level: None,
             },
@@ -386,6 +390,7 @@ mod tests {
                 load15: 0.0,
             },
             temperatures: None,
+            io_totals: Default::default(),
             extras: Default::default(),
         }
     }

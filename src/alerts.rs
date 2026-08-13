@@ -82,6 +82,21 @@ const SLOW_MIN_SPAN: Duration = Duration::from_secs(MIN_SPAN.as_secs() * SLOW_FA
 const ACUTE_FACTOR: f64 = 3.0;
 /// How often qualifying processes are reported as metric records
 const RECORD_EVERY: Duration = Duration::from_secs(60);
+/// Additionally record this many processes per pass purely for having
+/// consumed the most CPU TIME in the last window, whatever their
+/// percentages.
+///
+/// This is the only recording criterion that can see a process no
+/// threshold will ever catch. Every rule in this file compares an
+/// average against a bar, which structurally cannot notice a process
+/// sitting at a steady 8% — yet twelve hours of that is 1 core-hour,
+/// several times what a ten-minute runaway costs. Rules stay
+/// threshold-based on purpose (a low-bar-long-window rule would fire on
+/// every legitimate resident daemon, and a 12-hour window rarely even
+/// completes on a laptop); the answer is to keep the DATA so the
+/// question can be asked afterwards, which is the same
+/// interruption-versus-history split the overrides already follow
+const RECORD_TOP_CPU_TIME: usize = 5;
 /// A condition still true this long after it first notified earns one
 /// follow-up — insurance against the first notification being missed,
 /// well clear of the cooldown so it can never feel like nagging
@@ -108,13 +123,18 @@ const DISK_REARM_MARGIN: f64 = 0.05;
 /// high CPU in normal use. Applied below the user's own overrides (a
 /// same-name user entry always wins) unless `[alerts] template = false`.
 ///
-/// Only long-running apps qualify — short-lived bursts (a single rustc)
-/// exit before the alert window fills and never notify anyway. Values:
-/// 100 = "interrupt me only at a full core" (interactive apps), 200 =
-/// "multi-core is its job" (IDE indexers, VM/container hosts), 0 =
-/// "never interrupt, still record" (self-started long jobs and periodic
-/// macOS system work). Keep the reference copy in `config.example.toml`
-/// in sync with this list.
+/// Only processes that can outlive the 50s window qualify — a burst that
+/// exits sooner never notifies anyway. Values: 100 = "interrupt me only
+/// at a full core" (interactive apps), 200 = "multi-core is its job" (IDE
+/// indexers, VM/container hosts), 0 = "never interrupt, still record"
+/// (work you started yourself and periodic macOS system work).
+///
+/// The dividing line for 0 is WHO ASKED, not how much CPU it uses: you
+/// typed the build command, so "your compiler is compiling" tells you
+/// nothing you did not know, while a background indexer pegged for
+/// minutes is a real (and common) failure worth a raised bar instead.
+/// Keep the reference copy in `config.example.toml` in sync with this
+/// list.
 pub const TEMPLATE_CPU_OVERRIDES: &[(&str, f32)] = &[
     // Browsers: page loads / video / heavy-JS sites run for minutes
     ("Google Chrome", 100.0),
@@ -151,7 +171,13 @@ pub const TEMPLATE_CPU_OVERRIDES: &[(&str, f32)] = &[
     ("sourcekit-lsp", 100.0),
     ("Xcode", 200.0),
     ("SourceKitService", 200.0),
+    // Deliberately 200 rather than 0 despite being a compiler: this one
+    // name serves both the build you started AND Xcode's background
+    // indexing, and the indexing half is worth a raised bar
     ("swift-frontend", 200.0),
+    ("XCBBuildService", 200.0),
+    // SwiftUI Previews rebuild in a loop while the canvas is open
+    ("XCPreviewAgent", 200.0),
     ("idea", 200.0),
     ("goland", 200.0),
     ("clion", 200.0),
@@ -162,6 +188,14 @@ pub const TEMPLATE_CPU_OVERRIDES: &[(&str, f32)] = &[
     ("qemu-system-aarch64", 200.0),
     ("prl_vm_app", 200.0),
     ("vmware-vmx", 200.0),
+    // iOS Simulator: the app renders the device screen, so a busy
+    // simulated app keeps it near a core. Deliberately NOT 0 for the
+    // CoreSimulator service — a wedged one spinning at a full core with
+    // no simulator running is a well-known Xcode failure whose fix is to
+    // kill it, which makes it one of the few genuinely actionable alerts
+    // in this whole table
+    ("Simulator", 100.0),
+    ("com.apple.CoreSimulator.CoreSimulatorService", 100.0),
     // Terminals rendering streaming AI output, and the AI CLIs themselves
     ("ghostty", 100.0),
     ("iTerm2", 100.0),
@@ -174,6 +208,43 @@ pub const TEMPLATE_CPU_OVERRIDES: &[(&str, f32)] = &[
     ("Microsoft Teams", 100.0),
     ("TencentMeeting", 100.0),
     ("avconferenced", 100.0),
+    // Toolchains: a build is SUPPOSED to saturate cores, and "your
+    // compiler is compiling" is never actionable. Most invocations are
+    // far too short to fill the window; the ones that do are exactly the
+    // ones you are already waiting on (LTO codegen, a link step, one
+    // enormous translation unit). Note interpreted tools are absent on
+    // purpose — `tsc`, gradle and friends run under `node`/`java`, and
+    // those names are half the real runaways
+    ("rustc", 0.0),
+    ("cargo", 0.0),
+    ("clippy-driver", 0.0),
+    ("rustdoc", 0.0),
+    ("clang", 0.0),
+    ("clang++", 0.0),
+    ("cc1plus", 0.0),
+    ("gcc", 0.0),
+    ("g++", 0.0),
+    ("ld", 0.0),
+    ("lld", 0.0),
+    ("make", 0.0),
+    ("cmake", 0.0),
+    ("ninja", 0.0),
+    ("go", 0.0),
+    ("esbuild", 0.0),
+    // Xcode's build-time tools (names verified against Xcode.app, not
+    // guessed from menu titles). dsymutil and the linkers are
+    // single-threaded and long — the classic "why is the fan on after an
+    // archive"
+    ("xcodebuild", 0.0),
+    ("swift-driver", 0.0),
+    ("actool", 0.0),
+    ("ibtool", 0.0),
+    ("ibtoold", 0.0),
+    ("dsymutil", 0.0),
+    ("ld-classic", 0.0),
+    // Auto-gc / repack on a big repo pegs a core for minutes without
+    // anyone asking, and there is nothing to do about it either
+    ("git", 0.0),
     // Long jobs you started yourself: never actionable, history only
     ("OBS", 0.0),
     ("ffmpeg", 0.0),
@@ -231,6 +302,11 @@ pub const TEMPLATE_APP_CPU_OVERRIDES: &[(&str, f32)] = &[
     ("vmware-vmx", 0.0),
     // Editors and browsers fan out across many helpers; a few cores
     // during an index rebuild or a heavy page is normal
+    // A booted simulator is a whole device's worth of daemons. Which name
+    // roots the tree depends on who spawned launchd_sim, so both are
+    // listed; confirm against `zstats --json` with a simulator running
+    ("Simulator", 400.0),
+    ("com.apple.CoreSimulator.CoreSimulatorService", 400.0),
     ("Xcode", 400.0),
     ("idea", 400.0),
     ("goland", 400.0),
@@ -270,6 +346,9 @@ pub const TEMPLATE_APP_MEM_OVERRIDES: &[(&str, f64)] = &[
     ("firefox", 60.0),
     ("Safari", 60.0),
     ("Xcode", 60.0),
+    // A booted device image plus its daemons runs to several GiB
+    ("Simulator", 60.0),
+    ("com.apple.CoreSimulator.CoreSimulatorService", 60.0),
 ];
 
 /// Which rule produced an alert — the category a frontend groups,
@@ -722,7 +801,10 @@ impl AlertEngine {
     /// Memory has no acute tier by design: transient legitimate spikes
     /// are exactly what must not alert. Recording stays on the 1-minute
     /// window with BASE thresholds — an override or the template
-    /// suppresses the notification, not the data point
+    /// suppresses the notification, not the data point — plus the
+    /// window's [`RECORD_TOP_CPU_TIME`] biggest CPU-time spenders
+    /// regardless of any threshold, which is what keeps a permanently
+    /// low-but-nonzero process from being invisible
     pub fn evaluate(
         &mut self,
         now: Instant,
@@ -828,6 +910,12 @@ impl AlertEngine {
                     name: g.name.clone(),
                     cmd: String::new(),
                     cpu_usage_percent: g.cpu_usage_percent,
+                    // Groups carry no CPU-time counter on purpose: their
+                    // membership churns, so a summed counter would drop
+                    // whenever a helper exits and the "diff two samples"
+                    // contract would break. The app rules only use the
+                    // averages anyway
+                    cpu_time_ms: 0,
                     memory_bytes: g.memory_bytes,
                     virtual_memory_bytes: 0,
                     run_time_secs: 0,
@@ -923,6 +1011,22 @@ impl AlertEngine {
             .get_or_insert_with(|| ProcessWindows::new(SLOW_WINDOW))
             .record(now, processes);
 
+        // The biggest CPU-time spenders of this window get recorded no
+        // matter what their percentages look like — see RECORD_TOP_CPU_TIME
+        let top_cpu_time: std::collections::HashSet<u32> = if record_due {
+            let mut ranked: Vec<(u32, u64)> = fast_stats
+                .iter()
+                .filter(|(_, s)| s.span >= MIN_SPAN && s.cpu_time_delta_ms > 0)
+                .map(|(pid, s)| (*pid, s.cpu_time_delta_ms))
+                .collect();
+            // Ties broken by pid so a run is reproducible
+            ranked.sort_unstable_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            ranked.truncate(RECORD_TOP_CPU_TIME);
+            ranked.into_iter().map(|(pid, _)| pid).collect()
+        } else {
+            std::collections::HashSet::new()
+        };
+
         // Forget cooldowns of processes that disappeared — but only the
         // per-process ones: an app group is keyed by its ROOT pid, which
         // need not appear in the top-N process list at all, and wiping
@@ -1002,7 +1106,8 @@ impl AlertEngine {
                 }
             }
 
-            // Metrics recording: 1-minute window, BASE thresholds only
+            // Metrics recording: 1-minute window, BASE thresholds only,
+            // plus the window's top CPU-time spenders unconditionally
             if record_due && fast.span >= MIN_SPAN {
                 let over_cpu = active
                     .cpu
@@ -1011,7 +1116,7 @@ impl AlertEngine {
                 let over_mem = active.memory.base().is_some_and(|fraction| {
                     total_memory > 0 && mem_share(fast.memory_avg_bytes) >= fraction
                 });
-                if over_cpu || over_mem {
+                if over_cpu || over_mem || top_cpu_time.contains(&p.pid) {
                     evaluation.records.push(MetricRecord {
                         timestamp: snapshot.timestamp,
                         pid: p.pid,
@@ -1019,6 +1124,11 @@ impl AlertEngine {
                         cpu_avg_percent: fast.cpu_avg as f32,
                         memory_avg_bytes: fast.memory_avg_bytes as u64,
                         memory_share_percent: (mem_share(fast.memory_avg_bytes) * 100.0) as f32,
+                        // The raw counter, not the window's delta: the
+                        // selection above is a per-minute ranking, but
+                        // the FILE has to stay exact for a pid that only
+                        // qualifies on some minutes — see MetricRecord
+                        cpu_time_ms: p.cpu_time_ms,
                     });
                 }
             }
@@ -1135,12 +1245,20 @@ mod tests {
     use super::*;
     use crate::snapshot::{CpuSnapshot, HostInfo, LoadSnapshot, MemorySnapshot, ProcessSnapshot};
 
+    /// A process with no CPU-time counter, so it can never qualify for
+    /// the top-spender recording — every threshold test stays about
+    /// thresholds alone
     fn proc(pid: u32, cpu: f32, mem: u64) -> ProcessSnapshot {
+        proc_burning(pid, cpu, mem, 0)
+    }
+
+    fn proc_burning(pid: u32, cpu: f32, mem: u64, cpu_time_ms: u64) -> ProcessSnapshot {
         ProcessSnapshot {
             pid,
             name: format!("p{pid}"),
             cmd: String::new(),
             cpu_usage_percent: cpu,
+            cpu_time_ms,
             memory_bytes: mem,
             virtual_memory_bytes: mem,
             run_time_secs: 0,
@@ -1170,6 +1288,8 @@ mod tests {
                 logical_cores: 0,
                 physical_cores: None,
                 frequency_mhz: None,
+                per_core_frequency_mhz: Vec::new(),
+                brand: None,
                 perf_levels: None,
             },
             memory: MemorySnapshot {
@@ -1178,6 +1298,8 @@ mod tests {
                 available_bytes: 0,
                 swap_total_bytes: 0,
                 swap_used_bytes: 0,
+                used_percent: 0.0,
+                swap_used_percent: 0.0,
                 compressed_bytes: None,
                 pressure_level: None,
             },
@@ -1193,6 +1315,7 @@ mod tests {
                 load15: 0.0,
             },
             temperatures: None,
+            io_totals: Default::default(),
             extras: Default::default(),
         }
     }
@@ -1214,6 +1337,12 @@ mod tests {
     }
 
     fn disk(mount: &str, total: u64, available: u64) -> crate::snapshot::DiskSnapshot {
+        let used = total.saturating_sub(available);
+        let used_percent = if total == 0 {
+            0.0
+        } else {
+            used as f32 / total as f32 * 100.0
+        };
         crate::snapshot::DiskSnapshot {
             name: "disk0".into(),
             mount_point: mount.into(),
@@ -1222,6 +1351,7 @@ mod tests {
             is_removable: false,
             total_bytes: total,
             available_bytes: available,
+            used_percent,
             read_bytes_per_sec: None,
             write_bytes_per_sec: None,
         }
@@ -1786,6 +1916,43 @@ mod tests {
         assert!(events.is_empty());
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].name, "ghostty");
+    }
+
+    /// The blind spot this criterion exists to close: a process that
+    /// never approaches a threshold, but quietly outspends everything
+    /// that does. No rule here can catch it — and nothing should
+    /// interrupt over it — but the data has to survive so the question
+    /// can be asked a day later
+    #[test]
+    fn steady_low_cpu_is_recorded_even_though_no_rule_can_fire() {
+        let active = thresholds(
+            Thresholds::new(Some(30.0)),
+            Thresholds::new(Some(0.25)),
+            Duration::from_secs(600),
+        );
+        let mut engine = AlertEngine::new();
+        let base = Instant::now();
+        let mut records = Vec::new();
+        let mut events = Vec::new();
+
+        // A rock-steady 10% (200 core-ms per 2s tick) on a process that
+        // has already been running a while — the counter is absolute
+        const ALREADY_BURNED: u64 = 1_000_000;
+        for i in 0..40u64 {
+            let now = base + Duration::from_secs(2 * i);
+            let p = proc_burning(1, 10.0, 5, ALREADY_BURNED + 200 * i);
+            let evaluation = engine.evaluate(now, &snapshot(vec![p], 100), &active);
+            events.extend(evaluation.events);
+            records.extend(evaluation.records);
+        }
+
+        assert!(events.is_empty(), "10% must never interrupt anyone");
+        assert_eq!(records.len(), 1, "one record per minute");
+        assert!((records[0].cpu_avg_percent - 10.0).abs() < 0.5);
+        // The lifetime counter, not the window's 6 core-seconds: only an
+        // absolute value stays exact for a pid recorded on some minutes
+        // and not others
+        assert_eq!(records[0].cpu_time_ms, ALREADY_BURNED + 200 * 30);
     }
 
     #[test]

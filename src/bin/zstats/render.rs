@@ -921,6 +921,7 @@ TOP   NAME            MEM
             cpu_usage_percent: cpu,
             cpu_time_ms: 0,
             memory_bytes: mem,
+            phys_footprint_bytes: None,
             virtual_memory_bytes: mem,
             run_time_secs: 0,
             parent_pid: None,

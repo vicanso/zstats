@@ -74,6 +74,15 @@ libc = { version = "0.2", optional = true }
 # Safe sysctl access (P/E core topology, memory pressure) — keeps the
 # library free of unsafe code (#![forbid(unsafe_code)])
 sysctl = "0.7.1"
+# Safe `proc_pid_rusage` for the per-process physical footprint. Same
+# rationale as `sysctl`: the FFI lives in the dependency, keeping
+# `forbid(unsafe_code)` intact. The cost is real and considered: libproc
+# generates its bindings with bindgen at build time, so macOS builds
+# need libclang — which the Xcode CLT that any macOS build already
+# requires does provide. The lighter `darwin-libproc` (hand-written
+# bindings, no bindgen) is unmaintained and pins `memchr ~2.3`, which
+# collides with sysinfo's `^2.5` — it cannot resolve in this tree.
+libproc = "0.14"
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time"] }

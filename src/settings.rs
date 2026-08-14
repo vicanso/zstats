@@ -56,6 +56,20 @@ pub fn config_path(dir: &Path) -> PathBuf {
     dir.join("config.toml")
 }
 
+/// The optional alert-template override inside a config directory.
+///
+/// Absent on a normal install — the compiled-in `templates/alerts.toml`
+/// is used. Dropping a file here REPLACES it wholesale (rather than
+/// layering, which would make a removed entry impossible to remove and
+/// turn three precedence levels into five). To ADD a single entry, use a
+/// user override — `zstats -add alert-cpu 'name=pct'` — which outranks
+/// either template anyway. Keeping it a plain file is what makes
+/// "refresh the table on a schedule" a one-line cron job (`curl -o`)
+/// instead of an HTTP client inside a local metrics collector
+pub fn template_path(dir: &Path) -> PathBuf {
+    dir.join("template.toml")
+}
+
 /// Which kernel memory-pressure verdict is worth a notification.
 ///
 /// A memory-heavy machine can sit at `warning` as its normal operating
@@ -211,6 +225,15 @@ fn parse<T: std::str::FromStr>(key: &str, value: &str) -> Result<T, String> {
         .map_err(|_| format!("invalid value for {key}: {value}"))
 }
 
+/// Reject an override key the matcher cannot honour, so a key that
+/// looks like a pattern is never silently stored as an exact name.
+/// A leading and/or trailing `*` is fine; anything else is not
+fn check_name_pattern(key: &str, name: &str) -> Result<(), String> {
+    crate::alerts::Matcher::parse(name)
+        .map(|_| ())
+        .map_err(|e| format!("invalid value for {key}: {e}"))
+}
+
 fn collector_mut(config: &mut FileConfig) -> &mut CollectorConfig {
     config
         .collector
@@ -280,6 +303,7 @@ pub fn apply_add(config: &mut FileConfig, key: &str, value: &str) -> Result<Stri
                 if name.is_empty() {
                     return Err(format!("invalid value for {key}: {value} (empty name)"));
                 }
+                check_name_pattern(key, name)?;
                 let pct: f64 = parse(key, pct)?;
                 if key == "alert-app-cpu" {
                     config
@@ -307,6 +331,7 @@ pub fn apply_add(config: &mut FileConfig, key: &str, value: &str) -> Result<Stri
                 if name.is_empty() {
                     return Err(format!("invalid value for {key}: {value} (empty name)"));
                 }
+                check_name_pattern(key, name)?;
                 let pct: f64 = parse(key, pct)?;
                 if key == "alert-cpu" {
                     config
@@ -331,6 +356,7 @@ pub fn apply_add(config: &mut FileConfig, key: &str, value: &str) -> Result<Stri
                 if mount.is_empty() {
                     return Err(format!("invalid value for {key}: {value} (empty mount)"));
                 }
+                check_name_pattern(key, mount)?;
                 let pct: f32 = parse(key, pct)?;
                 config.alerts.disk_overrides.insert(mount.to_string(), pct);
                 return Ok(format!("{key} override: {mount} = {pct}% (0 disables)"));
@@ -452,6 +478,32 @@ pub fn load(dir: &Path) -> Result<FileConfig, ConfigError> {
         ParseConfigSnafu {
             path: path.display().to_string(),
             message: e.to_string(),
+        }
+        .build()
+    })
+}
+
+/// Load `<dir>/template.toml` if it exists, else the compiled-in
+/// template. A malformed or wrong-version file is an error rather than a
+/// silent fallback: an alert template that quietly did not apply is
+/// indistinguishable from a quiet machine
+pub fn load_template(dir: &Path) -> Result<crate::alerts::Template, ConfigError> {
+    let path = template_path(dir);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(crate::alerts::Template::builtin().clone());
+        }
+        Err(e) => {
+            return Err(e).context(ReadConfigSnafu {
+                path: path.display().to_string(),
+            });
+        }
+    };
+    crate::alerts::Template::parse(&content).map_err(|message| {
+        ParseConfigSnafu {
+            path: path.display().to_string(),
+            message,
         }
         .build()
     })
@@ -605,6 +657,26 @@ detach = true
         assert!(apply_add(&mut config, "alert-disk", "=90").is_err());
         assert!(apply_add(&mut config, "alert-pressure", "loud").is_err());
         assert!(apply_add(&mut config, "process-boost", "-1").is_err());
+        // A `*` only means anything at the ends; an interior one is
+        // refused rather than stored as a literal name that can never
+        // match (see alerts::Matcher)
+        assert!(apply_add(&mut config, "alert-cpu", "rust*analyzer=100").is_err());
+        assert!(apply_add(&mut config, "alert-mem", "a*b=10").is_err());
+        assert!(apply_add(&mut config, "alert-app-cpu", "a*b=10").is_err());
+        assert!(apply_add(&mut config, "alert-disk", "/Vol*umes=90").is_err());
+    }
+
+    #[test]
+    fn apply_add_accepts_name_patterns() {
+        let mut config = FileConfig::default();
+        settings_apply(&mut config, "alert-cpu", "rust-analyzer*=200");
+        settings_apply(&mut config, "alert-cpu", "*Helper (Renderer)=100");
+        assert_eq!(config.alerts.cpu_overrides["rust-analyzer*"], 200.0);
+        assert_eq!(config.alerts.cpu_overrides["*Helper (Renderer)"], 100.0);
+
+        // -remove takes the key verbatim, patterns included
+        apply_remove(&mut config, "alert-cpu", Some("rust-analyzer*")).expect("remove pattern");
+        assert!(!config.alerts.cpu_overrides.contains_key("rust-analyzer*"));
     }
 
     #[test]
@@ -690,6 +762,33 @@ detach = true
         // Malformed file = error, not silent defaults
         std::fs::write(config_path(&dir), "not toml [").expect("write garbage");
         assert!(load(&dir).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn load_template_falls_back_to_builtin_but_never_to_silence() {
+        let dir = std::env::temp_dir().join(format!("zstats-template-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("mkdir");
+
+        // No file at all is the normal install: the compiled-in table
+        let builtin = load_template(&dir).expect("load missing");
+        assert_eq!(builtin.cpu.get("rustc"), Some(&0.0));
+
+        std::fs::write(template_path(&dir), "version = 1\n[cpu]\ngopls = 42.0")
+            .expect("write template");
+        let loaded = load_template(&dir).expect("load override");
+        assert_eq!(loaded.cpu.get("gopls"), Some(&42.0));
+        assert!(!loaded.cpu.contains_key("rustc"), "replaces, not layers");
+
+        // A template that fails to parse is an ERROR, never a quiet
+        // fallback — one that did not apply is indistinguishable from a
+        // quiet machine, which is the failure a monitor must not have
+        std::fs::write(template_path(&dir), "version = 99").expect("write bad version");
+        assert!(load_template(&dir).is_err());
+        std::fs::write(template_path(&dir), "not toml [").expect("write garbage");
+        assert!(load_template(&dir).is_err());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

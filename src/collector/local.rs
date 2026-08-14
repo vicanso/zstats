@@ -540,6 +540,7 @@ impl LocalCollector {
                 // that produces cpu_usage, under the same refresh kind
                 cpu_time_ms: p.accumulated_cpu_time(),
                 memory_bytes: p.memory(),
+                phys_footprint_bytes: phys_footprint(pid),
                 virtual_memory_bytes: p.virtual_memory(),
                 run_time_secs: p.run_time(),
                 parent_pid: p.parent().map(|pp| pp.as_u32()),
@@ -945,6 +946,40 @@ fn aggregate_process_groups(table: &HashMap<u32, ProcNode>, max: usize) -> Vec<G
     groups
 }
 
+/// Physical footprint via `proc_pid_rusage`, through the `libproc`
+/// crate for the same reason sysctls go through `sysctl`: the library
+/// forbids unsafe code, so the FFI lives in the dependency.
+///
+/// Cheap enough to run unconditionally: the kernel maintains the
+/// footprint as a ledger value on the task, and this call copies it out
+/// in one round trip — measured ~0.5µs. It runs only for the
+/// materialised top-N, so a collect pays tens of microseconds against
+/// the ~20ms the process refresh already costs.
+///
+/// `RUSAGE_INFO_V0` on purpose: `ri_phys_footprint` has been there
+/// since the flavor existed, and asking for the oldest layout keeps the
+/// call working on every macOS this library reaches.
+#[cfg(target_os = "macos")]
+fn phys_footprint(pid: u32) -> Option<u64> {
+    use libproc::pid_rusage::{RUsageInfoV0, pidrusage};
+
+    // Errors are EPERM for other users' processes (and ESRCH for a pid
+    // that exited mid-collect). None, not 0 — a zero footprint would
+    // read as a measurement.
+    //
+    // The FIELD, deliberately not the `PIDRUsage::memory_used()` trait
+    // method — that returns `ri_resident_size`, which is RSS, the very
+    // number this field exists to not be.
+    pidrusage::<RUsageInfoV0>(pid as i32)
+        .ok()
+        .map(|r| r.ri_phys_footprint)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn phys_footprint(_pid: u32) -> Option<u64> {
+    None
+}
+
 /// Safe sysctl readers via the `sysctl` crate (the library forbids
 /// unsafe code; the FFI lives inside that crate)
 #[cfg(target_os = "macos")]
@@ -1117,6 +1152,37 @@ mod tests {
             mem,
             io: None,
         }
+    }
+
+    /// The footprint contract on macOS: our own process is always
+    /// readable and always has a real footprint, and failure is `None`,
+    /// never zero — a zero would read as a measurement.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn phys_footprint_reads_own_process_and_fails_to_none() {
+        let own = phys_footprint(std::process::id());
+        assert!(
+            own.is_some_and(|b| b > 1024 * 1024),
+            "own footprint should be at least a megabyte, got {own:?}"
+        );
+        // Pid 0 is kernel_task; an unprivileged test cannot inspect it.
+        // Root CI would see Some here, so only assert it is never zero.
+        assert_ne!(phys_footprint(0), Some(0));
+
+        // Cross-check the V0 layout against V4: the same kernel ledger
+        // value read through two struct layouts. Divergence would mean
+        // the flavor constant and the struct no longer line up — the
+        // kind of silent offset bug a bindgen bump could introduce.
+        use libproc::pid_rusage::{RUsageInfoV4, pidrusage};
+        let v4 = pidrusage::<RUsageInfoV4>(std::process::id() as i32)
+            .expect("own rusage v4")
+            .ri_phys_footprint;
+        let v0 = own.unwrap();
+        let drift = v0.abs_diff(v4);
+        assert!(
+            drift < 8 * 1024 * 1024,
+            "V0 ({v0}) and V4 ({v4}) footprints disagree by {drift} bytes"
+        );
     }
 
     #[test]

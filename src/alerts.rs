@@ -47,8 +47,12 @@
 //! System memory pressure is driven by the kernel's own verdict
 //! (`pressure_level`) but requires PERSISTENCE, not just a crossing: a
 //! memory-heavy machine sits at warning as its steady state and would
-//! otherwise alert all day. One alert per severity per episode
-//! (worsening escalates, lingering never nags), re-armed at normal.
+//! otherwise alert all day. Its episode is symmetric — it takes
+//! [`PRESSURE_REARM`] of continuous normal to declare it over, the same
+//! way it takes persistence to declare it started — and because the
+//! condition can legitimately hold for hours, reminders inside one
+//! episode BACK OFF ([`PERSIST_REMINDER`] doubling up to
+//! [`PRESSURE_REMINDER_MAX`]) instead of stopping at one.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -102,6 +106,34 @@ const RECORD_TOP_CPU_TIME: usize = 5;
 /// well clear of the cooldown so it can never feel like nagging
 const PERSIST_REMINDER: Duration = Duration::from_secs(30 * 60);
 
+/// How long the kernel must report normal before an above-normal
+/// memory-pressure episode counts as over.
+///
+/// The fire side already demands persistence; the clear side used to
+/// accept a single normal sample, and that asymmetry was a bug. The
+/// kernel's level is a noisy step function, so a machine sitting near
+/// the line dips back for a sample or two regularly — each dip ended
+/// the episode and the next one alerted again as if it were news.
+/// Measured on a real machine: four "new" warning alerts in 5.5h for
+/// what was one continuous condition, all of them `repeat=false`. It
+/// takes the same evidence to call the episode over as to call it
+/// started, so this mirrors the warning tier's [`SLOW_WINDOW`]
+const PRESSURE_REARM: Duration = SLOW_WINDOW;
+
+/// Ceiling on the gap between reminders inside one memory-pressure
+/// episode; the gap starts at [`PERSIST_REMINDER`] and doubles
+/// (30m, 1h, 2h, 4h, 4h…).
+///
+/// Pressure is the one rule whose condition is a machine STATE rather
+/// than a culprit: there is often nothing to do about it beyond closing
+/// something, and it can hold for a whole workday. So unlike the
+/// per-process rules — which notify once, follow up once, then go quiet
+/// because you either acted or decided not to — this one keeps a sparse
+/// pulse going for as long as the machine is actually swapping. The
+/// backoff is what makes that bearable: 6 notifications across 12 hours,
+/// each one flagged as a repeat rather than posing as a new event
+const PRESSURE_REMINDER_MAX: Duration = Duration::from_secs(4 * 60 * 60);
+
 /// Builtin defaults when the config file leaves a value unset
 const DEFAULT_CPU_PERCENT: f32 = 30.0;
 const DEFAULT_MEMORY_FRACTION: f64 = 0.25;
@@ -120,236 +152,78 @@ const DEFAULT_COOLDOWN: Duration = Duration::from_secs(600);
 const DISK_REARM_MARGIN: f64 = 0.05;
 
 /// Builtin CPU-override template: resident apps that legitimately sustain
-/// high CPU in normal use. Applied below the user's own overrides (a
-/// same-name user entry always wins) unless `[alerts] template = false`.
+/// The builtin template, compiled in from `templates/alerts.toml`.
 ///
-/// Only processes that can outlive the 50s window qualify — a burst that
-/// exits sooner never notifies anyway. Values: 100 = "interrupt me only
-/// at a full core" (interactive apps), 200 = "multi-core is its job" (IDE
-/// indexers, VM/container hosts), 0 = "never interrupt, still record"
-/// (work you started yourself and periodic macOS system work).
-///
-/// The dividing line for 0 is WHO ASKED, not how much CPU it uses: you
-/// typed the build command, so "your compiler is compiling" tells you
-/// nothing you did not know, while a background indexer pegged for
-/// minutes is a real (and common) failure worth a raised bar instead.
-/// Keep the reference copy in `config.example.toml` in sync with this
-/// list.
-pub const TEMPLATE_CPU_OVERRIDES: &[(&str, f32)] = &[
-    // Browsers: page loads / video / heavy-JS sites run for minutes
-    ("Google Chrome", 100.0),
-    ("Google Chrome Helper (Renderer)", 100.0),
-    ("Google Chrome Helper (GPU)", 100.0),
-    ("Microsoft Edge Helper (Renderer)", 100.0),
-    ("Brave Browser Helper (Renderer)", 100.0),
-    ("Arc Helper (Renderer)", 100.0),
-    ("firefox", 100.0),
-    ("plugin-container", 100.0),
-    ("com.apple.WebKit.WebContent", 100.0),
-    ("com.apple.WebKit.GPU", 100.0),
-    // Electron / Chromium desktop apps: same engine, same bursts
-    ("Slack Helper (Renderer)", 100.0),
-    ("Discord Helper (Renderer)", 100.0),
-    ("Notion Helper (Renderer)", 100.0),
-    ("Obsidian Helper (Renderer)", 100.0),
-    ("Figma Helper (Renderer)", 100.0),
-    ("Spotify Helper", 100.0),
-    ("QQ Helper (Renderer)", 100.0),
-    ("Lark Helper (Renderer)", 100.0),
-    ("DingTalk", 100.0),
-    // 企业微信 runs as `wwmapp`, not under a "WeCom Helper" name —
-    // vendor process names are worth confirming with `zstats --json`
-    // rather than guessing from the app's title
-    ("WeCom Helper (Renderer)", 100.0),
-    ("wwmapp", 100.0),
-    // Editors / IDEs / language servers: re-index after every edit burst
-    ("Cursor Helper (Renderer)", 100.0),
-    ("Code Helper (Renderer)", 100.0),
-    ("gopls", 100.0),
-    ("rust-analyzer", 100.0),
-    ("clangd", 100.0),
-    ("sourcekit-lsp", 100.0),
-    ("Xcode", 200.0),
-    ("SourceKitService", 200.0),
-    // Deliberately 200 rather than 0 despite being a compiler: this one
-    // name serves both the build you started AND Xcode's background
-    // indexing, and the indexing half is worth a raised bar
-    ("swift-frontend", 200.0),
-    ("XCBBuildService", 200.0),
-    // SwiftUI Previews rebuild in a loop while the canvas is open
-    ("XCPreviewAgent", 200.0),
-    ("idea", 200.0),
-    ("goland", 200.0),
-    ("clion", 200.0),
-    // VMs / containers: guest workload is supposed to use cores
-    ("com.docker.backend", 200.0),
-    ("com.docker.virtualization", 200.0),
-    ("OrbStack Helper", 200.0),
-    ("qemu-system-aarch64", 200.0),
-    ("prl_vm_app", 200.0),
-    ("vmware-vmx", 200.0),
-    // iOS Simulator: the app renders the device screen, so a busy
-    // simulated app keeps it near a core. Deliberately NOT 0 for the
-    // CoreSimulator service — a wedged one spinning at a full core with
-    // no simulator running is a well-known Xcode failure whose fix is to
-    // kill it, which makes it one of the few genuinely actionable alerts
-    // in this whole table
-    ("Simulator", 100.0),
-    ("com.apple.CoreSimulator.CoreSimulatorService", 100.0),
-    // Terminals rendering streaming AI output, and the AI CLIs themselves
-    ("ghostty", 100.0),
-    ("iTerm2", 100.0),
-    ("kitty", 100.0),
-    ("alacritty", 100.0),
-    ("claude", 100.0),
-    // Calls / screen sharing: video encode while the call lasts
-    ("zoom.us", 100.0),
-    ("WeChat", 100.0),
-    ("Microsoft Teams", 100.0),
-    ("TencentMeeting", 100.0),
-    ("avconferenced", 100.0),
-    // Toolchains: a build is SUPPOSED to saturate cores, and "your
-    // compiler is compiling" is never actionable. Most invocations are
-    // far too short to fill the window; the ones that do are exactly the
-    // ones you are already waiting on (LTO codegen, a link step, one
-    // enormous translation unit). Note interpreted tools are absent on
-    // purpose — `tsc`, gradle and friends run under `node`/`java`, and
-    // those names are half the real runaways
-    ("rustc", 0.0),
-    ("cargo", 0.0),
-    ("clippy-driver", 0.0),
-    ("rustdoc", 0.0),
-    ("clang", 0.0),
-    ("clang++", 0.0),
-    ("cc1plus", 0.0),
-    ("gcc", 0.0),
-    ("g++", 0.0),
-    ("ld", 0.0),
-    ("lld", 0.0),
-    ("make", 0.0),
-    ("cmake", 0.0),
-    ("ninja", 0.0),
-    ("go", 0.0),
-    ("esbuild", 0.0),
-    // Xcode's build-time tools (names verified against Xcode.app, not
-    // guessed from menu titles). dsymutil and the linkers are
-    // single-threaded and long — the classic "why is the fan on after an
-    // archive"
-    ("xcodebuild", 0.0),
-    ("swift-driver", 0.0),
-    ("actool", 0.0),
-    ("ibtool", 0.0),
-    ("ibtoold", 0.0),
-    ("dsymutil", 0.0),
-    ("ld-classic", 0.0),
-    // Auto-gc / repack on a big repo pegs a core for minutes without
-    // anyone asking, and there is nothing to do about it either
-    ("git", 0.0),
-    // Long jobs you started yourself: never actionable, history only
-    ("OBS", 0.0),
-    ("ffmpeg", 0.0),
-    ("HandBrake", 0.0),
-    ("Final Cut Pro", 0.0),
-    ("ollama", 0.0),
-    // macOS periodic system work: not actionable, history only.
-    // Spotlight is a family, not one process — `spotlightknowledged`
-    // alone was the single noisiest alerter on a real machine while
-    // only two of its siblings were listed
-    ("mds", 0.0),
-    ("mds_stores", 0.0),
-    ("mdworker", 0.0),
-    ("mdworker_shared", 0.0),
-    ("spotlightknowledged", 0.0),
-    ("corespotlightd", 0.0),
-    ("knowledgeconstructiond", 0.0),
-    ("suggestd", 0.0),
-    ("parsecd", 0.0),
-    ("photoanalysisd", 0.0),
-    ("mediaanalysisd", 0.0),
-    ("backupd", 0.0),
-    ("syspolicyd", 0.0),
-    ("installd", 0.0),
-    ("softwareupdated", 0.0),
-    ("kernel_task", 0.0),
-    ("wdavdaemon", 0.0),
-    // Sustained ≥100% here usually means some app is spamming redraws
-    ("WindowServer", 100.0),
-];
+/// It is a FILE rather than a table in this source for two reasons. It
+/// is data, not logic — 144 entries that change as apps and toolchains
+/// come and go, and every change used to be a code edit plus a hand-kept
+/// duplicate in `config.example.toml`. And it is the same format, read
+/// by the same parser, as the optional `<config-dir>/template.toml`
+/// override, so updating the table never requires a new binary.
+const BUILTIN_TEMPLATE: &str = include_str!("../templates/alerts.toml");
 
-/// Builtin whole-app CPU template, keyed on the process-tree ROOT name.
-/// Deliberately much shorter than [`TEMPLATE_CPU_OVERRIDES`]: the app
-/// thresholds already start high (200% / 40%), so only two situations
-/// need exempting — work you started yourself, and hosts whose whole job
-/// is to burn cores on someone else's behalf.
-///
-/// `login` is the important entry and the reason this table exists at
-/// all: on macOS every terminal session's descendants group under a
-/// `login` root, so a build sustains hundreds of percent under a name
-/// that is not an application. Silencing it costs nothing — a genuine
-/// runaway among its members is still caught by the per-process rules.
-pub const TEMPLATE_APP_CPU_OVERRIDES: &[(&str, f32)] = &[
-    // Terminal sessions: your own foreground work
-    ("login", 0.0),
-    ("sshd", 0.0),
-    ("tmux", 0.0),
-    ("screen", 0.0),
-    // VM / container hosts: guest workload is supposed to use cores
-    ("com.docker.backend", 0.0),
-    ("com.docker.virtualization", 0.0),
-    ("OrbStack Helper", 0.0),
-    ("qemu-system-aarch64", 0.0),
-    ("prl_vm_app", 0.0),
-    ("vmware-vmx", 0.0),
-    // Editors and browsers fan out across many helpers; a few cores
-    // during an index rebuild or a heavy page is normal
-    // A booted simulator is a whole device's worth of daemons. Which name
-    // roots the tree depends on who spawned launchd_sim, so both are
-    // listed; confirm against `zstats --json` with a simulator running
-    ("Simulator", 400.0),
-    ("com.apple.CoreSimulator.CoreSimulatorService", 400.0),
-    ("Xcode", 400.0),
-    ("idea", 400.0),
-    ("goland", 400.0),
-    ("clion", 400.0),
-    ("zed", 400.0),
-    ("Cursor", 400.0),
-    ("Code", 400.0),
-    ("Google Chrome", 400.0),
-    ("Microsoft Edge", 400.0),
-    ("Brave Browser", 400.0),
-    ("Arc", 400.0),
-    ("firefox", 400.0),
-    ("Safari", 400.0),
-];
+/// Format version of `templates/alerts.toml`. A file claiming anything
+/// else is refused outright rather than half-read into thresholds the
+/// user did not ask for
+pub const TEMPLATE_VERSION: u32 = 1;
 
-/// Builtin whole-app memory template (percent of total), keyed on the
-/// tree root name. Browsers and IDEs legitimately hold a large share of
-/// a machine's RAM; the system memory-pressure rule is what catches
-/// "actually too much", so these only need to not cry wolf.
-pub const TEMPLATE_APP_MEM_OVERRIDES: &[(&str, f64)] = &[
-    // Your own terminal work — the pressure rule covers real trouble
-    ("login", 0.0),
-    ("sshd", 0.0),
-    ("tmux", 0.0),
-    ("screen", 0.0),
-    ("com.docker.backend", 0.0),
-    ("com.docker.virtualization", 0.0),
-    ("OrbStack Helper", 0.0),
-    ("qemu-system-aarch64", 0.0),
-    ("prl_vm_app", 0.0),
-    ("vmware-vmx", 0.0),
-    // A browser with many tabs routinely passes 40% of RAM
-    ("Google Chrome", 60.0),
-    ("Microsoft Edge", 60.0),
-    ("Brave Browser", 60.0),
-    ("Arc", 60.0),
-    ("firefox", 60.0),
-    ("Safari", 60.0),
-    ("Xcode", 60.0),
-    // A booted device image plus its daemons runs to several GiB
-    ("Simulator", 60.0),
-    ("com.apple.CoreSimulator.CoreSimulatorService", 60.0),
-];
+/// Raised (or zeroed) alert bars for processes that legitimately sustain
+/// high CPU or a large share of RAM.
+///
+/// Applied below the user's own overrides (a matching user entry always
+/// wins) unless `[alerts] template = false`, and skipped entirely when
+/// the corresponding base rule is disabled. Keys are [`Matcher`]
+/// patterns; see `templates/alerts.toml` for the tiers and the reasoning
+/// behind each group.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Template {
+    /// Absent in a hand-written file only if the author forgot; treated
+    /// as a mismatch so it cannot be silently skipped
+    pub version: Option<u32>,
+    /// Per-process CPU, single-core percent
+    #[serde(default)]
+    pub cpu: std::collections::BTreeMap<String, f32>,
+    /// Whole-application CPU, keyed on the tree root name
+    #[serde(default)]
+    pub app_cpu: std::collections::BTreeMap<String, f32>,
+    /// Whole-application memory, percent of total
+    #[serde(default)]
+    pub app_mem: std::collections::BTreeMap<String, f64>,
+}
+
+impl Template {
+    /// Parse one template file. Rejects a version mismatch, an unknown
+    /// table, and any key the [`Matcher`] cannot honour — a template is
+    /// only useful if you can trust that every line in it took effect
+    pub fn parse(text: &str) -> Result<Self, String> {
+        let template: Self = toml::from_str(text).map_err(|e| e.to_string())?;
+        if template.version != Some(TEMPLATE_VERSION) {
+            return Err(format!(
+                "unsupported template version {:?} (this build reads {TEMPLATE_VERSION})",
+                template.version
+            ));
+        }
+        let keys = template
+            .cpu
+            .keys()
+            .chain(template.app_cpu.keys())
+            .chain(template.app_mem.keys());
+        for key in keys {
+            Matcher::parse(key)?;
+        }
+        Ok(template)
+    }
+
+    /// The compiled-in template. Parsed once; a failure here is a build
+    /// bug, and `builtin_template_parses` keeps `make check` honest
+    pub fn builtin() -> &'static Self {
+        static BUILTIN: std::sync::OnceLock<Template> = std::sync::OnceLock::new();
+        BUILTIN.get_or_init(|| {
+            Template::parse(BUILTIN_TEMPLATE).expect("the compiled-in template must parse")
+        })
+    }
+}
 
 /// Which rule produced an alert — the category a frontend groups,
 /// filters or picks an icon by.
@@ -589,14 +463,124 @@ pub struct Evaluation {
     pub records: Vec<MetricRecord>,
 }
 
+/// How an override key matches a process name (always
+/// case-insensitive).
+///
+/// A process name is not a stable identifier. Tool managers stamp the
+/// version into the binary itself — Zed ships rust-analyzer as
+/// `rust-analyzer-2026-08-10.1` and rewrites that name on every update
+/// — and one tool commonly runs as several sibling processes
+/// (`rust-analyzer-proc-macro-srv`). Exact matching missed both
+/// silently: the builtin `rust-analyzer` entry had never applied on any
+/// Zed install, so the indexer alerted against the 30% base instead of
+/// its 100% bar.
+///
+/// Only a leading and/or trailing `*` is special — this is deliberately
+/// not a glob engine, just enough to name a family. A `*` anywhere else
+/// is REJECTED at parse time rather than treated as a literal, so a key
+/// that looks like a pattern can never quietly behave as an exact name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Matcher {
+    Exact(String),
+    /// `name*`
+    Prefix(String),
+    /// `*name`
+    Suffix(String),
+    /// `*name*`
+    Contains(String),
+}
+
+impl Matcher {
+    /// Read an override key. Fails only on an interior `*`
+    pub fn parse(key: &str) -> Result<Self, String> {
+        let leading = key.starts_with('*');
+        let rest = if leading { &key[1..] } else { key };
+        let trailing = rest.ends_with('*');
+        let literal = if trailing {
+            &rest[..rest.len() - 1]
+        } else {
+            rest
+        };
+        if literal.contains('*') {
+            return Err(format!(
+                "`{key}`: `*` is only supported at the start or end of a name"
+            ));
+        }
+        let literal = literal.to_string();
+        Ok(match (leading, trailing) {
+            (false, false) => Self::Exact(literal),
+            (false, true) => Self::Prefix(literal),
+            (true, false) => Self::Suffix(literal),
+            (true, true) => Self::Contains(literal),
+        })
+    }
+
+    fn literal(&self) -> &str {
+        match self {
+            Self::Exact(s) | Self::Prefix(s) | Self::Suffix(s) | Self::Contains(s) => s,
+        }
+    }
+
+    /// Compared as ASCII bytes so no allocation or char-boundary
+    /// slicing is needed for a name that may be arbitrary UTF-8
+    pub fn matches(&self, name: &str) -> bool {
+        let literal = self.literal().as_bytes();
+        let name = name.as_bytes();
+        let fits = name.len() >= literal.len();
+        match self {
+            Self::Exact(_) => name.eq_ignore_ascii_case(literal),
+            Self::Prefix(_) => fits && name[..literal.len()].eq_ignore_ascii_case(literal),
+            Self::Suffix(_) => {
+                fits && name[name.len() - literal.len()..].eq_ignore_ascii_case(literal)
+            }
+            // `windows(0)` panics, and "contains nothing" is true anyway
+            Self::Contains(_) => {
+                literal.is_empty()
+                    || (fits
+                        && name
+                            .windows(literal.len())
+                            .any(|w| w.eq_ignore_ascii_case(literal)))
+            }
+        }
+    }
+}
+
+/// One override entry: which names it claims, what it sets them to, and
+/// which layer wrote it
+struct Override<T> {
+    matcher: Matcher,
+    value: Option<T>,
+    /// A user entry outranks a template entry whatever their shapes: an
+    /// explicit override is a request, a template entry is only a
+    /// better default
+    user: bool,
+}
+
+impl<T> Override<T> {
+    /// Higher wins. Layer first, then specificity: an exact name beats
+    /// any pattern, and a longer pattern beats a shorter one.
+    ///
+    /// This has to be explicit rather than "first match wins in file
+    /// order", because the config's override maps are `BTreeMap`s —
+    /// what reaches us is alphabetical, not the order anything was
+    /// written in
+    fn rank(&self) -> (bool, bool, usize) {
+        (
+            self.user,
+            matches!(self.matcher, Matcher::Exact(_)),
+            self.matcher.literal().len(),
+        )
+    }
+}
+
 /// A rule threshold: a default plus per-process-name overrides
-/// (case-insensitive). An override of `None` disables the rule for that
-/// process — so a legitimately busy app (e.g. a terminal rendering
-/// streaming AI output) can get a higher bar without being blind to a
-/// real runaway.
+/// (case-insensitive, optionally patterns — see [`Matcher`]). An
+/// override of `None` disables the rule for that process — so a
+/// legitimately busy app (e.g. a terminal rendering streaming AI
+/// output) can get a higher bar without being blind to a real runaway.
 pub struct Thresholds<T> {
     default: Option<T>,
-    overrides: Vec<(String, Option<T>)>,
+    overrides: Vec<Override<T>>,
 }
 
 impl<T: Copy> Thresholds<T> {
@@ -607,20 +591,43 @@ impl<T: Copy> Thresholds<T> {
         }
     }
 
-    pub fn with_override(mut self, name: String, value: Option<T>) -> Self {
-        self.overrides.push((name, value));
+    /// An override the user asked for. An unparseable key is kept as a
+    /// literal name: `apply_add` already rejects those, so anything
+    /// that reaches here from an old or hand-edited file should behave
+    /// as it did before patterns existed rather than vanish
+    pub fn with_override(self, name: String, value: Option<T>) -> Self {
+        self.push(name, value, true)
+    }
+
+    /// An override from the builtin template, outranked by any user
+    /// entry that also matches
+    pub fn with_template_override(self, name: String, value: Option<T>) -> Self {
+        self.push(name, value, false)
+    }
+
+    fn push(mut self, name: String, value: Option<T>, user: bool) -> Self {
+        let matcher = Matcher::parse(&name).unwrap_or(Matcher::Exact(name));
+        self.overrides.push(Override {
+            matcher,
+            value,
+            user,
+        });
         self
     }
 
-    /// The effective threshold for a process: first name match wins,
-    /// otherwise the default. `None` = rule disabled for this process
+    /// The effective threshold for a process: the highest-ranking
+    /// matching override (see [`Override::rank`]), otherwise the
+    /// default. `None` = rule disabled for this process
     pub fn for_process(&self, name: &str) -> Option<T> {
-        for (n, value) in &self.overrides {
-            if n.eq_ignore_ascii_case(name) {
-                return *value;
+        let mut best: Option<&Override<T>> = None;
+        for entry in &self.overrides {
+            // Strictly greater, so equally ranked entries keep the
+            // old "first one wins" behaviour
+            if entry.matcher.matches(name) && best.is_none_or(|b| entry.rank() > b.rank()) {
+                best = Some(entry);
             }
         }
-        self.default
+        best.map_or(self.default, |entry| entry.value)
     }
 
     /// The base threshold, ignoring per-process overrides — this is what
@@ -630,7 +637,7 @@ impl<T: Copy> Thresholds<T> {
     }
 
     pub fn any_enabled(&self) -> bool {
-        self.default.is_some() || self.overrides.iter().any(|(_, v)| v.is_some())
+        self.default.is_some() || self.overrides.iter().any(|o| o.value.is_some())
     }
 }
 
@@ -652,14 +659,22 @@ pub struct ActiveThresholds {
 
 impl ActiveThresholds {
     /// Merge the `[alerts]` config section over the builtin template over
-    /// the builtin defaults (CPU 30%, memory 25%, cooldown 10m). Per-name
-    /// precedence: a user override always beats the same-name
-    /// [`TEMPLATE_CPU_OVERRIDES`] entry, template entries fill the names
-    /// the user did not configure, and every other process falls through
-    /// to the base value. `[alerts] template = false` drops the template
-    /// layer entirely. A configured 0 disables the rule; a 0 override
-    /// disables it for that process only
+    /// the builtin defaults (CPU 30%, memory 25%, cooldown 10m)
     pub fn from_config(file: &AlertsConfig) -> Self {
+        Self::from_config_with_template(file, Template::builtin())
+    }
+
+    /// As [`Self::from_config`], but against a template the caller
+    /// loaded — `<config-dir>/template.toml` replacing the compiled-in
+    /// one, so the table can be updated without a new binary.
+    ///
+    /// Per-name precedence: a user override always beats a matching
+    /// template entry, template entries fill the names the user did not
+    /// configure, and every other process falls through to the base
+    /// value. `[alerts] template = false` drops the template layer
+    /// entirely. A configured 0 disables the rule; a 0 override disables
+    /// it for that process only
+    pub fn from_config_with_template(file: &AlertsConfig, template: &Template) -> Self {
         let cpu_default = match file.cpu {
             Some(p) if p > 0.0 => Some(p),
             Some(_) => None,
@@ -671,8 +686,8 @@ impl ActiveThresholds {
             None => Some(DEFAULT_MEMORY_FRACTION),
         };
 
-        // User entries are pushed first: Thresholds::for_process returns
-        // the first name match, so they shadow the template below
+        // User entries outrank template entries by layer, not by push
+        // order — see Override::rank
         let mut cpu = Thresholds::new(cpu_default);
         for (name, pct) in &file.cpu_overrides {
             cpu = cpu.with_override(name.clone(), (*pct > 0.0).then_some(*pct));
@@ -682,8 +697,8 @@ impl ActiveThresholds {
         // leave ~60 templated apps still firing. An explicit user
         // override is different — that one is a request, and it stands
         if file.template.unwrap_or(true) && cpu_default.is_some() {
-            for (name, pct) in TEMPLATE_CPU_OVERRIDES {
-                cpu = cpu.with_override((*name).to_string(), (*pct > 0.0).then_some(*pct));
+            for (name, pct) in &template.cpu {
+                cpu = cpu.with_template_override(name.clone(), (*pct > 0.0).then_some(*pct));
             }
         }
         let mut memory = Thresholds::new(mem_default);
@@ -710,8 +725,9 @@ impl ActiveThresholds {
             app_cpu = app_cpu.with_override(name.clone(), (*pct > 0.0).then_some(*pct));
         }
         if file.template.unwrap_or(true) && app_cpu_default.is_some() {
-            for (name, pct) in TEMPLATE_APP_CPU_OVERRIDES {
-                app_cpu = app_cpu.with_override((*name).to_string(), (*pct > 0.0).then_some(*pct));
+            for (name, pct) in &template.app_cpu {
+                app_cpu =
+                    app_cpu.with_template_override(name.clone(), (*pct > 0.0).then_some(*pct));
             }
         }
         let app_mem_default = match file.app_mem {
@@ -725,9 +741,9 @@ impl ActiveThresholds {
                 app_memory.with_override(name.clone(), (*pct > 0.0).then_some(*pct / 100.0));
         }
         if file.template.unwrap_or(true) && app_mem_default.is_some() {
-            for (name, pct) in TEMPLATE_APP_MEM_OVERRIDES {
+            for (name, pct) in &template.app_mem {
                 app_memory = app_memory
-                    .with_override((*name).to_string(), (*pct > 0.0).then_some(*pct / 100.0));
+                    .with_template_override(name.clone(), (*pct > 0.0).then_some(*pct / 100.0));
             }
         }
 
@@ -771,13 +787,27 @@ pub struct AlertEngine {
     /// Mounts that already fired the disk alert and have not yet dropped
     /// [`DISK_REARM_MARGIN`] below their threshold
     disk_disarmed: std::collections::HashSet<String>,
-    /// When the current above-normal pressure episode began; None while
-    /// the kernel reports normal
+    /// When the current above-normal pressure episode began; None only
+    /// once the kernel has reported normal for [`PRESSURE_REARM`]
     pressure_since: Option<Instant>,
+    /// When the kernel first reported normal INSIDE an ongoing episode.
+    /// The episode ends only once this has held for [`PRESSURE_REARM`];
+    /// a shorter dip is noise and leaves the episode untouched
+    pressure_normal_since: Option<Instant>,
     /// Highest memory-pressure level already alerted this episode; reset
-    /// to 0 when the kernel reports normal again. One alert per severity
-    /// per episode — worsening escalates, lingering does not nag
+    /// to 0 when the episode ends. One FIRST alert per severity —
+    /// worsening escalates immediately, and lingering is handled by the
+    /// backing-off reminders rather than by re-crossing
     pressure_alerted: u32,
+    /// When this episode last notified, and how long until it may again.
+    /// The gap starts at [`PERSIST_REMINDER`], doubles per reminder up
+    /// to [`PRESSURE_REMINDER_MAX`], and resets on escalation
+    pressure_last_alert: Option<Instant>,
+    pressure_reminder_gap: Duration,
+    /// When this episode FIRST notified, so a reminder can report how
+    /// long it has been going since the user was first told — the same
+    /// meaning `repeat_after` carries for every other rule
+    pressure_first_alert: Option<Instant>,
     /// When the last metrics-recording pass ran (`None` = record on the
     /// next evaluation)
     last_record: Option<Instant>,
@@ -786,6 +816,18 @@ pub struct AlertEngine {
 impl AlertEngine {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The memory-pressure episode is over: the next above-normal stretch
+    /// starts a fresh one, serving its own persistence requirement and
+    /// its own backoff from scratch
+    fn clear_pressure(&mut self) {
+        self.pressure_since = None;
+        self.pressure_normal_since = None;
+        self.pressure_alerted = 0;
+        self.pressure_last_alert = None;
+        self.pressure_first_alert = None;
+        self.pressure_reminder_gap = Duration::ZERO;
     }
 
     /// Evaluate one snapshot observed at `now` (injectable for tests).
@@ -868,16 +910,46 @@ impl AlertEngine {
             && let Some(level) = snapshot.memory.pressure_level
         {
             if level <= 1 {
-                self.pressure_since = None;
-                self.pressure_alerted = 0;
+                // A dip to normal does not end the episode — see
+                // PRESSURE_REARM. Until it has held, everything below
+                // (including the reminder clock) stays exactly as it was
+                let normal_since = *self.pressure_normal_since.get_or_insert(now);
+                if now.duration_since(normal_since) >= PRESSURE_REARM {
+                    self.clear_pressure();
+                }
             } else {
+                self.pressure_normal_since = None;
                 let since = *self.pressure_since.get_or_insert(now);
                 let elapsed = now.duration_since(since);
                 // More severe means faster notification, mirroring the
                 // acute/chronic split of the per-process rules
                 let required = if level >= 4 { WINDOW } else { SLOW_WINDOW };
-                if level >= threshold && level > self.pressure_alerted && elapsed >= required {
-                    self.pressure_alerted = level;
+                let notify =
+                    if level >= threshold && level > self.pressure_alerted && elapsed >= required {
+                        // First alert at this severity. Worsening does not
+                        // wait for the reminder clock — persistence is
+                        // already established — and it restarts the backoff,
+                        // because a new severity is genuinely new news
+                        self.pressure_alerted = level;
+                        self.pressure_reminder_gap = PERSIST_REMINDER;
+                        self.pressure_first_alert.get_or_insert(now);
+                        Some(None)
+                    } else if level >= threshold
+                        && self.pressure_alerted > 0
+                        && self.pressure_last_alert.is_some_and(|last| {
+                            now.duration_since(last) >= self.pressure_reminder_gap
+                        })
+                    {
+                        // Still going. Reminders back off so a condition
+                        // that holds all day stays a pulse, not a nag
+                        self.pressure_reminder_gap =
+                            (self.pressure_reminder_gap * 2).min(PRESSURE_REMINDER_MAX);
+                        Some(self.pressure_first_alert.map(|at| now.duration_since(at)))
+                    } else {
+                        None
+                    };
+                if let Some(repeat_after) = notify {
+                    self.pressure_last_alert = Some(now);
                     evaluation.events.push(AlertEvent {
                         subject: AlertSubject::System,
                         detail: AlertDetail::Pressure {
@@ -887,7 +959,7 @@ impl AlertEngine {
                             swap_total_bytes: snapshot.memory.swap_total_bytes,
                             compressed_bytes: snapshot.memory.compressed_bytes,
                         },
-                        repeat_after: None,
+                        repeat_after,
                     });
                 }
             }
@@ -917,6 +989,10 @@ impl AlertEngine {
                     // averages anyway
                     cpu_time_ms: 0,
                     memory_bytes: g.memory_bytes,
+                    // Not summed over the tree: EPERM'd members would make
+                    // the total silently partial. The app rules don't read
+                    // it; per-process rows carry the real value.
+                    phys_footprint_bytes: None,
                     virtual_memory_bytes: 0,
                     run_time_secs: 0,
                     parent_pid: None,
@@ -1260,6 +1336,7 @@ mod tests {
             cpu_usage_percent: cpu,
             cpu_time_ms,
             memory_bytes: mem,
+            phys_footprint_bytes: None,
             virtual_memory_bytes: mem,
             run_time_secs: 0,
             parent_pid: None,
@@ -2189,10 +2266,171 @@ mod tests {
             step(154, 2).is_empty(),
             "improving within the episode is silent"
         );
-        assert!(step(155, 1).is_empty(), "back to normal re-arms silently");
+        // Normal must HOLD for PRESSURE_REARM (300s) before the episode
+        // counts as over — it starts at step 155 (t=310s), so the
+        // episode survives until t=610s
+        for i in 155..305 {
+            assert!(step(i, 1).is_empty(), "normal is silent (t={}s)", 2 * i);
+        }
+        assert!(step(305, 1).is_empty(), "the episode ends silently");
         // A new episode must serve its own persistence requirement
-        assert!(step(156, 2).is_empty(), "new episode restarts the clock");
-        assert_eq!(step(306, 2).len(), 1, "and alerts once sustained again");
+        assert!(step(306, 2).is_empty(), "new episode restarts the clock");
+        for i in 307..456 {
+            assert!(
+                step(i, 2).is_empty(),
+                "still inside the new persistence window (t={}s)",
+                2 * i
+            );
+        }
+        assert_eq!(step(456, 2).len(), 1, "and alerts once sustained again");
+    }
+
+    #[test]
+    fn brief_return_to_normal_does_not_restart_the_pressure_episode() {
+        // The real-machine failure this fixes: the fire side demanded
+        // 5 minutes of persistence while the clear side accepted a
+        // single normal sample, so one continuous stretch of memory
+        // pressure was chopped into a string of alerts that each
+        // arrived as news (all `repeat=false` in the daemon log)
+        let active = ActiveThresholds {
+            cpu: Thresholds::new(None),
+            memory: Thresholds::new(None),
+            disk: Thresholds::new(None),
+            app_cpu: Thresholds::new(None),
+            app_memory: Thresholds::new(None),
+            pressure: Some(2),
+            cooldown: Duration::from_secs(600),
+        };
+        let mut engine = AlertEngine::new();
+        let base = Instant::now();
+        let mut step = |i: u64, level: u32| {
+            let mut s = snapshot(Vec::new(), 100);
+            s.memory.pressure_level = Some(level);
+            engine
+                .evaluate(base + Duration::from_secs(2 * i), &s, &active)
+                .events
+        };
+
+        assert!(step(0, 1).is_empty());
+        for i in 1..151 {
+            assert!(step(i, 2).is_empty());
+        }
+        assert_eq!(step(151, 2).len(), 1, "sustained warning alerts once");
+
+        // Four minutes of normal — under PRESSURE_REARM, so noise
+        for i in 152..272 {
+            assert!(step(i, 1).is_empty(), "the dip is silent (t={}s)", 2 * i);
+        }
+        // Back over the line. This is the SAME episode, so it must not
+        // alert again even once another full SLOW_WINDOW has passed —
+        // under the old rule this is exactly where the duplicate landed
+        for i in 272..600 {
+            assert!(
+                step(i, 2).is_empty(),
+                "one episode alerts once, whatever the kernel did in \
+                 between (t={}s)",
+                2 * i
+            );
+        }
+    }
+
+    #[test]
+    fn pressure_reminders_back_off_and_are_flagged_as_repeats() {
+        // Ticks are irregular on purpose: the rule reads the clock, so
+        // it must not depend on the sampling cadence
+        let active = ActiveThresholds {
+            cpu: Thresholds::new(None),
+            memory: Thresholds::new(None),
+            disk: Thresholds::new(None),
+            app_cpu: Thresholds::new(None),
+            app_memory: Thresholds::new(None),
+            pressure: Some(2),
+            cooldown: Duration::from_secs(600),
+        };
+        let mut engine = AlertEngine::new();
+        let base = Instant::now();
+        let mut at = |secs: u64, level: u32| {
+            let mut s = snapshot(Vec::new(), 100);
+            s.memory.pressure_level = Some(level);
+            engine
+                .evaluate(base + Duration::from_secs(secs), &s, &active)
+                .events
+        };
+
+        assert!(at(0, 2).is_empty(), "episode starts");
+        assert!(at(299, 2).is_empty(), "one second short of persistence");
+        let first = at(300, 2);
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].repeat_after, None, "the first alert is news");
+
+        // Gaps double from PERSIST_REMINDER and cap at
+        // PRESSURE_REMINDER_MAX: 30m, 1h, 2h, 4h, 4h. repeat_after
+        // counts from the FIRST alert, as it does for every other rule
+        for (silent, fires, since_first) in [
+            (2099u64, 2100u64, 1800u64),
+            (5699, 5700, 5400),
+            (12899, 12900, 12600),
+            (27299, 27300, 27000),
+            (41699, 41700, 41400),
+        ] {
+            assert!(at(silent, 2).is_empty(), "too soon at t={silent}s");
+            let events = at(fires, 2);
+            assert_eq!(events.len(), 1, "reminder due at t={fires}s");
+            assert_eq!(
+                events[0].repeat_after,
+                Some(Duration::from_secs(since_first)),
+                "at t={fires}s"
+            );
+            assert!(
+                events[0]
+                    .summary()
+                    .contains(&format!("still going after {} min", since_first / 60)),
+                "got: {}",
+                events[0].summary()
+            );
+        }
+    }
+
+    #[test]
+    fn worsening_pressure_restarts_the_reminder_backoff() {
+        let active = ActiveThresholds {
+            cpu: Thresholds::new(None),
+            memory: Thresholds::new(None),
+            disk: Thresholds::new(None),
+            app_cpu: Thresholds::new(None),
+            app_memory: Thresholds::new(None),
+            pressure: Some(2),
+            cooldown: Duration::from_secs(600),
+        };
+        let mut engine = AlertEngine::new();
+        let base = Instant::now();
+        let mut at = |secs: u64, level: u32| {
+            let mut s = snapshot(Vec::new(), 100);
+            s.memory.pressure_level = Some(level);
+            engine
+                .evaluate(base + Duration::from_secs(secs), &s, &active)
+                .events
+        };
+
+        assert!(at(0, 2).is_empty());
+        assert_eq!(at(300, 2).len(), 1, "warning alerts once sustained");
+        // Escalation does not wait for the reminder clock — persistence
+        // is already established — and it reads as news, not a repeat
+        let crit = at(360, 4);
+        assert_eq!(crit.len(), 1, "worsening escalates immediately");
+        assert_eq!(crit[0].repeat_after, None);
+        assert_eq!(crit[0].severity(), Severity::Critical);
+
+        // The backoff now runs from the escalation, not from the first
+        // alert: t=2100 would have been due under the old clock
+        assert!(at(2100, 4).is_empty(), "backoff restarted at t=360s");
+        let reminder = at(2160, 4);
+        assert_eq!(reminder.len(), 1);
+        assert_eq!(
+            reminder[0].repeat_after,
+            Some(Duration::from_secs(1860)),
+            "but repeat_after still counts from the first alert"
+        );
     }
 
     #[test]
@@ -2363,6 +2601,171 @@ mod tests {
         assert_eq!(merged.cpu.for_process("mds_stores"), Some(50.0));
         // Untouched template entries stay active
         assert_eq!(merged.cpu.for_process("gopls"), Some(100.0));
+    }
+
+    #[test]
+    fn builtin_template_parses_and_every_key_is_usable() {
+        // The compiled-in table is data in a file, so nothing but this
+        // test stands between a typo there and a shipped binary whose
+        // template silently does not apply
+        let t = Template::builtin();
+        assert_eq!(t.version, Some(TEMPLATE_VERSION));
+        assert!(t.cpu.len() > 80, "cpu entries: {}", t.cpu.len());
+        assert!(!t.app_cpu.is_empty() && !t.app_mem.is_empty());
+
+        // Spot-check one entry per tier, so a bad value cannot pass by
+        // merely parsing
+        assert_eq!(t.cpu.get("rust-analyzer*"), Some(&100.0));
+        assert_eq!(t.cpu.get("rustc"), Some(&0.0));
+        assert_eq!(t.cpu.get("Xcode"), Some(&200.0));
+        assert_eq!(t.app_cpu.get("login"), Some(&0.0));
+        assert_eq!(t.app_mem.get("Google Chrome"), Some(&60.0));
+    }
+
+    #[test]
+    fn template_parse_rejects_bad_versions_tables_and_keys() {
+        assert!(Template::parse("[cpu]\nfoo = 1.0").is_err(), "no version");
+        assert!(Template::parse("version = 999").is_err(), "wrong version");
+        assert!(
+            Template::parse("version = 1\n[nope]\na = 1.0").is_err(),
+            "unknown table"
+        );
+        // A key the Matcher cannot honour would silently match nothing;
+        // a template is only useful if every line in it took effect
+        assert!(
+            Template::parse("version = 1\n[cpu]\n\"a*b\" = 1.0").is_err(),
+            "interior star"
+        );
+        let ok = Template::parse("version = 1\n[cpu]\n\"a*\" = 5.0").expect("valid");
+        assert_eq!(ok.cpu.get("a*"), Some(&5.0));
+        assert!(ok.app_cpu.is_empty(), "missing tables default to empty");
+    }
+
+    #[test]
+    fn a_loaded_template_replaces_the_builtin_rather_than_layering() {
+        let template = Template::parse("version = 1\n[cpu]\ngopls = 42.0").expect("valid");
+        let merged =
+            ActiveThresholds::from_config_with_template(&AlertsConfig::default(), &template);
+
+        assert_eq!(merged.cpu.for_process("gopls"), Some(42.0));
+        // Replacement, not a layer: an entry the file drops is gone, so
+        // a name can actually be REMOVED from the table. It falls back
+        // to the base rule, not to the builtin's value
+        assert_eq!(merged.cpu.for_process("rustc"), Some(DEFAULT_CPU_PERCENT));
+        assert_eq!(
+            merged.cpu.for_process("rust-analyzer-2026-08-10.1"),
+            Some(DEFAULT_CPU_PERCENT)
+        );
+        // A user override still outranks whatever the template says
+        let mut file = AlertsConfig::default();
+        file.cpu_overrides.insert("gopls".into(), 77.0);
+        let merged = ActiveThresholds::from_config_with_template(&file, &template);
+        assert_eq!(merged.cpu.for_process("gopls"), Some(77.0));
+    }
+
+    #[test]
+    fn matcher_reads_leading_and_trailing_stars_only() {
+        assert_eq!(
+            Matcher::parse("rust-analyzer"),
+            Ok(Matcher::Exact("rust-analyzer".into()))
+        );
+        assert_eq!(
+            Matcher::parse("rust-analyzer*"),
+            Ok(Matcher::Prefix("rust-analyzer".into()))
+        );
+        assert_eq!(
+            Matcher::parse("*Helper (Renderer)"),
+            Ok(Matcher::Suffix("Helper (Renderer)".into()))
+        );
+        assert_eq!(
+            Matcher::parse("*analyzer*"),
+            Ok(Matcher::Contains("analyzer".into()))
+        );
+        // An interior `*` is refused rather than taken literally: a key
+        // that looks like a pattern must never quietly match nothing
+        assert!(Matcher::parse("rust*analyzer").is_err());
+
+        let prefix = Matcher::parse("rust-analyzer*").expect("prefix");
+        assert!(prefix.matches("rust-analyzer-2026-08-10.1"));
+        assert!(prefix.matches("rust-analyzer-proc-macro-srv"));
+        assert!(prefix.matches("RUST-ANALYZER"), "case-insensitive");
+        assert!(!prefix.matches("rust-analyze"), "shorter than the literal");
+        assert!(!prefix.matches("my-rust-analyzer"), "prefix, not contains");
+
+        let suffix = Matcher::parse("*Helper (Renderer)").expect("suffix");
+        assert!(suffix.matches("Google Chrome Helper (Renderer)"));
+        assert!(!suffix.matches("Google Chrome Helper (GPU)"));
+
+        let contains = Matcher::parse("*analyzer*").expect("contains");
+        assert!(contains.matches("my-rust-analyzer-1"));
+        assert!(!contains.matches("rustc"));
+
+        // Degenerate keys must not panic — `windows(0)` would
+        assert!(Matcher::parse("*").expect("star").matches("anything"));
+        assert!(Matcher::parse("**").expect("stars").matches("anything"));
+        // A UTF-8 name is compared as bytes, so no boundary slicing
+        assert!(!prefix.matches("中文进程"));
+    }
+
+    #[test]
+    fn template_pattern_covers_a_versioned_binary_and_its_siblings() {
+        let merged = ActiveThresholds::from_config(&AlertsConfig::default());
+        // Zed rewrites this name on every rust-analyzer update, so the
+        // old exact `rust-analyzer` entry never matched and the indexer
+        // alerted against the 30% base — seen in a real daemon log
+        assert_eq!(
+            merged.cpu.for_process("rust-analyzer-2026-08-10.1"),
+            Some(100.0)
+        );
+        assert_eq!(
+            merged.cpu.for_process("rust-analyzer-proc-macro-srv"),
+            Some(100.0)
+        );
+        assert_eq!(merged.cpu.for_process("rust-analyzer"), Some(100.0));
+        // Still a prefix: an unrelated process is not swept up
+        assert_eq!(merged.cpu.for_process("rustc"), None);
+    }
+
+    #[test]
+    fn exact_names_and_user_entries_outrank_patterns() {
+        let mut file = AlertsConfig::default();
+        // A user pattern beats the TEMPLATE's exact entry: an explicit
+        // override is a request, a template entry is only a default
+        file.cpu_overrides.insert("*Helper (Renderer)".into(), 55.0);
+        // ...and the user's own exact name beats their own pattern
+        file.cpu_overrides
+            .insert("Google Chrome Helper (Renderer)".into(), 70.0);
+        let merged = ActiveThresholds::from_config(&file);
+
+        assert_eq!(
+            merged.cpu.for_process("Google Chrome Helper (Renderer)"),
+            Some(70.0),
+            "exact beats pattern within the user layer"
+        );
+        assert_eq!(
+            merged.cpu.for_process("Slack Helper (Renderer)"),
+            Some(55.0),
+            "user pattern beats the template's exact entry (100)"
+        );
+        assert_eq!(
+            merged.cpu.for_process("Google Chrome Helper (GPU)"),
+            Some(100.0),
+            "no user entry matches, so the template still applies"
+        );
+    }
+
+    #[test]
+    fn longer_patterns_win_over_shorter_ones() {
+        let mut file = AlertsConfig::default();
+        file.cpu_overrides.insert("rust*".into(), 40.0);
+        file.cpu_overrides.insert("rust-analyzer*".into(), 0.0);
+        let merged = ActiveThresholds::from_config(&file);
+
+        // The config's override map is a BTreeMap, so precedence cannot
+        // depend on the order these were written in — the longer
+        // literal is the more specific claim and wins
+        assert_eq!(merged.cpu.for_process("rust-analyzer-2026-08-10.1"), None);
+        assert_eq!(merged.cpu.for_process("rustc"), Some(40.0));
     }
 
     #[test]

@@ -76,6 +76,10 @@ Config keys for -add (also accepted as key=value). Durations take 500ms /
   alert-cpu <pct|name=pct>    [alerts] CPU rules: 5-min avg >= pct (chronic)
                               or 1-min avg >= 3x pct (runaway); name=pct sets
                               a per-process override, e.g. alert-cpu ghostty=100
+                              name may lead and/or end with * to cover a family
+                              of processes whose names are not stable, e.g.
+                              alert-cpu 'rust-analyzer*=200' (quote it: the
+                              shell would expand a bare *)
   alert-mem <pct|name=pct>    [alerts] 5-min avg memory-share rule, same forms
   alert-app-cpu <pct|name=pct>  [alerts] whole-app CPU rule over a process
                               tree (default 200; catches the browser whose
@@ -91,7 +95,11 @@ Config keys for -add (also accepted as key=value). Durations take 500ms /
                               condition notifies once, plus one follow-up
                               after 30m — never on every cooldown
   alert-template <bool>       [alerts] builtin per-app override template
-                              (default true; your overrides always win)
+                              (default true; your overrides always win).
+                              Drop a file at <config-dir>/template.toml to
+                              replace the builtin table without rebuilding —
+                              serve reloads it within ~1min of an mtime
+                              change, so refreshing it can be a cron curl
 ";
 
 #[derive(Clone, Copy, PartialEq)]
@@ -567,9 +575,16 @@ fn main() -> ExitCode {
             }
 
             let mut extra_sinks: Vec<Arc<dyn MetricSink>> = Vec::new();
-            // Alert settings come from the config file (hot-reloaded by
-            // the sink on mtime change, every 30 collects)
-            let alert_sink = alerts::AlertSink::from_config(&file.alerts);
+            // Alert settings come from the config file and the optional
+            // template override (both hot-reloaded by the sink on mtime
+            // change, every 30 collects). A malformed template fails
+            // fast here, exactly like a malformed config: at startup a
+            // silently-ignored template is a silently-missing alert
+            let template = settings::load_template().unwrap_or_else(|e| {
+                eprintln!("zstats: {e}");
+                std::process::exit(1);
+            });
+            let alert_sink = alerts::AlertSink::from_config(&file.alerts, &template);
             if alert_sink.enabled() {
                 extra_sinks.push(Arc::new(alert_sink));
             }

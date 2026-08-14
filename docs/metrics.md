@@ -280,6 +280,19 @@ still true (`repeat_after.is_some()`), then silence until the value falls back
 and re-arms. An alert list should therefore group by episode, not append a row
 per evaluation.
 
+`pressure` is the exception, in both directions, because it is a machine state
+rather than a culprit — nothing to kill, and it can legitimately hold all day:
+
+- its reminders **repeat indefinitely on a backoff** — 30m, 1h, 2h, then every
+  4h — instead of stopping after one, so a UI must be ready for many
+  `repeat_after` events in one episode;
+- its episode **ends only after 5 minutes of continuous normal**, so brief dips
+  back to level 1 must not clear the banner (the kernel level is a noisy step
+  function; treating one normal sample as recovery is what made this alert
+  repeat in the first place);
+- `sustained` counts from when the level first went above normal, while
+  `repeat_after` counts from the episode's first notification.
+
 ### 4.3 History — `records::MetricRecord`
 
 One JSON line per qualifying process per minute in
@@ -337,8 +350,37 @@ volume), `alert-pressure` (`off`/`warning`/`critical`), `alert-cooldown`
 (600s), `alert-template` (the builtin per-app exemption list).
 
 The first four accept per-name overrides (`ghostty=100`, `0` disables that
-name); `alert-disk` accepts per-mount overrides. Precedence is **user
-override > builtin template > base value**.
+name); `alert-disk` accepts per-mount overrides.
+
+An override key may lead and/or end with `*` to claim a family of names —
+`rust-analyzer*`, `*Helper (Renderer)`. This matters because a process name is
+not a stable identifier: tool managers stamp the version into the binary
+itself (Zed's rust-analyzer is `rust-analyzer-2026-08-10.1` and gets renamed on
+every update), so an exact key silently stops matching. A `*` anywhere other
+than the ends is rejected rather than treated as a literal.
+
+Precedence when several keys match, highest first:
+
+1. user exact name
+2. user pattern — longer literal wins
+3. builtin template exact name
+4. builtin template pattern
+5. the rule's base value
+
+A settings UI should surface which rule actually applied to a process; the
+merged view is `alerts::ActiveThresholds::from_config`.
+
+The template layer itself is a TOML file, not a table in the source —
+`templates/alerts.toml`, compiled in via `include_str!` and parsed into
+`alerts::Template` (`version`, `[cpu]`, `[app_cpu]`, `[app_mem]`). A copy at
+`<config-dir>/template.toml` **replaces** it wholesale, so the table can be
+refreshed on a schedule (`curl -o`) without a new binary; the daemon reloads it
+within about a minute of an mtime change. A missing file means "use the
+builtin", but a malformed or wrong-version one is an error rather than a silent
+fallback. Load it with `settings::load_template(dir)` and pass it to
+`ActiveThresholds::from_config_with_template` — a frontend that embeds
+collection should do this rather than calling `from_config`, or it will ignore
+the user's template.
 
 ---
 

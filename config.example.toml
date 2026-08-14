@@ -131,8 +131,15 @@ disk = 90.0
 #               machine that sits at warning as its normal state
 # Alerts only once the level PERSISTS: 5 minutes for warning, 1 minute
 # for critical (more severe, faster notification). Escalation from
-# warning to critical within the same episode notifies immediately;
-# lingering at one level never nags. `true`/`false` still parse
+# warning to critical within the same episode notifies immediately.
+# The episode is symmetric — it ends only after 5 minutes of continuous
+# normal, so the brief dips a machine sitting near the line makes all
+# day cannot turn one condition into a stream of "new" alerts. While it
+# holds, reminders back off: 30 min, 1 h, 2 h, then every 4 h, each one
+# marked "still going" rather than posing as a fresh event. This is the
+# only rule that keeps reminding — memory pressure is a machine state
+# you may not be able to fix, not a process you can kill.
+# `true`/`false` still parse
 pressure = "warning"
 # Minimum time between EPISODES for the same process and rule. A
 # condition that simply persists notifies once, plus exactly one
@@ -161,141 +168,34 @@ template = true
 # nothing, while a background indexer pegged for minutes is a real
 # failure and keeps a raised bar instead of an exemption.
 #
-# The list below IS BUILT IN as the template (default on, see above) —
-# it is reproduced here as reference only; uncommenting an entry makes it
-# an explicit user override that shadows the builtin one. Values: 100 =
-# "only interrupt me at a full core", 200 = "multi-core is its job",
-# 0 = "never interrupt, still record".
+# A key may lead and/or end with `*` to claim a family of names —
+# "rust-analyzer*", "*Helper (Renderer)", "*python*". Use it when the
+# name is not stable: tool managers stamp the version into the binary
+# itself, so an exact key silently stops matching after every update.
+# A `*` anywhere else is an error rather than a literal. Precedence when
+# several keys match: your own entries beat the builtin template, an
+# exact name beats a pattern, and a longer pattern beats a shorter one.
+# From a shell, quote it: `zstats -add alert-cpu 'rust-analyzer*=200'`.
+#
+# The builtin template (default on, see above) lives in
+# `templates/alerts.toml` in the source tree — ~144 entries covering
+# browsers, Electron apps, IDE indexers, toolchains and periodic macOS
+# system work. It used to be reproduced here, which meant keeping two
+# copies of the same 144 lines in sync by hand; read that file instead.
+#
+# To ADD an entry, put it below — a user override outranks the template
+# whatever the template says. To REPLACE the table wholesale (for
+# example from a copy you refresh on a schedule), drop your own file at
+# <config-dir>/template.toml; the daemon picks it up within about a
+# minute, no restart:
+#
+#     curl -fsS -o ~/.zstats/template.toml https://example.com/alerts.toml
+#
+# Values: 100 = "only interrupt me at a full core", 200 = "multi-core is
+# its job", 0 = "never interrupt, still record".
 [alerts.cpu_overrides]
-# --- browsers: page loads / video / heavy-JS sites run for minutes
-# "Google Chrome" = 100.0
-# "Google Chrome Helper (Renderer)" = 100.0   # per-tab; ≥100 = a pegged tab
-# "Google Chrome Helper (GPU)" = 100.0        # video playback
-# "Microsoft Edge Helper (Renderer)" = 100.0
-# "Brave Browser Helper (Renderer)" = 100.0
-# "Arc Helper (Renderer)" = 100.0
-# firefox = 100.0
-# plugin-container = 100.0                    # Firefox content processes
-# "com.apple.WebKit.WebContent" = 100.0       # Safari tabs
-# "com.apple.WebKit.GPU" = 100.0
-
-# --- Electron / Chromium desktop apps: same engine, same bursts
-# "Slack Helper (Renderer)" = 100.0
-# "Discord Helper (Renderer)" = 100.0
-# "Notion Helper (Renderer)" = 100.0
-# "Obsidian Helper (Renderer)" = 100.0
-# "Figma Helper (Renderer)" = 100.0           # canvas rendering is real work
-# "Spotify Helper" = 100.0
-# "QQ Helper (Renderer)" = 100.0
-# "Lark Helper (Renderer)" = 100.0            # Feishu
-# DingTalk = 100.0
-# "WeCom Helper (Renderer)" = 100.0
-# wwmapp = 100.0                              # 企业微信's real process name
-
-# --- editors / IDEs / language servers: re-index after every edit burst
-# "Cursor Helper (Renderer)" = 100.0
-# "Code Helper (Renderer)" = 100.0
-# gopls = 100.0
-# rust-analyzer = 100.0
-# clangd = 100.0
-# sourcekit-lsp = 100.0
-# Xcode = 200.0
-# SourceKitService = 200.0                    # Xcode indexing eats cores
-# swift-frontend = 200.0                      # 200 not 0: this one name covers
-#                                             #   builds AND background indexing
-# XCBBuildService = 200.0                     # Xcode's build orchestrator
-# XCPreviewAgent = 200.0                      # SwiftUI Previews rebuild in a loop
-# idea = 200.0                                # JetBrains IDEs run under their
-# goland = 200.0                              #   own binary name (pycharm,
-# clion = 200.0                               #   webstorm, ... same story)
-
-# --- VMs / containers: guest workload is supposed to use cores
-# "com.docker.backend" = 200.0
-# "com.docker.virtualization" = 200.0
-# "OrbStack Helper" = 200.0
-# qemu-system-aarch64 = 200.0                 # UTM / Lima / colima
-# prl_vm_app = 200.0                          # Parallels
-# vmware-vmx = 200.0
-
-# --- iOS Simulator
-# Simulator = 100.0                           # renders the device screen
-# "com.apple.CoreSimulator.CoreSimulatorService" = 100.0
-#   ...deliberately NOT 0: a wedged CoreSimulatorService spinning at a full
-#   core with no simulator running is a known Xcode failure, and the fix is
-#   to kill it — one of the few genuinely actionable alerts here
-
-# --- terminals rendering streaming AI output, and the AI CLIs themselves
 # ghostty = 100.0
-# iTerm2 = 100.0
-# kitty = 100.0
-# alacritty = 100.0
-# claude = 100.0                              # Claude Code sessions
-
-# --- calls / screen sharing: video encode while the call lasts
-# "zoom.us" = 100.0
-# WeChat = 100.0
-# "Microsoft Teams" = 100.0
-# TencentMeeting = 100.0
-# avconferenced = 100.0                       # FaceTime's encoder
-
-# --- toolchains: a build is supposed to saturate cores
-# rustc = 0.0                                 # LTO / codegen-units=1 easily
-# cargo = 0.0                                 #   outlives the 50s window
-# clippy-driver = 0.0
-# rustdoc = 0.0
-# clang = 0.0
-# "clang++" = 0.0
-# cc1plus = 0.0                               # gcc's C++ compiler proper
-# gcc = 0.0
-# "g++" = 0.0
-# ld = 0.0                                    # link steps are single-threaded
-# lld = 0.0                                   #   and long on big binaries
-# make = 0.0
-# cmake = 0.0
-# ninja = 0.0
-# go = 0.0
-# esbuild = 0.0
-# git = 0.0                                   # auto-gc / repack on a big repo
-# xcodebuild = 0.0                            # Xcode's build-time tools
-# swift-driver = 0.0
-# actool = 0.0                                # asset catalogs on a big app
-# ibtool = 0.0
-# ibtoold = 0.0
-# dsymutil = 0.0                              # DWARF linking: single-threaded
-# ld-classic = 0.0                            #   and long after an archive
-# NOTE tsc, gradle, webpack etc. are deliberately ABSENT: they run under
-# node/java, and overriding those names would silence half the real
-# runaways (see the note at the end of this section)
-
-# --- long jobs you started yourself: never actionable, history only
-# OBS = 0.0                                   # streaming / recording
-# ffmpeg = 0.0                                # long transcodes DO outlive 50s
-# HandBrake = 0.0
-# "Final Cut Pro" = 0.0
-# ollama = 0.0                                # local LLM inference pegs cores
-
-# --- macOS periodic system work: not actionable, keep the history only
-# Spotlight is a FAMILY of daemons — spotlightknowledged alone was the
-# noisiest alerter observed on a real machine
-# mds = 0.0
-# mds_stores = 0.0                            # Spotlight indexing
-# mdworker = 0.0
-# mdworker_shared = 0.0                       #   ...and its worker pool
-# spotlightknowledged = 0.0                   # semantic index
-# corespotlightd = 0.0
-# knowledgeconstructiond = 0.0
-# suggestd = 0.0
-# parsecd = 0.0
-# photoanalysisd = 0.0                        # Photos ML pass after imports
-# mediaanalysisd = 0.0                        # its video-analysis twin
-# backupd = 0.0                               # Time Machine
-# syspolicyd = 0.0                            # first-launch app verification
-# installd = 0.0                              # App Store / pkg installs
-# softwareupdated = 0.0
-# kernel_task = 0.0                           # inflates on purpose to cool the machine
-# wdavdaemon = 0.0                            # Microsoft Defender on corp Macs
-# WindowServer = 100.0                        # sustained ≥100% usually means some
-#                                             #   app is spamming redraws — actionable
+# "rust-analyzer*" = 200.0
 
 # Do NOT blanket-override interpreters like node/python/java — half the
 # real runaways are one of those (and tsserver/pyright/Gradle hide behind
@@ -316,23 +216,14 @@ template = true
 # on macOS every terminal session's descendants group under a `login`
 # root, so "the cargo build I started" is a `login` group, not `ghostty`.
 #
-# The builtin app template (same `template` switch as above) already
-# covers the two cases that matter, reproduced here for reference:
-# terminal sessions and VM hosts are silenced (0 — you started that work,
-# and its members still have per-process rules), browsers and IDEs get a
-# raised bar rather than an exemption.
+# The builtin app template (same `template` switch as above, and the same
+# `templates/alerts.toml` file — the `[app_cpu]` and `[app_mem]` tables)
+# already covers the two cases that matter: terminal sessions and VM
+# hosts are silenced (0 — you started that work, and its members still
+# have per-process rules), browsers and IDEs get a raised bar rather than
+# an exemption.
 [alerts.app_cpu_overrides]
-# login = 0.0
-# tmux = 0.0
-# "com.docker.backend" = 0.0
-# "Google Chrome" = 400.0
 # zed = 400.0
-# Simulator = 400.0                           # a booted simulator is a whole
-# "com.apple.CoreSimulator.CoreSimulatorService" = 400.0    # device's daemons
 
 [alerts.app_mem_overrides]
-# login = 0.0
 # "Google Chrome" = 60.0
-# Xcode = 60.0
-# Simulator = 60.0
-# "com.apple.CoreSimulator.CoreSimulatorService" = 60.0

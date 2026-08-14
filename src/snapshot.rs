@@ -266,6 +266,22 @@ pub struct ProcessSnapshot {
     #[serde(default)]
     pub cpu_time_ms: u64,
     pub memory_bytes: u64,
+    /// Physical footprint in bytes — what macOS bills the process for:
+    /// private dirty memory, compressed pages, and GPU/IOKit allocations
+    /// (IOSurface, Metal buffers). This is the figure Activity Monitor's
+    /// Memory column shows and what memory-pressure/jetsam accounting
+    /// uses, and it diverges from `memory_bytes` (RSS) in BOTH
+    /// directions: RSS counts shared framework pages footprint excludes,
+    /// footprint counts compressed and GPU memory RSS cannot see. A GUI
+    /// app can legitimately read 80 MB in one and 300 MB in the other.
+    ///
+    /// macOS only, and only for processes the collector may inspect —
+    /// `proc_pid_rusage` fails on other users' processes, so an
+    /// unprivileged collector reports None for root-owned daemons
+    /// (Activity Monitor sees them through the privileged sysmond).
+    /// None on every other platform.
+    #[serde(default)]
+    pub phys_footprint_bytes: Option<u64>,
     /// Virtual address space size (when available)
     #[serde(default)]
     pub virtual_memory_bytes: u64,

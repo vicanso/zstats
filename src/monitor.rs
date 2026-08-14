@@ -88,22 +88,30 @@ impl Monitor {
     pub fn new(config_dir: impl Into<PathBuf>) -> Result<Self, ConfigError> {
         let config_dir = config_dir.into();
         let settings = crate::settings::load(&config_dir)?;
-        Ok(Self::with_settings(config_dir, settings))
+        Self::with_settings(config_dir, settings)
     }
 
     /// Same, for a frontend that already holds the parsed settings (a
-    /// settings panel, say) and does not want them re-read
-    pub fn with_settings(config_dir: impl Into<PathBuf>, settings: FileConfig) -> Self {
+    /// settings panel, say) and does not want them re-read. Still
+    /// fallible: `<config-dir>/template.toml` is read here, and a
+    /// template that failed to load is a rule set that silently did not
+    /// apply
+    pub fn with_settings(
+        config_dir: impl Into<PathBuf>,
+        settings: FileConfig,
+    ) -> Result<Self, ConfigError> {
+        let config_dir = config_dir.into();
         let collector_config = settings.collector.clone().unwrap_or_default();
-        let thresholds = ActiveThresholds::from_config(&settings.alerts);
-        Self {
-            config_dir: config_dir.into(),
+        let template = crate::settings::load_template(&config_dir)?;
+        let thresholds = ActiveThresholds::from_config_with_template(&settings.alerts, &template);
+        Ok(Self {
+            config_dir,
             settings,
             collector: LocalCollector::new(collector_config),
             engine: AlertEngine::new(),
             thresholds,
             windows: ProcessWindows::new(DISPLAY_WINDOW),
-        }
+        })
     }
 
     /// Collect once, evaluate the alert rules, update the rolling
@@ -140,16 +148,20 @@ impl Monitor {
         })
     }
 
-    /// Re-read the config file and rebuild the alert thresholds, keeping
-    /// every accumulated window and cooldown intact — call this after a
-    /// settings panel writes.
+    /// Re-read the config file and the template, and rebuild the alert
+    /// thresholds, keeping every accumulated window and cooldown intact
+    /// — call this after a settings panel writes.
     ///
     /// Only the `[alerts]` section takes effect: `[collector]` settings
     /// are baked into a running collector whose rate baselines would be
-    /// lost, so apply those by building a new [`Monitor`].
+    /// lost, so apply those by building a new [`Monitor`]. Nothing is
+    /// applied unless BOTH files load, so a broken one never leaves half
+    /// the thresholds updated.
     pub fn reload_settings(&mut self) -> Result<(), ConfigError> {
-        self.settings = crate::settings::load(&self.config_dir)?;
-        self.thresholds = ActiveThresholds::from_config(&self.settings.alerts);
+        let settings = crate::settings::load(&self.config_dir)?;
+        let template = crate::settings::load_template(&self.config_dir)?;
+        self.thresholds = ActiveThresholds::from_config_with_template(&settings.alerts, &template);
+        self.settings = settings;
         Ok(())
     }
 

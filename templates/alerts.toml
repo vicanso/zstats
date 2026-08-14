@@ -1,0 +1,278 @@
+# zstats builtin alert template
+#
+# Raised (or zeroed) alert bars for processes that legitimately sustain
+# high CPU or a large share of RAM. This is a refinement of the base
+# rules, not a source of alerts in its own right — unlike an ignore
+# list, a real runaway still alerts, and an override silences the
+# NOTIFICATION while the data point is still recorded to
+# <config-dir>/data/.
+#
+# This exact file is compiled into the binary. Drop an edited copy at
+# <config-dir>/template.toml to REPLACE it wholesale — the daemon picks
+# the change up within about a minute, no restart. To ADD one entry you
+# do not need this file at all; that is what user overrides are for:
+#
+#     zstats -add alert-cpu 'rust-analyzer*=200'
+#
+# Precedence, highest first: user override > this template > base value.
+# Set `template = false` in the config's [alerts] section to skip the
+# template entirely. A layer is also skipped when its base rule is
+# disabled (`alert-cpu 0` must mean "no CPU alerts", not "~90 templated
+# apps keep firing").
+#
+# KEYS may lead and/or end with `*` to claim a family of names —
+# "rust-analyzer*", "*Helper (Renderer)". Use it when the name is not
+# stable: tool managers stamp the version into the binary itself, so an
+# exact key silently stops matching after an update. A `*` anywhere
+# else is an error. When several keys match one process: exact beats
+# pattern, and a longer pattern beats a shorter one.
+#
+# Only processes that can outlive the 50s alert window are worth
+# listing — a burst that exits sooner never notifies anyway.
+
+# Bump only on an incompatible format change; an unknown version is
+# rejected rather than half-read
+version = 1
+
+# Per-process CPU, in single-core percent (200 = two full cores).
+#
+#   100  interrupt me only at a full core   (interactive apps)
+#   200  multi-core is its job              (IDE indexers, VM hosts)
+#     0  never interrupt, still record      (work you started yourself,
+#                                            periodic macOS system work)
+#
+# The dividing line for 0 is WHO ASKED, not how much CPU it uses: you
+# typed the build command, so "your compiler is compiling" tells you
+# nothing you did not know, while a background indexer pegged for
+# minutes is a real (and common) failure that keeps a raised bar
+# instead.
+[cpu]
+
+# --- Browsers: page loads / video / heavy-JS sites run for minutes
+"Google Chrome" = 100.0
+"Google Chrome Helper (Renderer)" = 100.0
+"Google Chrome Helper (GPU)" = 100.0
+"Microsoft Edge Helper (Renderer)" = 100.0
+"Brave Browser Helper (Renderer)" = 100.0
+"Arc Helper (Renderer)" = 100.0
+firefox = 100.0
+plugin-container = 100.0
+"com.apple.WebKit.WebContent" = 100.0
+"com.apple.WebKit.GPU" = 100.0
+
+# --- Electron / Chromium desktop apps: same engine, same bursts
+"Slack Helper (Renderer)" = 100.0
+"Discord Helper (Renderer)" = 100.0
+"Notion Helper (Renderer)" = 100.0
+"Obsidian Helper (Renderer)" = 100.0
+"Figma Helper (Renderer)" = 100.0
+"Spotify Helper" = 100.0
+"QQ Helper (Renderer)" = 100.0
+"Lark Helper (Renderer)" = 100.0
+DingTalk = 100.0
+# 企业微信 runs as `wwmapp`, not under a "WeCom Helper" name — vendor
+# process names are worth confirming with `zstats --json` rather than
+# guessing from the app's title
+"WeCom Helper (Renderer)" = 100.0
+wwmapp = 100.0
+
+# --- Editors / IDEs / language servers: re-index after every edit burst
+"Cursor Helper (Renderer)" = 100.0
+"Code Helper (Renderer)" = 100.0
+gopls = 100.0
+# A pattern, not a name: Zed installs the server as
+# `rust-analyzer-<date>` and rewrites that name on every update, so the
+# plain entry this replaces had never once matched. It also picks up
+# `rust-analyzer-proc-macro-srv`, which is the same tool
+"rust-analyzer*" = 100.0
+clangd = 100.0
+sourcekit-lsp = 100.0
+Xcode = 200.0
+SourceKitService = 200.0
+# Deliberately 200 rather than 0 despite being a compiler: this one name
+# serves both the build you started AND Xcode's background indexing, and
+# the indexing half is worth a raised bar
+swift-frontend = 200.0
+XCBBuildService = 200.0
+# SwiftUI Previews rebuild in a loop while the canvas is open
+XCPreviewAgent = 200.0
+idea = 200.0
+goland = 200.0
+clion = 200.0
+
+# --- VMs / containers: guest workload is supposed to use cores
+"com.docker.backend" = 200.0
+"com.docker.virtualization" = 200.0
+"OrbStack Helper" = 200.0
+qemu-system-aarch64 = 200.0
+prl_vm_app = 200.0
+vmware-vmx = 200.0
+
+# --- iOS Simulator: the app renders the device screen, so a busy
+# simulated app keeps it near a core. Deliberately NOT 0 for the
+# CoreSimulator service — a wedged one spinning at a full core with no
+# simulator running is a well-known Xcode failure whose fix is to kill
+# it, which makes it one of the few genuinely actionable alerts here
+Simulator = 100.0
+"com.apple.CoreSimulator.CoreSimulatorService" = 100.0
+
+# --- Terminals rendering streaming AI output, and the AI CLIs themselves
+ghostty = 100.0
+iTerm2 = 100.0
+kitty = 100.0
+alacritty = 100.0
+claude = 100.0
+
+# --- Calls / screen sharing: video encode while the call lasts
+"zoom.us" = 100.0
+WeChat = 100.0
+"Microsoft Teams" = 100.0
+TencentMeeting = 100.0
+avconferenced = 100.0
+
+# --- Toolchains: a build is SUPPOSED to saturate cores, and "your
+# compiler is compiling" is never actionable. Most invocations are far
+# too short to fill the window; the ones that do are exactly the ones
+# you are already waiting on (LTO codegen, a link step, one enormous
+# translation unit). Note interpreted tools are absent on purpose —
+# `tsc`, gradle and friends run under `node`/`java`, and those names are
+# half the real runaways
+rustc = 0.0
+cargo = 0.0
+clippy-driver = 0.0
+rustdoc = 0.0
+clang = 0.0
+"clang++" = 0.0
+cc1plus = 0.0
+gcc = 0.0
+"g++" = 0.0
+ld = 0.0
+lld = 0.0
+make = 0.0
+cmake = 0.0
+ninja = 0.0
+go = 0.0
+esbuild = 0.0
+# Xcode's build-time tools (names verified against Xcode.app, not
+# guessed from menu titles). dsymutil and the linkers are
+# single-threaded and long — the classic "why is the fan on after an
+# archive"
+xcodebuild = 0.0
+swift-driver = 0.0
+actool = 0.0
+ibtool = 0.0
+ibtoold = 0.0
+dsymutil = 0.0
+ld-classic = 0.0
+# Auto-gc / repack on a big repo pegs a core for minutes without anyone
+# asking, and there is nothing to do about it either
+git = 0.0
+
+# --- Long jobs you started yourself: never actionable, history only
+OBS = 0.0
+ffmpeg = 0.0
+HandBrake = 0.0
+"Final Cut Pro" = 0.0
+ollama = 0.0
+
+# --- macOS periodic system work: not actionable, history only.
+# Spotlight is a family, not one process — `spotlightknowledged` alone
+# was the single noisiest alerter on a real machine while only two of
+# its siblings were listed
+mds = 0.0
+mds_stores = 0.0
+mdworker = 0.0
+mdworker_shared = 0.0
+spotlightknowledged = 0.0
+corespotlightd = 0.0
+knowledgeconstructiond = 0.0
+suggestd = 0.0
+parsecd = 0.0
+photoanalysisd = 0.0
+mediaanalysisd = 0.0
+backupd = 0.0
+syspolicyd = 0.0
+installd = 0.0
+softwareupdated = 0.0
+kernel_task = 0.0
+wdavdaemon = 0.0
+# Sustained >=100% here usually means some app is spamming redraws
+WindowServer = 100.0
+
+# Whole-application CPU, keyed on the process-tree ROOT name, in
+# single-core percent. Deliberately much shorter than [cpu]: the app
+# thresholds already start high (200% / 40%), so only two situations
+# need exempting — work you started yourself, and hosts whose whole job
+# is to burn cores on someone else's behalf.
+#
+# `login` is the important entry and the reason this table exists at
+# all: on macOS every terminal session's descendants group under a
+# `login` root, so a build sustains hundreds of percent under a name
+# that is not an application. Silencing it costs nothing — a genuine
+# runaway among its members is still caught by the per-process rules.
+[app_cpu]
+
+# --- Terminal sessions: your own foreground work
+login = 0.0
+sshd = 0.0
+tmux = 0.0
+screen = 0.0
+
+# --- VM / container hosts: guest workload is supposed to use cores
+"com.docker.backend" = 0.0
+"com.docker.virtualization" = 0.0
+"OrbStack Helper" = 0.0
+qemu-system-aarch64 = 0.0
+prl_vm_app = 0.0
+vmware-vmx = 0.0
+
+# --- Editors and browsers fan out across many helpers; a few cores
+# during an index rebuild or a heavy page is normal.
+# A booted simulator is a whole device's worth of daemons. Which name
+# roots the tree depends on who spawned launchd_sim, so both are listed;
+# confirm against `zstats --json` with a simulator running
+Simulator = 400.0
+"com.apple.CoreSimulator.CoreSimulatorService" = 400.0
+Xcode = 400.0
+idea = 400.0
+goland = 400.0
+clion = 400.0
+zed = 400.0
+Cursor = 400.0
+Code = 400.0
+"Google Chrome" = 400.0
+"Microsoft Edge" = 400.0
+"Brave Browser" = 400.0
+Arc = 400.0
+firefox = 400.0
+Safari = 400.0
+
+# Whole-application memory, keyed on the tree root name, as a percent of
+# total RAM. Browsers and IDEs legitimately hold a large share of a
+# machine's RAM; the system memory-pressure rule is what catches
+# "actually too much", so these only need to not cry wolf.
+[app_mem]
+
+# --- Your own terminal work — the pressure rule covers real trouble
+login = 0.0
+sshd = 0.0
+tmux = 0.0
+screen = 0.0
+"com.docker.backend" = 0.0
+"com.docker.virtualization" = 0.0
+"OrbStack Helper" = 0.0
+qemu-system-aarch64 = 0.0
+prl_vm_app = 0.0
+vmware-vmx = 0.0
+
+# --- A browser with many tabs routinely passes 40% of RAM
+"Google Chrome" = 60.0
+"Microsoft Edge" = 60.0
+"Brave Browser" = 60.0
+Arc = 60.0
+firefox = 60.0
+Safari = 60.0
+Xcode = 60.0
+# A booted device image plus its daemons runs to several GiB
+Simulator = 60.0
+"com.apple.CoreSimulator.CoreSimulatorService" = 60.0

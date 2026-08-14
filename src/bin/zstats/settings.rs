@@ -44,6 +44,19 @@ pub fn path() -> PathBuf {
     zstats::settings::config_path(&dir())
 }
 
+/// The optional `<config-dir>/template.toml` alert-template override.
+/// Only the daemon reads it, and that is unix-only
+#[cfg(unix)]
+pub fn template_path() -> PathBuf {
+    zstats::settings::template_path(&dir())
+}
+
+/// The template override if present, else the compiled-in one
+#[cfg(unix)]
+pub fn load_template() -> Result<zstats::alerts::Template, String> {
+    zstats::settings::load_template(&dir()).map_err(|e| e.to_string())
+}
+
 /// Load the config file; a missing file is an empty config, a malformed
 /// one is an error (so a typo doesn't silently drop the user's settings)
 pub fn load() -> Result<FileConfig, String> {

@@ -22,7 +22,7 @@
 use std::sync::Mutex;
 use std::time::{Instant, SystemTime};
 
-use zstats::alerts::{ActiveThresholds, AlertEngine};
+use zstats::alerts::{ActiveThresholds, AlertEngine, Template};
 use zstats::records::MetricRecord;
 use zstats::{MetricSink, SinkError, SystemSnapshot, async_trait};
 
@@ -34,16 +34,22 @@ const RELOAD_CHECK_EVERY: u32 = 30;
 /// Give the notification helper this long before assuming it is stuck
 const NOTIFY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
-fn config_mtime() -> Option<SystemTime> {
-    std::fs::metadata(settings::path())
-        .ok()
-        .and_then(|m| m.modified().ok())
+fn mtime(path: std::path::PathBuf) -> Option<SystemTime> {
+    std::fs::metadata(path).ok().and_then(|m| m.modified().ok())
+}
+
+/// mtimes of both files thresholds are built from. The template is
+/// watched alongside the config precisely so refreshing it can be a
+/// `curl -o` from cron — the daemon notices within about a minute and
+/// never needs restarting
+fn source_mtimes() -> (Option<SystemTime>, Option<SystemTime>) {
+    (mtime(settings::path()), mtime(settings::template_path()))
 }
 
 /// Hot-reload bookkeeping
 struct ReloadState {
     rounds_since_check: u32,
-    last_mtime: Option<SystemTime>,
+    last_mtime: (Option<SystemTime>, Option<SystemTime>),
 }
 
 /// Sink that watches snapshots and fires desktop notifications, driven
@@ -58,13 +64,13 @@ impl AlertSink {
     /// Build from the `[alerts]` config section; the file is then
     /// re-checked every [`RELOAD_CHECK_EVERY`] collects and reloaded on
     /// mtime change
-    pub fn from_config(file: &settings::AlertsConfig) -> Self {
+    pub fn from_config(file: &settings::AlertsConfig, template: &Template) -> Self {
         Self {
-            active: Mutex::new(ActiveThresholds::from_config(file)),
+            active: Mutex::new(ActiveThresholds::from_config_with_template(file, template)),
             engine: Mutex::new(AlertEngine::new()),
             reload: Mutex::new(ReloadState {
                 rounds_since_check: 0,
-                last_mtime: config_mtime(),
+                last_mtime: source_mtimes(),
             }),
         }
     }
@@ -88,20 +94,26 @@ impl AlertSink {
         }
         reload.rounds_since_check = 0;
 
-        let mtime = config_mtime();
-        tracing::debug!(?mtime, last = ?reload.last_mtime, "alert config reload check");
-        if mtime == reload.last_mtime {
+        let mtimes = source_mtimes();
+        tracing::debug!(?mtimes, last = ?reload.last_mtime, "alert config reload check");
+        if mtimes == reload.last_mtime {
             return;
         }
-        reload.last_mtime = mtime;
+        reload.last_mtime = mtimes;
 
-        match settings::load() {
-            Ok(file) => {
+        // Both halves must load before either is applied: half-new
+        // thresholds are worse than the previous consistent set
+        match (settings::load(), settings::load_template()) {
+            (Ok(file), Ok(template)) => {
                 *self.active.lock().unwrap_or_else(|e| e.into_inner()) =
-                    ActiveThresholds::from_config(&file.alerts);
-                tracing::info!("reloaded alert config from {}", settings::path().display());
+                    ActiveThresholds::from_config_with_template(&file.alerts, &template);
+                tracing::info!(
+                    config = %settings::path().display(),
+                    template = %settings::template_path().display(),
+                    "reloaded alert config"
+                );
             }
-            Err(e) => {
+            (Err(e), _) | (_, Err(e)) => {
                 tracing::warn!("alert config reload failed, keeping previous settings: {e}");
             }
         }

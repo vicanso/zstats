@@ -1,7 +1,8 @@
 .DEFAULT_GOAL := help
 
 .PHONY: help build release test lint fmt fmt-check check check-features check-targets \
-	run json clean install upgrade version version-patch version-minor version-major
+	run json clean install upgrade version version-patch version-minor version-major \
+	tag
 
 # Release version — read from Cargo.toml, the single source of truth the
 # tag, the changelog and the published tarball names all derive from.
@@ -60,14 +61,27 @@ upgrade: install ## Install, then restart the daemon on the new binary
 	zstats serve
 
 # Release flow: `make version-patch` (bump + changelog), review the diff,
-# commit, then `git tag vX.Y.Z && git push --tags` — the publish workflow
-# fires on v*.*.* and builds the release assets. Nothing here commits,
-# tags or pushes: those stay deliberate. Unlike projects that carry MSI /
+# commit, then `make tag` and `git push origin vX.Y.Z` — the publish
+# workflow fires on v*.*.* and builds the release assets. Nothing here
+# commits or pushes: those stay deliberate.
+#
+# The tag is not optional bookkeeping: `git cliff --unreleased` derives
+# the range from the latest tag, so a release that never gets tagged
+# makes the NEXT changelog repeat the whole history under the new
+# version. `make version` refuses to run when no tag exists at all. Unlike projects that carry MSI /
 # flatpak / deb metadata, zstats needs no secondary version sync — every
 # published artifact derives its name from the git tag.
 
 version: ## Prepend the changelog for the version currently in Cargo.toml
+	@git describe --tags --abbrev=0 >/dev/null 2>&1 || { \
+		echo "no release tag exists — git cliff would treat the ENTIRE history as"; \
+		echo "unreleased and repeat it under v$(VERSION). Tag the previous release"; \
+		echo "first: git tag -a vX.Y.Z <commit>"; exit 1; }
 	git cliff --unreleased --tag v$(VERSION) --prepend CHANGELOG.md
+
+tag: ## Tag the version currently in Cargo.toml (push separately)
+	git tag -a v$(VERSION) -m "version $(VERSION)"
+	@echo "created v$(VERSION) — push it with: git push origin v$(VERSION)" 
 
 # Bump Cargo.toml (+ Cargo.lock) via cargo-edit, then run `version` in a
 # fresh make invocation — VERSION is expanded at parse time, so the

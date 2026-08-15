@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.5.0](https://github.com/vicanso/zstats/compare/v0.4.0..v0.5.0) - 2026-08-15
+
+### ⛰️  Features
+
+- Memory alert rework — pressure attribution, byte bar, footprint basis - ([dfe545c](https://github.com/vicanso/zstats/commit/dfe545cea7389ca6784f7f5950c12c37e5b8bbc2))
+
 ## [0.4.0] - 2026-08-14
 
 ### ⛰️  Features

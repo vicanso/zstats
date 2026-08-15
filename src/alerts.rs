@@ -44,6 +44,15 @@
 //! re-arms only after dropping [`DISK_REARM_MARGIN`] below — one
 //! notification per episode, no cooldown, per-mount overrides.
 //!
+//! Memory is the one resource whose "is this a problem" question the
+//! machine answers better than any threshold can, so the kernel's
+//! pressure verdict below is the rule that catches a machine in trouble,
+//! and it NAMES the processes holding the RAM
+//! ([`AlertDetail::Pressure::top_consumers`]). The per-process rule is
+//! the earlier, narrower question — "is any ONE process enormous" — and
+//! its bar is a percentage AND an absolute ceiling, whichever is lower
+//! (see [`DEFAULT_MEMORY_FRACTION`] and [`DEFAULT_MEMORY_BYTES`]).
+//!
 //! System memory pressure is driven by the kernel's own verdict
 //! (`pressure_level`) but requires PERSISTENCE, not just a crossing: a
 //! memory-heavy machine sits at warning as its steady state and would
@@ -134,9 +143,55 @@ const PRESSURE_REARM: Duration = SLOW_WINDOW;
 /// each one flagged as a repeat rather than posing as a new event
 const PRESSURE_REMINDER_MAX: Duration = Duration::from_secs(4 * 60 * 60);
 
+/// How many processes (or applications) a pressure alert names.
+///
+/// The level says the machine is in trouble; this says what to close,
+/// which is the only half of the alert a person can act on. Three is
+/// what a notification line carries without becoming a table
+const PRESSURE_TOP_CONSUMERS: usize = 3;
+
+/// Smallest share of total RAM worth naming in a pressure alert.
+///
+/// Presentation, not policy: nothing under this is why a machine is
+/// swapping, and a list of 2% processes would read as noise on a machine
+/// whose memory is simply spread thin. Deliberately NOT a config key and
+/// deliberately not the `alert-mem` threshold — a bar that can silence
+/// the list would silence it exactly when every consumer is
+/// medium-sized, which is when the names help most
+const PRESSURE_CONSUMER_FLOOR: f64 = 0.05;
+
 /// Builtin defaults when the config file leaves a value unset
 const DEFAULT_CPU_PERCENT: f32 = 30.0;
+/// Share of total RAM at which one process is worth a notification.
+///
+/// A percentage alone cannot answer this question at any value, because
+/// it scales the wrong way: 25% of 8 GiB is 2 GiB, which a browser tab
+/// or a language server reaches on an ordinary morning, while 25% of
+/// 64 GiB is 16 GiB, which nothing reaches until long after the machine
+/// is already swapping. Measured on a 24 GiB machine over 5 days of
+/// recorded history, the largest process ever seen was 19.4% — the rule
+/// had never fired once.
+///
+/// So the percentage is only half of the bar: it protects SMALL
+/// machines, where any fixed byte count would be too high, and
+/// [`DEFAULT_MEMORY_BYTES`] protects large ones. A process has to reach
+/// whichever of the two is lower
 const DEFAULT_MEMORY_FRACTION: f64 = 0.25;
+
+/// Absolute ceiling on the same bar — the other half of
+/// [`DEFAULT_MEMORY_FRACTION`], and what makes the rule mean the same
+/// thing on an 8 GiB laptop (where the percentage wins, at 2 GiB) and a
+/// 64 GiB workstation (where this does).
+///
+/// 4 GiB rather than the 2 GiB an 8 GiB machine implies, because the
+/// measurement is the physical footprint, not the resident size, and
+/// those differ by more than intuition expects: measured live,
+/// rust-analyzer held 3.02 GiB of footprint against 0.17 GiB of RSS
+/// (the rest compressed). A fixed byte bar therefore catches roughly
+/// three times as many processes as the same number would have under
+/// RSS, and 2 GiB of footprint is an ordinary IDE
+const DEFAULT_MEMORY_BYTES: u64 = 4 << 30;
+
 const DEFAULT_DISK_FRACTION: f32 = 0.90;
 /// Whole-app defaults sit well above the per-process ones: an app is
 /// allowed to be bigger than any one of its processes, and the point of
@@ -184,6 +239,11 @@ pub struct Template {
     /// Per-process CPU, single-core percent
     #[serde(default)]
     pub cpu: std::collections::BTreeMap<String, f32>,
+    /// Per-process memory, percent of total. Raises (or removes) the
+    /// bar for processes that are large by design, the way `cpu` does
+    /// for processes that are busy by design
+    #[serde(default)]
+    pub mem: std::collections::BTreeMap<String, f64>,
     /// Whole-application CPU, keyed on the tree root name
     #[serde(default)]
     pub app_cpu: std::collections::BTreeMap<String, f32>,
@@ -207,6 +267,7 @@ impl Template {
         let keys = template
             .cpu
             .keys()
+            .chain(template.mem.keys())
             .chain(template.app_cpu.keys())
             .chain(template.app_mem.keys());
         for key in keys {
@@ -297,8 +358,16 @@ pub enum AlertDetail {
         runaway: bool,
     },
     Memory {
+        /// Average over `window` — the physical footprint where the
+        /// kernel provides one, resident size otherwise
         avg_bytes: u64,
         share_percent: f64,
+        /// The bar actually crossed, in bytes. This is the rule's native
+        /// unit now that the per-process bar is the lower of a share and
+        /// an absolute ceiling; `threshold_percent` is the same value
+        /// expressed against this machine's total
+        #[serde(default)]
+        threshold_bytes: u64,
         threshold_percent: f64,
         window: Duration,
     },
@@ -317,7 +386,35 @@ pub enum AlertDetail {
         swap_used_bytes: u64,
         swap_total_bytes: u64,
         compressed_bytes: Option<u64>,
+        /// Who is holding the memory, biggest first — the actionable
+        /// half of this alert. Whole applications where the collector
+        /// groups them (you quit Chrome, not `Google Chrome Helper
+        /// (Renderer)` pid 41213), individual processes otherwise; empty
+        /// when the snapshot carries no process data at all.
+        ///
+        /// Unsmoothed on purpose: memory is a slow state rather than a
+        /// rate, so the current sample already IS the answer to "what is
+        /// resident right now", and a rolling average would only report
+        /// a machine the user has already changed
+        #[serde(default)]
+        top_consumers: Vec<MemoryConsumer>,
     },
+}
+
+/// One entry in a pressure alert's attribution list
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct MemoryConsumer {
+    /// The process, or the group's root process
+    pub pid: u32,
+    pub name: String,
+    /// Physical footprint where the kernel allows reading it, resident
+    /// size otherwise; for an application, its members' summed resident
+    /// size (which counts shared pages more than once — the same basis
+    /// the whole-app rule uses)
+    pub bytes: u64,
+    pub share_percent: f64,
+    /// 1 for a single process, the member count for an application
+    pub process_count: u32,
 }
 
 /// An alert that should reach the user now.
@@ -380,13 +477,15 @@ impl AlertEvent {
             AlertDetail::Memory {
                 avg_bytes,
                 share_percent,
+                threshold_bytes,
                 threshold_percent,
                 window,
             } => format!(
                 "{who} averaged {:.1} GiB — {share_percent:.0}% of total memory — over {} \
-                 (threshold {threshold_percent:.0}%)",
+                 (threshold {:.1} GiB / {threshold_percent:.0}%)",
                 *avg_bytes as f64 / f64::from(1 << 30),
                 window_label(*window),
+                *threshold_bytes as f64 / f64::from(1 << 30),
             ),
             AlertDetail::Disk {
                 used_percent,
@@ -404,10 +503,15 @@ impl AlertEvent {
                 swap_used_bytes,
                 swap_total_bytes,
                 compressed_bytes,
+                top_consumers,
             } => format!(
-                "{who} memory pressure: {} for {} min — swap {:.1}/{:.1} GiB{}",
+                // The names come BEFORE the swap figures on purpose: a
+                // macOS banner truncates, and "what to close" is the
+                // half of this alert a person can act on
+                "{who} memory pressure: {} for {} min{} — swap {:.1}/{:.1} GiB{}",
                 if *level >= 4 { "critical" } else { "warning" },
                 sustained.as_secs() / 60,
+                consumer_label(top_consumers),
                 *swap_used_bytes as f64 / f64::from(1 << 30),
                 *swap_total_bytes as f64 / f64::from(1 << 30),
                 compressed_bytes
@@ -452,6 +556,95 @@ fn window_label(window: Duration) -> String {
         0 | 1 => "the last minute".to_string(),
         minutes => format!("the last {minutes} minutes"),
     }
+}
+
+/// A fraction of total memory as bytes, saturating rather than wrapping
+/// on an absurd configured percentage
+fn fraction_bytes(fraction: f64, total_memory: u64) -> u64 {
+    let bytes = fraction * total_memory as f64;
+    if bytes >= u64::MAX as f64 {
+        u64::MAX
+    } else {
+        bytes as u64
+    }
+}
+
+/// The attribution tail of a pressure line: ` — top: Chrome 4.3 GiB
+/// (18%), rustc 3.1 GiB (13%)`. Empty when there is nothing to name
+fn consumer_label(consumers: &[MemoryConsumer]) -> String {
+    if consumers.is_empty() {
+        return String::new();
+    }
+    let list: Vec<String> = consumers
+        .iter()
+        .map(|c| {
+            format!(
+                "{} {:.1} GiB ({:.0}%)",
+                c.name,
+                c.bytes as f64 / f64::from(1 << 30),
+                c.share_percent
+            )
+        })
+        .collect();
+    format!(" — top: {}", list.join(", "))
+}
+
+/// Who is holding the RAM at the moment the kernel called memory short.
+///
+/// Applications when the collector groups them, because that is the
+/// thing a person quits; individual processes otherwise. Both lists come
+/// straight from the snapshot rather than from a rolling window — see
+/// [`AlertDetail::Pressure::top_consumers`] for why an average would be
+/// the wrong answer here
+fn top_memory_consumers(snapshot: &SystemSnapshot) -> Vec<MemoryConsumer> {
+    let total = snapshot.memory.total_bytes;
+    if total == 0 {
+        return Vec::new();
+    }
+    let share = |bytes: u64| bytes as f64 / total as f64;
+    let groups = snapshot
+        .process_groups
+        .as_deref()
+        .filter(|groups| !groups.is_empty());
+    let mut ranked: Vec<MemoryConsumer> = match groups {
+        Some(groups) => groups
+            .iter()
+            .map(|g| MemoryConsumer {
+                pid: g.root_pid,
+                name: g.name.clone(),
+                bytes: g.memory_bytes,
+                share_percent: share(g.memory_bytes) * 100.0,
+                process_count: g.process_count,
+            })
+            .collect(),
+        None => snapshot
+            .processes
+            .as_deref()
+            .map(|processes| {
+                processes
+                    .iter()
+                    .map(|p| {
+                        // The footprint is what macOS bills this process
+                        // and what jetsam would kill it on; RSS is the
+                        // best available answer where we may not ask
+                        let bytes = p.phys_footprint_bytes.unwrap_or(p.memory_bytes);
+                        MemoryConsumer {
+                            pid: p.pid,
+                            name: p.name.clone(),
+                            bytes,
+                            share_percent: share(bytes) * 100.0,
+                            process_count: 1,
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    ranked.retain(|c| share(c.bytes) >= PRESSURE_CONSUMER_FLOOR);
+    // Ties broken by pid so a run is reproducible
+    ranked.sort_unstable_by(|a, b| b.bytes.cmp(&a.bytes).then(a.pid.cmp(&b.pid)));
+    ranked.truncate(PRESSURE_TOP_CONSUMERS);
+    ranked
 }
 
 /// Result of one evaluation pass
@@ -619,6 +812,24 @@ impl<T: Copy> Thresholds<T> {
     /// matching override (see [`Override::rank`]), otherwise the
     /// default. `None` = rule disabled for this process
     pub fn for_process(&self, name: &str) -> Option<T> {
+        self.override_for(name).unwrap_or(self.default)
+    }
+
+    /// The base threshold, ignoring per-process overrides — this is what
+    /// metrics recording uses
+    pub fn base(&self) -> Option<T> {
+        self.default
+    }
+
+    /// The override that applies to `name`, if any: `Some(None)` means
+    /// an override disabled the rule for it, `None` means no override
+    /// matched and the base value applies.
+    ///
+    /// Callers that combine the base value with something else (the
+    /// memory rule's absolute ceiling) need this distinction: an
+    /// override is an explicit request and stands exactly as written,
+    /// while the base value is a default that other defaults may refine
+    pub fn override_for(&self, name: &str) -> Option<Option<T>> {
         let mut best: Option<&Override<T>> = None;
         for entry in &self.overrides {
             // Strictly greater, so equally ranked entries keep the
@@ -627,13 +838,7 @@ impl<T: Copy> Thresholds<T> {
                 best = Some(entry);
             }
         }
-        best.map_or(self.default, |entry| entry.value)
-    }
-
-    /// The base threshold, ignoring per-process overrides — this is what
-    /// metrics recording uses
-    pub fn base(&self) -> Option<T> {
-        self.default
+        best.map(|entry| entry.value)
     }
 
     pub fn any_enabled(&self) -> bool {
@@ -644,7 +849,13 @@ impl<T: Copy> Thresholds<T> {
 /// The currently effective thresholds (config file over builtin defaults)
 pub struct ActiveThresholds {
     pub cpu: Thresholds<f32>,
+    /// Per-process memory as a share of total; the other half of the bar
+    /// is [`Self::memory_bytes`], and [`Self::memory_bar_bytes`] is what
+    /// rules should ask
     pub memory: Thresholds<f64>,
+    /// Absolute ceiling on the per-process memory bar, `None` for no
+    /// ceiling. See [`DEFAULT_MEMORY_BYTES`]
+    pub memory_bytes: Option<u64>,
     /// Volume used-capacity fractions, override key = mount point
     pub disk: Thresholds<f32>,
     /// Kernel memory-pressure level at which to start alerting (2 =
@@ -658,8 +869,38 @@ pub struct ActiveThresholds {
 }
 
 impl ActiveThresholds {
+    /// The effective per-process memory bar for `name`, in BYTES —
+    /// `None` when the rule is off for it.
+    ///
+    /// The base bar is the LOWER of the share and the absolute ceiling
+    /// (see [`DEFAULT_MEMORY_FRACTION`]), but a per-name override
+    /// REPLACES both: an override is an explicit request rather than a
+    /// default, so raising a browser to 70% must not silently still stop
+    /// at the 4 GiB ceiling
+    pub fn memory_bar_bytes(&self, name: &str, total_memory: u64) -> Option<u64> {
+        match self.memory.override_for(name) {
+            Some(over) => over.map(|fraction| fraction_bytes(fraction, total_memory)),
+            None => self.memory_base_bytes(total_memory),
+        }
+    }
+
+    /// The same bar with no overrides applied — what metrics recording
+    /// uses, since an override silences a notification but never a data
+    /// point
+    pub fn memory_base_bytes(&self, total_memory: u64) -> Option<u64> {
+        let share = self
+            .memory
+            .base()
+            .map(|fraction| fraction_bytes(fraction, total_memory));
+        match (share, self.memory_bytes) {
+            (Some(share), Some(ceiling)) => Some(share.min(ceiling)),
+            (Some(only), None) | (None, Some(only)) => Some(only),
+            (None, None) => None,
+        }
+    }
+
     /// Merge the `[alerts]` config section over the builtin template over
-    /// the builtin defaults (CPU 30%, memory 25%, cooldown 10m)
+    /// the builtin defaults (CPU 30%, memory 50%, cooldown 10m)
     pub fn from_config(file: &AlertsConfig) -> Self {
         Self::from_config_with_template(file, Template::builtin())
     }
@@ -701,9 +942,25 @@ impl ActiveThresholds {
                 cpu = cpu.with_template_override(name.clone(), (*pct > 0.0).then_some(*pct));
             }
         }
+        // `alert-mem` is the rule's on/off switch and `alert-mem-bytes`
+        // refines it, the same way the template does: disabling the
+        // percentage must mean "no per-process memory alerts" rather
+        // than "the ceiling keeps firing". 0 here removes the ceiling
+        // and leaves the percentage alone
+        let mem_bytes_default = match (mem_default, file.mem_bytes) {
+            (None, _) | (Some(_), Some(0)) => None,
+            (Some(_), Some(bytes)) => Some(bytes),
+            (Some(_), None) => Some(DEFAULT_MEMORY_BYTES),
+        };
         let mut memory = Thresholds::new(mem_default);
         for (name, pct) in &file.mem_overrides {
             memory = memory.with_override(name.clone(), (*pct > 0.0).then_some(*pct / 100.0));
+        }
+        if file.template.unwrap_or(true) && mem_default.is_some() {
+            for (name, pct) in &template.mem {
+                memory = memory
+                    .with_template_override(name.clone(), (*pct > 0.0).then_some(*pct / 100.0));
+            }
         }
         let disk_default = match file.disk {
             Some(p) if p > 0.0 => Some(p / 100.0),
@@ -750,6 +1007,7 @@ impl ActiveThresholds {
         Self {
             cpu,
             memory,
+            memory_bytes: mem_bytes_default,
             disk,
             app_cpu,
             app_memory,
@@ -841,7 +1099,12 @@ impl AlertEngine {
     ///   is established (self-limiting bursts never get that far).
     ///
     /// Memory has no acute tier by design: transient legitimate spikes
-    /// are exactly what must not alert. Recording stays on the 1-minute
+    /// are exactly what must not alert. Its bar is the LOWER of a share
+    /// of total RAM and an absolute byte ceiling, so it means the same
+    /// thing on a laptop and a workstation; "is memory short right now"
+    /// is a different question, answered by the kernel's pressure
+    /// verdict, which names its biggest consumers rather than comparing
+    /// each of them to a bar. Recording stays on the 1-minute
     /// window with BASE thresholds — an override or the template
     /// suppresses the notification, not the data point — plus the
     /// window's [`RECORD_TOP_CPU_TIME`] biggest CPU-time spenders
@@ -958,6 +1221,11 @@ impl AlertEngine {
                             swap_used_bytes: snapshot.memory.swap_used_bytes,
                             swap_total_bytes: snapshot.memory.swap_total_bytes,
                             compressed_bytes: snapshot.memory.compressed_bytes,
+                            // Computed only when the alert actually
+                            // fires: it is a sort over the process list,
+                            // and every round that stays silent should
+                            // stay free
+                            top_consumers: top_memory_consumers(snapshot),
                         },
                         repeat_after,
                     });
@@ -1055,6 +1323,7 @@ impl AlertEngine {
                             detail: AlertDetail::Memory {
                                 avg_bytes: stat.memory_avg_bytes as u64,
                                 share_percent: share * 100.0,
+                                threshold_bytes: fraction_bytes(fraction, total_memory),
                                 threshold_percent: fraction * 100.0,
                                 window: SLOW_WINDOW,
                             },
@@ -1158,12 +1427,16 @@ impl AlertEngine {
                 }
             }
 
-            if let Some(fraction) = active.memory.for_process(&p.name)
+            // The footprint where the kernel let us read it: a leak
+            // whose pages get compressed reads as a SHRINKING resident
+            // size, which is the one case this rule exists to catch
+            let held_bytes = slow.footprint_avg_bytes.unwrap_or(slow.memory_avg_bytes);
+            if let Some(bar) = active.memory_bar_bytes(&p.name, total_memory)
                 && total_memory > 0
                 && slow.span >= SLOW_MIN_SPAN
             {
                 let key = (p.pid, AlertKind::Memory);
-                if mem_share(slow.memory_avg_bytes) < fraction {
+                if (held_bytes as u64) < bar {
                     self.episodes.clear(key);
                 } else if let Some(notify) = self.episodes.notify(key, now, active.cooldown) {
                     evaluation.events.push(AlertEvent {
@@ -1172,9 +1445,10 @@ impl AlertEngine {
                             name: p.name.clone(),
                         },
                         detail: AlertDetail::Memory {
-                            avg_bytes: slow.memory_avg_bytes as u64,
-                            share_percent: mem_share(slow.memory_avg_bytes) * 100.0,
-                            threshold_percent: fraction * 100.0,
+                            avg_bytes: held_bytes as u64,
+                            share_percent: mem_share(held_bytes) * 100.0,
+                            threshold_bytes: bar,
+                            threshold_percent: mem_share(bar as f64) * 100.0,
                             window: SLOW_WINDOW,
                         },
                         repeat_after: notify.elapsed(),
@@ -1189,9 +1463,10 @@ impl AlertEngine {
                     .cpu
                     .base()
                     .is_some_and(|threshold| fast.cpu_avg >= f64::from(threshold));
-                let over_mem = active.memory.base().is_some_and(|fraction| {
-                    total_memory > 0 && mem_share(fast.memory_avg_bytes) >= fraction
-                });
+                let fast_held = fast.footprint_avg_bytes.unwrap_or(fast.memory_avg_bytes) as u64;
+                let over_mem = active
+                    .memory_base_bytes(total_memory)
+                    .is_some_and(|bar| total_memory > 0 && fast_held >= bar);
                 if over_cpu || over_mem || top_cpu_time.contains(&p.pid) {
                     evaluation.records.push(MetricRecord {
                         timestamp: snapshot.timestamp,
@@ -1200,6 +1475,10 @@ impl AlertEngine {
                         cpu_avg_percent: fast.cpu_avg as f32,
                         memory_avg_bytes: fast.memory_avg_bytes as u64,
                         memory_share_percent: (mem_share(fast.memory_avg_bytes) * 100.0) as f32,
+                        // Both, because the rules measure the footprint
+                        // while the resident size is what every earlier
+                        // file in this history carries — see MetricRecord
+                        memory_footprint_bytes: fast.footprint_avg_bytes.map(|b| b as u64),
                         // The raw counter, not the window's delta: the
                         // selection above is a per-minute ranking, but
                         // the FILE has to stay exact for a pid that only
@@ -1405,6 +1684,9 @@ mod tests {
         ActiveThresholds {
             cpu,
             memory,
+            // Percentage-only: these tests are about the rules, and a
+            // ceiling would silently change every bar they set
+            memory_bytes: None,
             disk: Thresholds::new(None),
             app_cpu: Thresholds::new(None),
             app_memory: Thresholds::new(None),
@@ -1608,6 +1890,128 @@ mod tests {
     }
 
     #[test]
+    fn the_memory_bar_is_the_lower_of_the_share_and_the_ceiling() {
+        let mut active = thresholds(
+            Thresholds::new(None),
+            Thresholds::new(Some(0.25)),
+            Duration::from_secs(600),
+        );
+        active.memory_bytes = Some(4 << 30);
+
+        // Small machine: the percentage is the binding half, and a fixed
+        // byte bar would be unreachable
+        assert_eq!(active.memory_bar_bytes("p1", 8 << 30), Some(2 << 30));
+        // Large machine: the ceiling is, and the percentage would mean
+        // "never" — 25% of 128 GiB is more RAM than most machines have
+        assert_eq!(active.memory_bar_bytes("p1", 128 << 30), Some(4 << 30));
+
+        // Either half alone still works, and only both being off turns
+        // the rule off
+        active.memory_bytes = None;
+        assert_eq!(active.memory_bar_bytes("p1", 128 << 30), Some(32 << 30));
+        active.memory = Thresholds::new(None);
+        active.memory_bytes = Some(4 << 30);
+        assert_eq!(active.memory_bar_bytes("p1", 128 << 30), Some(4 << 30));
+        active.memory_bytes = None;
+        assert_eq!(active.memory_bar_bytes("p1", 128 << 30), None);
+    }
+
+    #[test]
+    fn a_memory_override_replaces_both_halves_of_the_bar() {
+        // An override is a request, not a default: raising a browser to
+        // 70% must not silently still stop at the 4 GiB ceiling, or the
+        // setting would do nothing on any machine above 6 GiB
+        let memory = Thresholds::new(Some(0.25))
+            .with_override("browser".into(), Some(0.70))
+            .with_override("vm".into(), None);
+        let mut active = thresholds(Thresholds::new(None), memory, Duration::from_secs(600));
+        active.memory_bytes = Some(4 << 30);
+
+        assert_eq!(
+            active.memory_bar_bytes("browser", 32 << 30),
+            Some(fraction_bytes(0.70, 32 << 30))
+        );
+        assert_eq!(active.memory_bar_bytes("vm", 32 << 30), None, "0 disables");
+        assert_eq!(active.memory_bar_bytes("other", 32 << 30), Some(4 << 30));
+        // Recording ignores overrides — the notification is silenced,
+        // the data point is not
+        assert_eq!(active.memory_base_bytes(32 << 30), Some(4 << 30));
+    }
+
+    #[test]
+    fn the_ceiling_fires_where_the_percentage_never_would() {
+        // 3 GiB on a 24 GiB machine is 12.5% — under any sane percentage
+        // bar, and exactly the case that made the old percentage-only
+        // rule never fire on a large machine
+        let mut active = thresholds(
+            Thresholds::new(None),
+            Thresholds::new(Some(0.25)),
+            Duration::from_secs(600),
+        );
+        active.memory_bytes = Some(2 << 30);
+        let mut engine = AlertEngine::new();
+        let fired = drive(
+            &mut engine,
+            &active,
+            Instant::now(),
+            Duration::ZERO,
+            160,
+            |_| proc(1, 0.0, 3 << 30),
+            24 << 30,
+        );
+        assert_eq!(fired, 1);
+    }
+
+    #[test]
+    fn the_mem_template_raises_the_bar_for_names_that_are_large_by_design() {
+        let file = AlertsConfig::default();
+        let merged = ActiveThresholds::from_config(&file);
+        let total = 24u64 << 30;
+
+        // A language server measured against the machine again (30%),
+        // not against the 4 GiB ceiling every unknown process gets
+        assert_eq!(
+            merged.memory_bar_bytes("rust-analyzer-2026-08-10.1", total),
+            Some(fraction_bytes(0.30, total))
+        );
+        // Your own build, and a VM holding its guest's RAM: never
+        assert_eq!(merged.memory_bar_bytes("rustc", total), None);
+        assert_eq!(
+            merged.memory_bar_bytes("com.apple.Virtualization.VirtualMachine", total),
+            None
+        );
+        // Everything else keeps the ceiling
+        assert_eq!(merged.memory_bar_bytes("some-daemon", total), Some(4 << 30));
+        // ...and recording still uses the base bar, template or not
+        assert_eq!(merged.memory_base_bytes(total), Some(4 << 30));
+    }
+
+    #[test]
+    fn disabling_the_percentage_disables_the_whole_memory_rule() {
+        // "alert-mem 0" has to mean no per-process memory alerts. The
+        // byte ceiling refines that rule; it must not outlive it, or
+        // turning the rule off would take two settings and the second
+        // one would not be obvious
+        let mut file = AlertsConfig {
+            mem: Some(0.0),
+            ..Default::default()
+        };
+        let merged = ActiveThresholds::from_config(&file);
+        assert_eq!(merged.memory_bytes, None);
+        assert_eq!(merged.memory_bar_bytes("rust-analyzer", 24 << 30), None);
+        assert_eq!(merged.memory_bar_bytes("anything", 24 << 30), None);
+
+        // The other direction: 0 bytes removes only the ceiling
+        file.mem = None;
+        file.mem_bytes = Some(0);
+        let merged = ActiveThresholds::from_config(&file);
+        assert_eq!(
+            merged.memory_bar_bytes("anything", 24 << 30),
+            Some(fraction_bytes(0.25, 24 << 30))
+        );
+    }
+
+    #[test]
     fn transient_memory_spike_does_not_alert() {
         let active = thresholds(
             Thresholds::new(None),
@@ -1700,6 +2104,7 @@ mod tests {
         let active = ActiveThresholds {
             cpu: Thresholds::new(Some(30.0)),
             memory: Thresholds::new(None),
+            memory_bytes: None,
             disk: Thresholds::new(Some(0.90)),
             app_cpu: Thresholds::new(None),
             app_memory: Thresholds::new(None),
@@ -2053,6 +2458,7 @@ mod tests {
         let active = ActiveThresholds {
             cpu: Thresholds::new(None),
             memory: Thresholds::new(None),
+            memory_bytes: None,
             disk: Thresholds::new(Some(0.90)),
             app_cpu: Thresholds::new(None),
             app_memory: Thresholds::new(None),
@@ -2089,6 +2495,7 @@ mod tests {
         let active = ActiveThresholds {
             cpu: Thresholds::new(None),
             memory: Thresholds::new(None),
+            memory_bytes: None,
             disk: disk_rule,
             app_cpu: Thresholds::new(None),
             app_memory: Thresholds::new(None),
@@ -2125,6 +2532,7 @@ mod tests {
         ActiveThresholds {
             cpu: Thresholds::new(None),
             memory: Thresholds::new(None),
+            memory_bytes: None,
             disk: Thresholds::new(None),
             app_cpu: cpu,
             app_memory: memory,
@@ -2225,6 +2633,7 @@ mod tests {
         let active = ActiveThresholds {
             cpu: Thresholds::new(None),
             memory: Thresholds::new(None),
+            memory_bytes: None,
             disk: Thresholds::new(None),
             app_cpu: Thresholds::new(None),
             app_memory: Thresholds::new(None),
@@ -2295,6 +2704,7 @@ mod tests {
         let active = ActiveThresholds {
             cpu: Thresholds::new(None),
             memory: Thresholds::new(None),
+            memory_bytes: None,
             disk: Thresholds::new(None),
             app_cpu: Thresholds::new(None),
             app_memory: Thresholds::new(None),
@@ -2341,6 +2751,7 @@ mod tests {
         let active = ActiveThresholds {
             cpu: Thresholds::new(None),
             memory: Thresholds::new(None),
+            memory_bytes: None,
             disk: Thresholds::new(None),
             app_cpu: Thresholds::new(None),
             app_memory: Thresholds::new(None),
@@ -2396,6 +2807,7 @@ mod tests {
         let active = ActiveThresholds {
             cpu: Thresholds::new(None),
             memory: Thresholds::new(None),
+            memory_bytes: None,
             disk: Thresholds::new(None),
             app_cpu: Thresholds::new(None),
             app_memory: Thresholds::new(None),
@@ -2440,6 +2852,7 @@ mod tests {
         let active = ActiveThresholds {
             cpu: Thresholds::new(None),
             memory: Thresholds::new(None),
+            memory_bytes: None,
             disk: Thresholds::new(None),
             app_cpu: Thresholds::new(None),
             app_memory: Thresholds::new(None),
@@ -2470,6 +2883,7 @@ mod tests {
         let active = ActiveThresholds {
             cpu: Thresholds::new(None),
             memory: Thresholds::new(None),
+            memory_bytes: None,
             disk: Thresholds::new(None),
             app_cpu: Thresholds::new(None),
             app_memory: Thresholds::new(None),
@@ -2491,11 +2905,156 @@ mod tests {
         assert_eq!(fired, 0, "sustained warning never alerts at critical-only");
     }
 
+    /// Everything the pressure rule needs and nothing else
+    fn pressure_only() -> ActiveThresholds {
+        ActiveThresholds {
+            cpu: Thresholds::new(None),
+            memory: Thresholds::new(None),
+            memory_bytes: None,
+            disk: Thresholds::new(None),
+            app_cpu: Thresholds::new(None),
+            app_memory: Thresholds::new(None),
+            pressure: Some(2),
+            cooldown: Duration::from_secs(600),
+        }
+    }
+
+    #[test]
+    fn a_pressure_alert_names_the_applications_holding_the_memory() {
+        // The kernel's level says the machine is in trouble; on its own
+        // it leaves the user to go find out what to close. Applications,
+        // not processes: you quit Chrome, not helper pid 41213
+        let active = pressure_only();
+        let mut engine = AlertEngine::new();
+        let base = Instant::now();
+        let mut step = |i: u64| {
+            let mut s = snapshot(vec![proc(1, 0.0, 40)], 100);
+            s.memory.pressure_level = Some(2);
+            s.process_groups = Some(std::sync::Arc::new(vec![
+                group(10, "Google Chrome", 37, 0.0, 40),
+                group(20, "zed", 3, 0.0, 20),
+                group(30, "node", 1, 0.0, 10),
+                group(40, "Finder", 1, 0.0, 8),
+                group(50, "cron", 1, 0.0, 3),
+            ]));
+            engine
+                .evaluate(base + Duration::from_secs(2 * i), &s, &active)
+                .events
+        };
+
+        for i in 0..150 {
+            assert!(step(i).is_empty(), "still inside the window (t={}s)", 2 * i);
+        }
+        let events = step(150);
+        assert_eq!(events.len(), 1);
+        let AlertDetail::Pressure {
+            ref top_consumers, ..
+        } = events[0].detail
+        else {
+            panic!("expected a pressure alert, got {:?}", events[0].detail);
+        };
+        // Biggest first, capped at PRESSURE_TOP_CONSUMERS; the 3% one is
+        // under PRESSURE_CONSUMER_FLOOR and would have made the cap
+        assert_eq!(
+            top_consumers
+                .iter()
+                .map(|c| c.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Google Chrome", "zed", "node"]
+        );
+        assert_eq!(top_consumers[0].process_count, 37, "the whole tree");
+        assert_eq!(top_consumers[0].share_percent, 40.0);
+        assert!(
+            events[0].summary().contains("top: Google Chrome"),
+            "got: {}",
+            events[0].summary()
+        );
+    }
+
+    #[test]
+    fn pressure_attribution_falls_back_to_processes_and_reads_the_footprint() {
+        // No group data (collection disabled): individual processes, and
+        // the footprint rather than the resident size wherever the
+        // kernel let us read one — that is the figure macOS bills
+        let active = pressure_only();
+        let mut engine = AlertEngine::new();
+        let base = Instant::now();
+        let mut step = |i: u64| {
+            let mut leaker = proc(1, 0.0, 10);
+            leaker.phys_footprint_bytes = Some(40);
+            let plain = proc(2, 0.0, 25);
+            let tiny = proc(3, 0.0, 2);
+            let mut s = snapshot(vec![leaker, plain, tiny], 100);
+            s.memory.pressure_level = Some(2);
+            engine
+                .evaluate(base + Duration::from_secs(2 * i), &s, &active)
+                .events
+        };
+
+        for i in 0..150 {
+            assert!(step(i).is_empty());
+        }
+        let events = step(150);
+        let AlertDetail::Pressure {
+            ref top_consumers, ..
+        } = events[0].detail
+        else {
+            panic!("expected a pressure alert");
+        };
+        assert_eq!(
+            top_consumers
+                .iter()
+                .map(|c| (c.pid, c.bytes))
+                .collect::<Vec<_>>(),
+            [(1, 40), (2, 25)],
+            "footprint ranks the leaker first, and pid 3 is under the floor"
+        );
+        assert!(top_consumers.iter().all(|c| c.process_count == 1));
+    }
+
+    #[test]
+    fn the_memory_rule_measures_the_footprint_not_the_resident_size() {
+        // The case this rule exists for: a process the kernel has been
+        // compressing reads as SHRINKING resident size while it is still
+        // holding the memory. RSS 5% would never alert; the footprint is
+        // 30% and the bar here is 25%
+        let active = thresholds(
+            Thresholds::new(None),
+            Thresholds::new(Some(0.25)),
+            Duration::from_secs(600),
+        );
+        let mut engine = AlertEngine::new();
+        let mut messages = Vec::new();
+        let base = Instant::now();
+        for i in 0..160u64 {
+            let mut leaker = proc(1, 0.0, 5);
+            leaker.phys_footprint_bytes = Some(30);
+            messages.extend(
+                engine
+                    .evaluate(
+                        base + Duration::from_secs(2 * i),
+                        &snapshot(vec![leaker], 100),
+                        &active,
+                    )
+                    .events
+                    .into_iter()
+                    .map(|e| e.summary()),
+            );
+        }
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0].contains("30% of total memory"),
+            "the alert must report what it measured, got: {}",
+            messages[0]
+        );
+    }
+
     #[test]
     fn pressure_rule_can_be_disabled_and_skips_absent_data() {
         let mut active = ActiveThresholds {
             cpu: Thresholds::new(None),
             memory: Thresholds::new(None),
+            memory_bytes: None,
             disk: Thresholds::new(None),
             app_cpu: Thresholds::new(None),
             app_memory: Thresholds::new(None),
@@ -2529,6 +3088,11 @@ mod tests {
         let merged = ActiveThresholds::from_config(&AlertsConfig::default());
         assert_eq!(merged.cpu.for_process("any"), Some(30.0));
         assert_eq!(merged.memory.for_process("any"), Some(0.25));
+        assert_eq!(merged.memory_bytes, Some(DEFAULT_MEMORY_BYTES));
+        // The bar is the LOWER of the two: the percentage on a small
+        // machine, the ceiling on a large one
+        assert_eq!(merged.memory_bar_bytes("any", 8 << 30), Some(2 << 30));
+        assert_eq!(merged.memory_bar_bytes("any", 64 << 30), Some(4 << 30));
         assert_eq!(merged.disk.for_process("/"), Some(0.90));
         assert_eq!(merged.pressure, Some(2));
         assert_eq!(merged.cooldown, Duration::from_secs(600));

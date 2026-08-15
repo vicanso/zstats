@@ -115,6 +115,106 @@ pub mod duration_serde {
     }
 }
 
+/// Parse a human-friendly byte size: `"4GiB"`, `"512MiB"`, `"2GB"`, or
+/// a bare integer meaning bytes.
+///
+/// Binary and decimal units are both accepted and mean what they say
+/// (`GiB` = 1024³, `GB` = 1000³); a bare `G`/`M`/`K` is read as the
+/// binary one, since that is what every memory reading on this platform
+/// is quoted in
+pub fn parse_size(value: &str) -> Result<u64, String> {
+    let v = value.trim();
+    if v.is_empty() {
+        return Err("empty size".into());
+    }
+    if v.chars().all(|c| c.is_ascii_digit()) {
+        return v.parse().map_err(|_| format!("invalid size: {value}"));
+    }
+    let unit_start = v
+        .find(|c: char| !c.is_ascii_digit())
+        .expect("checked: not all digits");
+    let (number, unit) = v.split_at(unit_start);
+    let n: u64 = number
+        .parse()
+        .map_err(|_| format!("invalid size: {value}"))?;
+    let factor: u64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "b" => 1,
+        "k" | "kib" => 1 << 10,
+        "m" | "mib" => 1 << 20,
+        "g" | "gib" => 1 << 30,
+        "t" | "tib" => 1u64 << 40,
+        "kb" => 1_000,
+        "mb" => 1_000_000,
+        "gb" => 1_000_000_000,
+        "tb" => 1_000_000_000_000,
+        other => {
+            return Err(format!(
+                "invalid size unit: {other} (use B, KiB, MiB, GiB, TiB or their KB/MB/GB forms)"
+            ));
+        }
+    };
+    n.checked_mul(factor)
+        .ok_or_else(|| format!("size out of range: {value}"))
+}
+
+/// The most compact exact binary representation: `4GiB`, `512MiB`,
+/// `1536B`
+pub fn format_size(bytes: u64) -> String {
+    for (factor, unit) in [
+        (1u64 << 40, "TiB"),
+        (1 << 30, "GiB"),
+        (1 << 20, "MiB"),
+        (1 << 10, "KiB"),
+    ] {
+        if bytes >= factor && bytes.is_multiple_of(factor) {
+            return format!("{}{unit}", bytes / factor);
+        }
+    }
+    format!("{bytes}B")
+}
+
+/// Serde representation for human-friendly byte sizes on `Option<u64>`
+/// fields: serializes as `"4GiB"`, deserializes from such strings or
+/// from a bare integer meaning bytes
+pub mod option_size_serde {
+    use serde::{Deserializer, Serializer, de};
+
+    use super::{format_size, parse_size};
+
+    pub fn serialize<S: Serializer>(bytes: &Option<u64>, s: S) -> Result<S::Ok, S::Error> {
+        match bytes {
+            Some(b) => s.serialize_str(&format_size(*b)),
+            None => s.serialize_none(),
+        }
+    }
+
+    struct SizeVisitor;
+
+    impl de::Visitor<'_> for SizeVisitor {
+        type Value = u64;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a size like \"4GiB\", \"512MiB\", or bytes as an integer")
+        }
+
+        fn visit_u64<E: de::Error>(self, v: u64) -> Result<u64, E> {
+            Ok(v)
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<u64, E> {
+            u64::try_from(v).map_err(|_| E::custom("size must not be negative"))
+        }
+
+        fn visit_str<E: de::Error>(self, v: &str) -> Result<u64, E> {
+            parse_size(v).map_err(E::custom)
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+        d.deserialize_any(SizeVisitor).map(Some)
+    }
+}
+
 /// [`duration_serde`] for `Option<Duration>` fields (combine with
 /// `#[serde(default, skip_serializing_if = "Option::is_none")]`)
 pub mod option_duration_serde {
@@ -367,6 +467,32 @@ mod duration_tests {
 #[cfg(all(test, feature = "config"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sizes_parse_from_both_unit_families_and_round_trip() {
+        assert_eq!(parse_size("4GiB"), Ok(4 << 30));
+        assert_eq!(parse_size("4G"), Ok(4 << 30), "bare units are binary");
+        assert_eq!(parse_size("512MiB"), Ok(512 << 20));
+        assert_eq!(
+            parse_size("2GB"),
+            Ok(2_000_000_000),
+            "GB means what it says"
+        );
+        assert_eq!(parse_size("1024"), Ok(1024), "a bare number is bytes");
+        assert!(parse_size("4 gigs").is_err());
+        assert!(parse_size("").is_err());
+        assert!(
+            parse_size("99999999999999999999GiB").is_err(),
+            "no wraparound"
+        );
+
+        assert_eq!(format_size(4 << 30), "4GiB");
+        assert_eq!(format_size(1536), "1536B", "not a lying 1.5KiB");
+        assert_eq!(format_size(0), "0B");
+        for text in ["4GiB", "512MiB", "1536B"] {
+            assert_eq!(format_size(parse_size(text).expect("parse")), text);
+        }
+    }
 
     #[test]
     fn load_from_dir_reads_collector_section() {

@@ -264,9 +264,9 @@ AlertEvent
 | Variant | Fields |
 |---|---|
 | `cpu` | `avg_percent`, `threshold_percent`, `window`, `runaway` |
-| `memory` | `avg_bytes`, `share_percent`, `threshold_percent`, `window` |
+| `memory` | `avg_bytes`, `share_percent`, `threshold_bytes`, `threshold_percent`, `window` |
 | `disk` | `used_percent`, `threshold_percent`, `available_bytes`, `total_bytes` |
-| `pressure` | `level`, `sustained`, `swap_used_bytes`, `swap_total_bytes`, `compressed_bytes` |
+| `pressure` | `level`, `sustained`, `swap_used_bytes`, `swap_total_bytes`, `compressed_bytes`, `top_consumers` |
 
 Derived accessors (not stored, so they cannot disagree with the data):
 
@@ -293,6 +293,27 @@ rather than a culprit — nothing to kill, and it can legitimately hold all day:
 - `sustained` counts from when the level first went above normal, while
   `repeat_after` counts from the episode's first notification.
 
+It also carries the **attribution**: `top_consumers` is up to 3
+`MemoryConsumer { pid, name, bytes, share_percent, process_count }`, biggest
+first, taken from the snapshot at the moment the alert fired — whole
+applications where `process_groups` is collected (`process_count` > 1 and `pid`
+is the group root, so a UI can select the app row), individual processes
+otherwise. This is the actionable half of the alert: the level says the machine
+is in trouble, these say what to close. It is not smoothed (memory is a state,
+not a rate) and not configurable — everything above 5% of RAM, capped at 3.
+
+Per-process memory alerts (`memory` on a `Process` subject) answer the earlier,
+narrower question — "is any ONE process enormous" — and their bar is the **lower
+of 25% of total RAM and 4 GiB**. Neither half works alone: a percentage is
+unreachable on a large machine (25% of 64 GiB) and trivially reached on a small
+one, so the percentage protects small machines and the ceiling protects large
+ones. `threshold_bytes` is the bar that actually fired. A UI should not present
+this as the same rule as pressure — pressure means "memory is short now", this
+means "this one thing is enormous". `avg_bytes` is the physical footprint where
+macOS provides one, not the resident size, and the two differ by more than
+rounding (measured: 3.02 GiB of footprint against 0.17 GiB of RSS for one
+language server).
+
 ### 4.3 History — `records::MetricRecord`
 
 One JSON line per qualifying process per minute in
@@ -304,8 +325,9 @@ automatically on append.
 | `timestamp` | UTC |
 | `pid`, `name` | |
 | `cpu_avg_percent` | 1-minute average |
-| `memory_avg_bytes` | 1-minute average |
+| `memory_avg_bytes` | 1-minute average resident size |
 | `memory_share_percent` | Share of total RAM |
+| `memory_footprint_bytes` | 1-minute average physical footprint (macOS, absent where unreadable and in files written before it existed) — the figure the rules measure |
 | `cpu_time_ms` | **Lifetime** CPU counter at this sample, absolute. Subtract a pid's first record of the day from its last for exactly what it consumed; a decrease means pid reuse |
 
 Two criteria put a process in the file:
@@ -345,9 +367,10 @@ carries the validation.
 `1h` or a bare integer in milliseconds.
 
 **Alert thresholds** — `alert-cpu` (30 single-core %), `alert-mem` (25% of
-total), `alert-app-cpu` (200%), `alert-app-mem` (40%), `alert-disk` (90% per
-volume), `alert-pressure` (`off`/`warning`/`critical`), `alert-cooldown`
-(600s), `alert-template` (the builtin per-app exemption list).
+total) with `alert-mem-bytes` (4GiB ceiling, whichever is lower),
+`alert-app-cpu` (200%), `alert-app-mem` (40%), `alert-disk` (90% per volume),
+`alert-pressure` (`off`/`warning`/`critical`), `alert-cooldown` (600s),
+`alert-template` (the builtin per-app exemption list).
 
 The first four accept per-name overrides (`ghostty=100`, `0` disables that
 name); `alert-disk` accepts per-mount overrides.
@@ -372,7 +395,7 @@ merged view is `alerts::ActiveThresholds::from_config`.
 
 The template layer itself is a TOML file, not a table in the source —
 `templates/alerts.toml`, compiled in via `include_str!` and parsed into
-`alerts::Template` (`version`, `[cpu]`, `[app_cpu]`, `[app_mem]`). A copy at
+`alerts::Template` (`version`, `[cpu]`, `[mem]`, `[app_cpu]`, `[app_mem]`). A copy at
 `<config-dir>/template.toml` **replaces** it wholesale, so the table can be
 refreshed on a schedule (`curl -o`) without a new binary; the daemon reloads it
 within about a minute of an mtime change. A missing file means "use the

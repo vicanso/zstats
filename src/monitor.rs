@@ -277,6 +277,7 @@ mod tests {
                 cpu_avg_percent: 50.0,
                 memory_avg_bytes: 1024,
                 memory_share_percent: 1.0,
+                memory_footprint_bytes: None,
                 cpu_time_ms: 30_000,
             }],
         )

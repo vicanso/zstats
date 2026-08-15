@@ -199,6 +199,112 @@ wdavdaemon = 0.0
 # Sustained >=100% here usually means some app is spamming redraws
 WindowServer = 100.0
 
+# Per-process memory, as a percent of total RAM.
+#
+#    30  judge it by share of the machine   (large by design: browsers,
+#        rather than by a fixed ceiling      IDEs, language servers)
+#     0  never interrupt, still record      (work you started yourself,
+#                                            and hosts holding a guest's
+#                                            RAM on purpose)
+#
+# The base rule is the LOWER of `alert-mem` (25% of total) and
+# `alert-mem-bytes` (4 GiB), so on a large machine it is the byte
+# ceiling that fires. An entry here REPLACES both halves for that name,
+# which is what "30" buys: the process is measured against the machine
+# again, with no absolute ceiling.
+#
+# Note this is measured as the physical footprint on macOS, not the
+# resident size — a language server can read 0.2 GiB of RSS and 3 GiB of
+# footprint, the difference being pages the kernel compressed.
+#
+# Language RUNTIMES are deliberately absent for the same reason they are
+# absent from [cpu]: `node`, `java` and `python3` are the names half the
+# real leaks run under, and exempting them would exempt the failure.
+[mem]
+
+# --- VM / container hosts: the guest's RAM is allocated on purpose
+"com.docker.backend" = 0.0
+"com.docker.virtualization" = 0.0
+"OrbStack Helper" = 0.0
+"com.apple.Virtualization.VirtualMachine" = 0.0
+qemu-system-aarch64 = 0.0
+qemu-system-x86_64 = 0.0
+prl_vm_app = 0.0
+vmware-vmx = 0.0
+VirtualBoxVM = 0.0
+emulator = 0.0
+
+# --- Toolchains: you typed the build command, and a compiler holding
+# gigabytes is what a build looks like
+rustc = 0.0
+cargo = 0.0
+clang = 0.0
+"clang++" = 0.0
+cc1plus = 0.0
+swift-frontend = 0.0
+ld = 0.0
+lld = 0.0
+"ld64.lld" = 0.0
+go = 0.0
+"go build" = 0.0
+
+# --- Language servers and indexers: the index IS the product, and the
+# name carries a version stamp on some installs (see the pattern rules)
+"rust-analyzer*" = 30.0
+clangd = 30.0
+gopls = 30.0
+sourcekit-lsp = 30.0
+SourceKitService = 30.0
+"jdt.ls*" = 30.0
+OmniSharp = 30.0
+"typescript-language-server" = 30.0
+
+# --- IDEs and editors
+Xcode = 30.0
+idea = 30.0
+goland = 30.0
+clion = 30.0
+pycharm = 30.0
+webstorm = 30.0
+rider = 30.0
+zed = 30.0
+Cursor = 30.0
+Code = 30.0
+
+# --- Browsers: one heavy page can hold gigabytes, and that is the page's
+# doing rather than the browser's fault
+"Google Chrome" = 30.0
+"Google Chrome Helper (Renderer)" = 30.0
+"Microsoft Edge" = 30.0
+"Microsoft Edge Helper (Renderer)" = 30.0
+"Brave Browser" = 30.0
+"Brave Browser Helper (Renderer)" = 30.0
+Arc = 30.0
+"Arc Helper (Renderer)" = 30.0
+firefox = 30.0
+Safari = 30.0
+"com.apple.WebKit.WebContent" = 30.0
+
+# --- Simulators: a booted device image is a whole machine's worth of RAM
+Simulator = 30.0
+"com.apple.CoreSimulator.CoreSimulatorService" = 30.0
+
+# --- Creative and media: an open project is loaded, not leaked
+"Adobe Photoshop*" = 30.0
+"Adobe Premiere Pro*" = 30.0
+"Adobe After Effects*" = 30.0
+"Final Cut Pro" = 30.0
+"Logic Pro" = 30.0
+"DaVinci Resolve" = 30.0
+Blender = 30.0
+
+# --- Databases: a resident cache is the point of them
+postgres = 30.0
+mysqld = 30.0
+mongod = 30.0
+"redis-server" = 30.0
+
+
 # Whole-application CPU, keyed on the process-tree ROOT name, in
 # single-core percent. Deliberately much shorter than [cpu]: the app
 # thresholds already start high (200% / 40%), so only two situations

@@ -166,8 +166,23 @@ pub struct DaemonConfig {
 pub struct AlertsConfig {
     /// Default CPU threshold; absent = builtin default (30)
     pub cpu: Option<f32>,
-    /// Default memory threshold; absent = builtin default (25)
+    /// Default memory threshold as a percentage of total; absent =
+    /// builtin default (25). Combined with [`Self::mem_bytes`] — the
+    /// process only has to reach whichever of the two is lower
     pub mem: Option<f64>,
+    /// Absolute ceiling for the same rule, in bytes; absent = builtin
+    /// default (4 GiB), 0 = no absolute ceiling.
+    ///
+    /// A percentage alone scales the wrong way — 25% of 8 GiB is a
+    /// browser tab, 25% of 64 GiB is never reached before the machine is
+    /// already swapping — so the effective bar is the LOWER of the two:
+    /// the percentage protects small machines, this protects large ones
+    #[serde(
+        default,
+        with = "crate::config::option_size_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub mem_bytes: Option<u64>,
     /// Re-alert cooldown; absent = builtin default (10m)
     #[serde(
         default,
@@ -215,8 +230,8 @@ cpu-freq-interval, battery-interval, process-boost, max-processes, \
 collect-processes, collect-disks, collect-networks, collect-temperatures, \
 collect-battery, process-disk-io, \
 process-groups, dedupe-disks, per-core-cpu, alert-cpu, alert-mem, \
-alert-app-cpu, alert-app-mem, alert-disk, alert-pressure, alert-cooldown, \
-alert-template";
+alert-mem-bytes, alert-app-cpu, alert-app-mem, alert-disk, alert-pressure, \
+alert-cooldown, alert-template";
 
 fn parse<T: std::str::FromStr>(key: &str, value: &str) -> Result<T, String> {
     value
@@ -350,6 +365,16 @@ pub fn apply_add(config: &mut FileConfig, key: &str, value: &str) -> Result<Stri
                 config.alerts.mem = Some(pct);
             }
         }
+        "alert-mem-bytes" => {
+            let bytes = crate::config::parse_size(value)
+                .map_err(|e| format!("invalid value for {key}: {e}"))?;
+            config.alerts.mem_bytes = Some(bytes);
+            return Ok(format!(
+                "{key} = {} (0 removes the absolute ceiling; the effective bar is \
+                 the lower of this and alert-mem)",
+                crate::config::format_size(bytes)
+            ));
+        }
         "alert-disk" => {
             if let Some((mount, pct)) = value.split_once('=') {
                 let mount = mount.trim();
@@ -449,6 +474,7 @@ pub fn apply_remove(
         "per-core-cpu" => collector_mut(config).per_core_cpu = defaults.per_core_cpu,
         "alert-cpu" => config.alerts.cpu = None,
         "alert-mem" => config.alerts.mem = None,
+        "alert-mem-bytes" => config.alerts.mem_bytes = None,
         "alert-app-cpu" => config.alerts.app_cpu = None,
         "alert-app-mem" => config.alerts.app_mem = None,
         "alert-disk" => config.alerts.disk = None,
@@ -664,6 +690,34 @@ detach = true
         assert!(apply_add(&mut config, "alert-mem", "a*b=10").is_err());
         assert!(apply_add(&mut config, "alert-app-cpu", "a*b=10").is_err());
         assert!(apply_add(&mut config, "alert-disk", "/Vol*umes=90").is_err());
+    }
+
+    #[test]
+    fn alert_mem_bytes_takes_human_sizes_and_round_trips() {
+        let mut config = FileConfig::default();
+        settings_apply(&mut config, "alert-mem-bytes", "4GiB");
+        assert_eq!(config.alerts.mem_bytes, Some(4 << 30));
+        settings_apply(&mut config, "alert-mem-bytes", "1500MB");
+        assert_eq!(config.alerts.mem_bytes, Some(1_500_000_000));
+        settings_apply(&mut config, "alert-mem-bytes", "0");
+        assert_eq!(
+            config.alerts.mem_bytes,
+            Some(0),
+            "0 = no ceiling, not unset"
+        );
+        assert!(apply_add(&mut config, "alert-mem-bytes", "4 gigs").is_err());
+
+        // The file keeps the human form, and reading it back gives the
+        // same bytes — a config you cannot read is a config you cannot
+        // check
+        settings_apply(&mut config, "alert-mem-bytes", "6GiB");
+        let toml = toml::to_string_pretty(&config).expect("serialize");
+        assert!(toml.contains(r#"mem_bytes = "6GiB""#), "got: {toml}");
+        let back: FileConfig = toml::from_str(&toml).expect("reparse");
+        assert_eq!(back.alerts.mem_bytes, Some(6 << 30));
+
+        apply_remove(&mut config, "alert-mem-bytes", None).expect("remove");
+        assert_eq!(config.alerts.mem_bytes, None);
     }
 
     #[test]

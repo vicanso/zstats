@@ -32,6 +32,8 @@ struct Sample {
     at: Instant,
     cpu: f32,
     memory_bytes: u64,
+    /// Physical footprint where the kernel let us read it
+    footprint_bytes: Option<u64>,
     /// The process's lifetime CPU counter at this instant
     cpu_time_ms: u64,
 }
@@ -53,6 +55,17 @@ pub struct ProcessStats {
     pub cpu_time_delta_ms: u64,
     /// Average resident memory in bytes
     pub memory_avg_bytes: f64,
+    /// Average physical footprint in bytes, over the samples that
+    /// carried one — `None` when no sample did.
+    ///
+    /// The better basis for "how much memory is this holding": RSS
+    /// counts shared framework pages the process is not really costing
+    /// the machine, and cannot see compressed pages at all, so a leak
+    /// whose pages the kernel compressed reads as SHRINKING in
+    /// `memory_avg_bytes` while the footprint keeps climbing. macOS
+    /// only, and absent for processes the collector may not inspect —
+    /// hence an average over what is there rather than a hole
+    pub footprint_avg_bytes: Option<f64>,
     /// Time between the oldest and newest retained sample — how "full"
     /// the window is (0 for a single sample)
     pub span: Duration,
@@ -94,6 +107,7 @@ impl ProcessWindows {
                 at: now,
                 cpu: p.cpu_usage_percent,
                 memory_bytes: p.memory_bytes,
+                footprint_bytes: p.phys_footprint_bytes,
                 cpu_time_ms: p.cpu_time_ms,
             });
             while let Some(oldest) = samples.front() {
@@ -115,6 +129,7 @@ impl ProcessWindows {
                 (Some(first), Some(last)) => last.cpu_time_ms.saturating_sub(first.cpu_time_ms),
                 _ => 0,
             };
+            let footprints: Vec<u64> = samples.iter().filter_map(|s| s.footprint_bytes).collect();
             stats.insert(
                 p.pid,
                 ProcessStats {
@@ -122,6 +137,9 @@ impl ProcessWindows {
                     cpu_time_delta_ms,
                     memory_avg_bytes: samples.iter().map(|s| s.memory_bytes as f64).sum::<f64>()
                         / n,
+                    footprint_avg_bytes: (!footprints.is_empty()).then(|| {
+                        footprints.iter().map(|b| *b as f64).sum::<f64>() / footprints.len() as f64
+                    }),
                     span,
                     samples: samples.len(),
                 },
@@ -156,6 +174,30 @@ mod tests {
             read_bytes_per_sec: None,
             write_bytes_per_sec: None,
         }
+    }
+
+    #[test]
+    fn footprint_averages_over_the_samples_that_carried_one() {
+        let mut w = ProcessWindows::new(Duration::from_secs(60));
+        let base = Instant::now();
+
+        // A process the collector may not inspect reports no footprint
+        // at all — None, so a caller can fall back rather than divide by
+        // a hole
+        let stats = w.record(base, &[proc(1, 0.0, 100)]);
+        assert_eq!(stats[&1].footprint_avg_bytes, None);
+
+        let mut with_footprint = proc(2, 0.0, 100);
+        with_footprint.phys_footprint_bytes = Some(300);
+        let mut later = proc(2, 0.0, 100);
+        later.phys_footprint_bytes = Some(500);
+        w.record(base, &[with_footprint]);
+        let stats = w.record(base + Duration::from_secs(2), &[later]);
+        assert_eq!(stats[&2].footprint_avg_bytes, Some(400.0));
+        assert_eq!(
+            stats[&2].memory_avg_bytes, 100.0,
+            "the resident average is untouched"
+        );
     }
 
     #[test]

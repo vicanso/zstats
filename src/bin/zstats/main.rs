@@ -80,7 +80,15 @@ Config keys for -add (also accepted as key=value). Durations take 500ms /
                               of processes whose names are not stable, e.g.
                               alert-cpu 'rust-analyzer*=200' (quote it: the
                               shell would expand a bare *)
-  alert-mem <pct|name=pct>    [alerts] 5-min avg memory-share rule, same forms
+  alert-mem <pct|name=pct>    [alerts] 5-min avg memory rule, same forms
+                              (default 25% of total). The effective bar is
+                              the LOWER of this and alert-mem-bytes, so it
+                              means the same thing on a laptop and a
+                              workstation; 0 disables the rule. A per-name
+                              override replaces both halves
+  alert-mem-bytes <size>      [alerts] absolute ceiling for that rule
+                              (default 4GiB; 0 removes it). Takes 4GiB /
+                              512MiB / 2GB or bytes
   alert-app-cpu <pct|name=pct>  [alerts] whole-app CPU rule over a process
                               tree (default 200; catches the browser whose
                               helpers each stay under the per-process bar)
@@ -89,7 +97,9 @@ Config keys for -add (also accepted as key=value). Durations take 500ms /
                               (default 90; re-arms 5 pts below; 0 disables)
   alert-pressure <level>      [alerts] kernel memory-pressure alert, macOS:
                               off | warning (default) | critical; alerts only
-                              once the level persists (5m / 1m at critical)
+                              once the level persists (5m / 1m at critical),
+                              and names the biggest memory holders so the
+                              alert says what to close
   alert-cooldown <dur>        [alerts] minimum gap between EPISODES for one
                               process+rule (default 10m); a persisting
                               condition notifies once, plus one follow-up

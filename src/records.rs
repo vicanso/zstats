@@ -71,6 +71,18 @@ pub struct MetricRecord {
     pub memory_avg_bytes: u64,
     /// `memory_avg_bytes` as a percentage of total memory
     pub memory_share_percent: f32,
+    /// 1-minute average physical footprint, where the kernel provided
+    /// one (macOS, and only for processes this user may inspect).
+    ///
+    /// Recorded alongside the resident size rather than instead of it
+    /// because the two answer different questions and diverge by more
+    /// than a rounding: measured live, a language server held 3.02 GiB
+    /// of footprint against 0.17 GiB of RSS, the rest compressed. The
+    /// alert rules measure THIS one, so a history file that only carried
+    /// RSS could not explain its own alerts. Absent from files written
+    /// before this field existed, and on every other platform
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub memory_footprint_bytes: Option<u64>,
     /// The process's LIFETIME CPU counter at this sample, in single-core
     /// milliseconds — an absolute value, not this window's share.
     ///
@@ -208,6 +220,7 @@ mod tests {
             cpu_avg_percent: 50.0,
             memory_avg_bytes: 1024,
             memory_share_percent: 10.0,
+            memory_footprint_bytes: None,
             cpu_time_ms: 30_000,
         }
     }

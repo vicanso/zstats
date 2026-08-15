@@ -107,10 +107,29 @@ detach = true
 #   runaway: 1-minute average >= 3x this value (fast notification)
 # Per-process overrides scale both tiers. 0 disables the rule
 cpu = 30.0
-# Notification when a process's 5-minute average share of total memory
-# reaches this percentage (no runaway tier — transient legitimate spikes
-# must not alert). 0 disables
+# Notification when a process's 5-minute average memory reaches the bar
+# below (no runaway tier — transient legitimate spikes must not alert).
+#
+# The bar is the LOWER of these two, because neither works alone:
+#   mem        percent of total RAM — protects small machines, where any
+#              fixed byte count would be too high to ever fire
+#   mem_bytes  an absolute ceiling — protects large machines, where 25%
+#              is 16 GiB on a 64 GiB box and nothing reaches it until
+#              long after the machine is already swapping
+# So an 8 GiB laptop alerts at 2 GiB (the percentage) and a 64 GiB
+# workstation at 4 GiB (the ceiling). `mem = 0` disables the rule
+# entirely; `mem_bytes = 0` only removes the ceiling. A per-process
+# override replaces BOTH halves — it is a request, not a default.
+#
+# Measured as the physical footprint where macOS provides one (what
+# Activity Monitor bills), not the resident size: a language server can
+# read 0.2 GiB of RSS and 3 GiB of footprint, the rest compressed. That
+# also means a fixed byte bar catches about three times as many
+# processes as the same number would under RSS — which is why the
+# ceiling is 4 GiB rather than the 2 GiB an 8 GiB machine implies.
 mem = 25.0
+mem_bytes = "4GiB"
+
 # Whole-application rules, evaluated over process TREES (see
 # collect_process_groups): a browser split across 37 helpers can hold
 # gigabytes and several cores while no single member trips the
@@ -139,6 +158,12 @@ disk = 90.0
 # marked "still going" rather than posing as a fresh event. This is the
 # only rule that keeps reminding — memory pressure is a machine state
 # you may not be able to fix, not a process you can kill.
+# Every one of these alerts NAMES the biggest memory holders (whole
+# applications where process groups are collected, individual processes
+# otherwise) — the level tells you the machine is in trouble, the names
+# tell you what to close. Not configurable: it is the top 3 above 5% of
+# RAM, and a bar you could raise would silence the list exactly when
+# every consumer is medium-sized, which is when the names help most.
 # `true`/`false` still parse
 pressure = "warning"
 # Minimum time between EPISODES for the same process and rule. A
@@ -204,7 +229,12 @@ template = true
 # before adding an override.
 
 [alerts.mem_overrides]
-# "Google Chrome" = 50.0
+# An entry here replaces BOTH halves of the bar for that name, so 30
+# means "judge it by share of the machine, no absolute ceiling" — the
+# same tier the builtin template uses for browsers, IDEs and language
+# servers. 0 means never interrupt (the data point is still recorded)
+# "Google Chrome" = 30.0
+# qemu-system-aarch64 = 0.0
 
 # Per-volume disk overrides by mount point. Backup volumes (Time
 # Machine) run near-full by design — silence them with 0

@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.5.1](https://github.com/vicanso/zstats/compare/v0.4.0..v0.5.1) - 2026-08-17
+
+### ⛰️  Features
+
+- Memory alert rework — pressure attribution, byte bar, footprint basis - ([dfe545c](https://github.com/vicanso/zstats/commit/dfe545cea7389ca6784f7f5950c12c37e5b8bbc2))
+
+### 🐛 Bug Fixes
+
+- App memory bar, stalled collects, accept loop, new-mount capacity - ([98aff10](https://github.com/vicanso/zstats/commit/98aff10e141361981c80d9d1d424f4565449967e))
+
+### ⚙️ Miscellaneous Tasks
+
+- Version 0.5.0 - ([5219eed](https://github.com/vicanso/zstats/commit/5219eed168e872e79b35410d1647fe001fd09bbc))
+
 ## [0.5.0](https://github.com/vicanso/zstats/compare/v0.4.0..v0.5.0) - 2026-08-15
 
 ### ⛰️  Features

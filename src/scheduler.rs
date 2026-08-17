@@ -18,11 +18,19 @@
 //! Behavior highlights:
 //! - When a collect overruns the interval, missed ticks are skipped
 //!   (`MissedTickBehavior::Skip`).
-//! - Collection runs inside `spawn_blocking`, bounded by `collect_timeout`.
+//! - Collection runs inside `spawn_blocking`. `collect_timeout` bounds
+//!   how long the loop WAITS, not how long the collect runs: a blocking
+//!   task cannot be cancelled, so a stuck collect (statfs on a vanished
+//!   network mount is the realistic one) keeps running to completion.
+//!   The loop therefore also refuses to start a second collect while one
+//!   is still in flight — without that, every skipped tick would queue
+//!   another blocking task behind the same collector lock and they would
+//!   all fire at once when it finally returned.
 //! - Each sink's `write` runs concurrently with its own timeout; a single
 //!   slow/broken sink never affects the others.
 //! - A failed collect is only logged; the loop continues with the next round.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -47,6 +55,10 @@ pub struct Scheduler {
     // Run control
     shutdown_tx: Option<oneshot::Sender<()>>,
     loop_handle: Option<JoinHandle<()>>,
+    /// Set while a collect is running. A timed-out collect keeps going on
+    /// its blocking thread (they are not cancellable), so this is what
+    /// stops the next tick from queueing another one behind it
+    in_flight: Arc<AtomicBool>,
 }
 
 impl Scheduler {
@@ -62,6 +74,7 @@ impl Scheduler {
             sink_write_timeout: DEFAULT_SINK_WRITE_TIMEOUT,
             shutdown_tx: None,
             loop_handle: None,
+            in_flight: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -82,6 +95,11 @@ impl Scheduler {
         let sinks = self.sinks.clone();
         let interval = self.interval;
         let sink_timeout = self.sink_write_timeout;
+        // Read once, here, rather than per round: reaching for it through
+        // the collector's lock would block a runtime worker for as long as
+        // a stuck collect holds it
+        let collect_timeout = lock_collector(&collector).config().collect_timeout;
+        let in_flight = Arc::clone(&self.in_flight);
 
         let handle = tokio::spawn(async move {
             let mut ticker = tokio::time::interval(interval);
@@ -91,7 +109,12 @@ impl Scheduler {
                 tokio::select! {
                     _ = &mut shutdown_rx => break,
                     _ = ticker.tick() => {
-                        match collect_snapshot(&collector).await {
+                        if in_flight.swap(true, Ordering::SeqCst) {
+                            tracing::warn!("previous collect is still running, skipping this tick");
+                            continue;
+                        }
+                        let result = collect_snapshot(&collector, collect_timeout, &in_flight).await;
+                        match result {
                             Ok(snapshot) => dispatch(&sinks, snapshot, sink_timeout).await,
                             Err(e) => tracing::warn!(error = %e, "collect failed, will retry next tick"),
                         }
@@ -118,7 +141,8 @@ impl Scheduler {
 
     /// Collect and dispatch immediately (for app-initiated refresh)
     pub async fn collect_once(&mut self) -> Result<SystemSnapshot, CollectError> {
-        let snapshot = collect_snapshot(&self.collector).await?;
+        let timeout = lock_collector(&self.collector).config().collect_timeout;
+        let snapshot = collect_snapshot(&self.collector, timeout, &self.in_flight).await?;
         dispatch(&self.sinks, snapshot.clone(), self.sink_write_timeout).await;
         Ok(snapshot)
     }
@@ -133,18 +157,36 @@ impl Drop for Scheduler {
     }
 }
 
-/// Run collection on the blocking thread pool, bounded by collect_timeout
-async fn collect_snapshot(collector: &SharedCollector) -> Result<SystemSnapshot, CollectError> {
-    let timeout = lock_collector(collector).config().collect_timeout;
-
+/// Run collection on the blocking thread pool, waiting at most
+/// `timeout` for it.
+///
+/// `in_flight` is cleared by the blocking task itself, not by this
+/// function: on timeout we stop waiting but the collect is still running,
+/// and the flag has to stay set until it actually finishes or the caller
+/// would immediately start another one behind the same lock
+async fn collect_snapshot(
+    collector: &SharedCollector,
+    timeout: Duration,
+    in_flight: &Arc<AtomicBool>,
+) -> Result<SystemSnapshot, CollectError> {
+    in_flight.store(true, Ordering::SeqCst);
     let shared = Arc::clone(collector);
-    let task = tokio::task::spawn_blocking(move || lock_collector(&shared).collect());
+    let done = Arc::clone(in_flight);
+    let task = tokio::task::spawn_blocking(move || {
+        let result = lock_collector(&shared).collect();
+        done.store(false, Ordering::SeqCst);
+        result
+    });
 
     match tokio::time::timeout(timeout, task).await {
         Err(_) => Err(CollectError::Timeout),
-        Ok(Err(join_err)) => Err(CollectError::System {
-            message: join_err.to_string(),
-        }),
+        Ok(Err(join_err)) => {
+            // The task panicked, so it never cleared the flag itself
+            in_flight.store(false, Ordering::SeqCst);
+            Err(CollectError::System {
+                message: join_err.to_string(),
+            })
+        }
         Ok(Ok(result)) => result,
     }
 }

@@ -324,6 +324,18 @@ pub struct ProcessGroupSnapshot {
     pub cpu_usage_percent: f32,
     /// Sum of member resident memory
     pub memory_bytes: u64,
+    /// Sum of member physical footprints, falling back to a member's
+    /// resident size where the kernel refused to report one; `None` when
+    /// no member had a footprint at all (every platform but macOS).
+    ///
+    /// This is the figure the whole-application memory rule measures, for
+    /// the same reason the per-process rule does: RSS cannot see
+    /// compressed pages, so a group whose pages the kernel compressed
+    /// reads as SHRINKING exactly while it is squeezing the machine —
+    /// and a browser split across dozens of helpers is the case that
+    /// compresses hardest
+    #[serde(default)]
+    pub phys_footprint_bytes: Option<u64>,
     /// Sum of member disk read/write rates; None unless
     /// `collect_process_disk_io` is enabled
     #[serde(default)]

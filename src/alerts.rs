@@ -198,6 +198,24 @@ const DEFAULT_DISK_FRACTION: f32 = 0.90;
 /// this rule is the total that per-process thresholds cannot see
 const DEFAULT_APP_CPU_PERCENT: f32 = 200.0;
 const DEFAULT_APP_MEMORY_FRACTION: f64 = 0.40;
+
+/// Absolute ceiling on the whole-app memory bar, the counterpart of
+/// [`DEFAULT_MEMORY_BYTES`] — and the reason this rule can fire at all.
+///
+/// A share of total RAM fails the same way here as it does per process,
+/// only worse: 40% is 25.6 GiB on a 64 GiB machine and 9.6 GiB on a
+/// 24 GiB one, so on the machines that actually run browsers with dozens
+/// of helpers the rule was unreachable. The whole stated point of the
+/// app rules — "the browser holding gigabytes across 37 helpers is
+/// visible even though no member trips the per-process bar" — needs a
+/// bar that a real application can reach.
+///
+/// Twice [`DEFAULT_MEMORY_BYTES`] on purpose: it keeps the app bar above
+/// the per-process one on every machine size (min(40%, 8 GiB) against
+/// min(25%, 4 GiB)), so a group alert always means "more than any single
+/// process bar would have explained" and the two rules never notify
+/// about the same thing
+const DEFAULT_APP_MEMORY_BYTES: u64 = 8 << 30;
 const DEFAULT_COOLDOWN: Duration = Duration::from_secs(600);
 
 /// The disk rule is crossing-based, not windowed (capacity is a slow
@@ -609,12 +627,20 @@ fn top_memory_consumers(snapshot: &SystemSnapshot) -> Vec<MemoryConsumer> {
     let mut ranked: Vec<MemoryConsumer> = match groups {
         Some(groups) => groups
             .iter()
-            .map(|g| MemoryConsumer {
-                pid: g.root_pid,
-                name: g.name.clone(),
-                bytes: g.memory_bytes,
-                share_percent: share(g.memory_bytes) * 100.0,
-                process_count: g.process_count,
+            .map(|g| {
+                // Footprint, for the reason this list exists at all: the
+                // kernel only reports pressure once it is compressing
+                // hard, and RSS is the number that FALLS as it does — so
+                // ranking by RSS would demote exactly the applications
+                // responsible for the episode being reported
+                let bytes = g.phys_footprint_bytes.unwrap_or(g.memory_bytes);
+                MemoryConsumer {
+                    pid: g.root_pid,
+                    name: g.name.clone(),
+                    bytes,
+                    share_percent: share(bytes) * 100.0,
+                    process_count: g.process_count,
+                }
             })
             .collect(),
         None => snapshot
@@ -864,6 +890,9 @@ pub struct ActiveThresholds {
     /// Whole-application totals, override key = the group's root name
     pub app_cpu: Thresholds<f32>,
     pub app_memory: Thresholds<f64>,
+    /// Absolute ceiling on the whole-app memory bar, `None` for no
+    /// ceiling. See [`DEFAULT_APP_MEMORY_BYTES`]
+    pub app_memory_bytes: Option<u64>,
     /// Per (process, rule) re-alert cooldown while a condition persists
     pub cooldown: Duration,
 }
@@ -896,6 +925,29 @@ impl ActiveThresholds {
             (Some(share), Some(ceiling)) => Some(share.min(ceiling)),
             (Some(only), None) | (None, Some(only)) => Some(only),
             (None, None) => None,
+        }
+    }
+
+    /// The effective whole-application memory bar for `name`, in BYTES.
+    ///
+    /// Same shape as [`Self::memory_bar_bytes`] one level up: the lower
+    /// of the share and the ceiling, and a per-name override replaces
+    /// both halves. There is no override-free variant because metrics
+    /// recording is per process — a group is never a recorded row
+    pub fn app_memory_bar_bytes(&self, name: &str, total_memory: u64) -> Option<u64> {
+        match self.app_memory.override_for(name) {
+            Some(over) => over.map(|fraction| fraction_bytes(fraction, total_memory)),
+            None => {
+                let share = self
+                    .app_memory
+                    .base()
+                    .map(|fraction| fraction_bytes(fraction, total_memory));
+                match (share, self.app_memory_bytes) {
+                    (Some(share), Some(ceiling)) => Some(share.min(ceiling)),
+                    (Some(only), None) | (None, Some(only)) => Some(only),
+                    (None, None) => None,
+                }
+            }
         }
     }
 
@@ -987,6 +1039,8 @@ impl ActiveThresholds {
                     app_cpu.with_template_override(name.clone(), (*pct > 0.0).then_some(*pct));
             }
         }
+        // Mirrors `alert-mem` / `alert-mem-bytes`: the percentage is the
+        // rule's on/off switch, the byte ceiling only refines it
         let app_mem_default = match file.app_mem {
             Some(p) if p > 0.0 => Some(p / 100.0),
             Some(_) => None,
@@ -1004,6 +1058,12 @@ impl ActiveThresholds {
             }
         }
 
+        let app_mem_bytes_default = match (app_mem_default, file.app_mem_bytes) {
+            (None, _) | (Some(_), Some(0)) => None,
+            (Some(_), Some(bytes)) => Some(bytes),
+            (Some(_), None) => Some(DEFAULT_APP_MEMORY_BYTES),
+        };
+
         Self {
             cpu,
             memory,
@@ -1011,6 +1071,7 @@ impl ActiveThresholds {
             disk,
             app_cpu,
             app_memory,
+            app_memory_bytes: app_mem_bytes_default,
             pressure: file
                 .pressure
                 .unwrap_or(crate::settings::PressureAlert::Warning)
@@ -1257,10 +1318,11 @@ impl AlertEngine {
                     // averages anyway
                     cpu_time_ms: 0,
                     memory_bytes: g.memory_bytes,
-                    // Not summed over the tree: EPERM'd members would make
-                    // the total silently partial. The app rules don't read
-                    // it; per-process rows carry the real value.
-                    phys_footprint_bytes: None,
+                    // Summed over the whole tree by the collector, with a
+                    // member's RSS standing in wherever the kernel refused
+                    // a footprint — so the total is never silently partial,
+                    // and never worse than the resident sum it replaces
+                    phys_footprint_bytes: g.phys_footprint_bytes,
                     virtual_memory_bytes: 0,
                     run_time_secs: 0,
                     parent_pid: None,
@@ -1306,12 +1368,15 @@ impl AlertEngine {
                         });
                     }
                 }
-                if let Some(fraction) = active.app_memory.for_process(&g.name)
+                // Measured on the footprint like the per-process rule,
+                // falling back to the resident sum on platforms that have
+                // no footprint at all
+                let held_bytes = stat.footprint_avg_bytes.unwrap_or(stat.memory_avg_bytes);
+                if let Some(bar) = active.app_memory_bar_bytes(&g.name, total_memory)
                     && total_memory > 0
                 {
                     let key = (g.root_pid, AlertKind::AppMemory);
-                    let share = mem_share(stat.memory_avg_bytes);
-                    if share < fraction {
+                    if (held_bytes as u64) < bar {
                         self.episodes.clear(key);
                     } else if let Some(notify) = self.episodes.notify(key, now, active.cooldown) {
                         evaluation.events.push(AlertEvent {
@@ -1321,10 +1386,10 @@ impl AlertEngine {
                                 process_count: g.process_count,
                             },
                             detail: AlertDetail::Memory {
-                                avg_bytes: stat.memory_avg_bytes as u64,
-                                share_percent: share * 100.0,
-                                threshold_bytes: fraction_bytes(fraction, total_memory),
-                                threshold_percent: fraction * 100.0,
+                                avg_bytes: held_bytes as u64,
+                                share_percent: mem_share(held_bytes) * 100.0,
+                                threshold_bytes: bar,
+                                threshold_percent: mem_share(bar as f64) * 100.0,
                                 window: SLOW_WINDOW,
                             },
                             repeat_after: notify.elapsed(),
@@ -1690,6 +1755,7 @@ mod tests {
             disk: Thresholds::new(None),
             app_cpu: Thresholds::new(None),
             app_memory: Thresholds::new(None),
+            app_memory_bytes: None,
             pressure: None,
             cooldown,
         }
@@ -2108,6 +2174,7 @@ mod tests {
             disk: Thresholds::new(Some(0.90)),
             app_cpu: Thresholds::new(None),
             app_memory: Thresholds::new(None),
+            app_memory_bytes: None,
             pressure: Some(2),
             cooldown: Duration::from_secs(600),
         };
@@ -2462,6 +2529,7 @@ mod tests {
             disk: Thresholds::new(Some(0.90)),
             app_cpu: Thresholds::new(None),
             app_memory: Thresholds::new(None),
+            app_memory_bytes: None,
             pressure: None,
             cooldown: Duration::from_secs(600),
         };
@@ -2499,6 +2567,7 @@ mod tests {
             disk: disk_rule,
             app_cpu: Thresholds::new(None),
             app_memory: Thresholds::new(None),
+            app_memory_bytes: None,
             pressure: None,
             cooldown: Duration::from_secs(600),
         };
@@ -2523,8 +2592,22 @@ mod tests {
             process_count: count,
             cpu_usage_percent: cpu,
             memory_bytes: mem,
+            phys_footprint_bytes: None,
             read_bytes_per_sec: None,
             write_bytes_per_sec: None,
+        }
+    }
+
+    fn group_with_footprint(
+        root_pid: u32,
+        name: &str,
+        count: u32,
+        mem: u64,
+        footprint: u64,
+    ) -> ProcessGroupSnapshot {
+        ProcessGroupSnapshot {
+            phys_footprint_bytes: Some(footprint),
+            ..group(root_pid, name, count, 0.0, mem)
         }
     }
 
@@ -2536,6 +2619,7 @@ mod tests {
             disk: Thresholds::new(None),
             app_cpu: cpu,
             app_memory: memory,
+            app_memory_bytes: None,
             pressure: None,
             cooldown: Duration::from_secs(600),
         }
@@ -2612,6 +2696,121 @@ mod tests {
     }
 
     #[test]
+    fn the_app_memory_rule_measures_the_footprint_not_the_resident_sum() {
+        // The case the rule exists for: an app split across helpers whose
+        // pages the kernel compressed. The resident sum says 10% and
+        // falls as the squeeze gets worse; the footprint says 50%
+        let active = app_thresholds(Thresholds::new(None), Thresholds::new(Some(0.40)));
+        let mut engine = AlertEngine::new();
+        let base = Instant::now();
+        let mut messages = Vec::new();
+
+        for i in 0..160u64 {
+            let mut s = snapshot(Vec::new(), 100);
+            s.process_groups = Some(std::sync::Arc::new(vec![
+                group_with_footprint(10, "Google Chrome", 37, 10, 50),
+                // Same resident sum, no footprint at all (Linux): the
+                // fallback keeps it under the bar rather than inventing one
+                group(20, "firefox", 12, 0.0, 10),
+            ]));
+            messages.extend(
+                engine
+                    .evaluate(base + Duration::from_secs(2 * i), &s, &active)
+                    .events
+                    .into_iter()
+                    .map(|e| e.summary()),
+            );
+        }
+        assert_eq!(messages.len(), 1, "only the footprint-heavy app alerts");
+        assert!(
+            messages[0].contains("Google Chrome (37 processes)")
+                && messages[0].contains("50% of total memory"),
+            "got: {}",
+            messages[0]
+        );
+    }
+
+    #[test]
+    fn the_app_memory_bar_is_the_lower_of_the_share_and_the_ceiling() {
+        let active = app_thresholds(
+            Thresholds::new(None),
+            Thresholds::new(Some(DEFAULT_APP_MEMORY_FRACTION)),
+        );
+        let active = ActiveThresholds {
+            app_memory_bytes: Some(DEFAULT_APP_MEMORY_BYTES),
+            ..active
+        };
+        // Small machine: the percentage is the binding half
+        assert_eq!(
+            active.app_memory_bar_bytes("any", 8 << 30),
+            Some(fraction_bytes(0.40, 8 << 30))
+        );
+        // Large machine: the ceiling is, and it stays reachable
+        assert_eq!(
+            active.app_memory_bar_bytes("any", 64 << 30),
+            Some(DEFAULT_APP_MEMORY_BYTES)
+        );
+        // On every size the app bar stays above the per-process one, so a
+        // group alert always means more than one process could explain
+        for total in [8u64 << 30, 24 << 30, 64 << 30] {
+            let per_process =
+                fraction_bytes(DEFAULT_MEMORY_FRACTION, total).min(DEFAULT_MEMORY_BYTES);
+            assert!(
+                active.app_memory_bar_bytes("any", total).expect("a bar") > per_process,
+                "app bar must exceed the per-process bar at {total} bytes"
+            );
+        }
+    }
+
+    #[test]
+    fn an_app_memory_override_replaces_both_halves_of_the_bar() {
+        let active = app_thresholds(
+            Thresholds::new(None),
+            Thresholds::new(Some(0.40)).with_override("qemu".into(), Some(0.70)),
+        );
+        let active = ActiveThresholds {
+            app_memory_bytes: Some(DEFAULT_APP_MEMORY_BYTES),
+            ..active
+        };
+        // 70% of 64 GiB is far past the 8 GiB ceiling — an override is an
+        // explicit request, not a default to be clamped
+        assert_eq!(
+            active.app_memory_bar_bytes("qemu", 64 << 30),
+            Some(fraction_bytes(0.70, 64 << 30))
+        );
+        assert_eq!(
+            active.app_memory_bar_bytes("other", 64 << 30),
+            Some(DEFAULT_APP_MEMORY_BYTES)
+        );
+    }
+
+    #[test]
+    fn disabling_the_app_percentage_disables_the_whole_app_memory_rule() {
+        let file = AlertsConfig {
+            app_mem: Some(0.0),
+            ..Default::default()
+        };
+        let merged = ActiveThresholds::from_config(&file);
+        assert!(!merged.app_memory.any_enabled());
+        assert_eq!(
+            merged.app_memory_bytes, None,
+            "the ceiling cannot outlive it"
+        );
+        assert_eq!(merged.app_memory_bar_bytes("any", 64 << 30), None);
+
+        // 0 on the ceiling alone only removes the ceiling
+        let file = AlertsConfig {
+            app_mem_bytes: Some(0),
+            ..Default::default()
+        };
+        let merged = ActiveThresholds::from_config(&file);
+        assert_eq!(
+            merged.app_memory_bar_bytes("any", 64 << 30),
+            Some(fraction_bytes(DEFAULT_APP_MEMORY_FRACTION, 64 << 30))
+        );
+    }
+
+    #[test]
     fn app_group_rules_are_skipped_without_group_data() {
         let active = app_thresholds(Thresholds::new(Some(1.0)), Thresholds::new(Some(0.01)));
         let mut engine = AlertEngine::new();
@@ -2637,6 +2836,7 @@ mod tests {
             disk: Thresholds::new(None),
             app_cpu: Thresholds::new(None),
             app_memory: Thresholds::new(None),
+            app_memory_bytes: None,
             pressure: Some(2),
             cooldown: Duration::from_secs(600),
         };
@@ -2708,6 +2908,7 @@ mod tests {
             disk: Thresholds::new(None),
             app_cpu: Thresholds::new(None),
             app_memory: Thresholds::new(None),
+            app_memory_bytes: None,
             pressure: Some(2),
             cooldown: Duration::from_secs(600),
         };
@@ -2755,6 +2956,7 @@ mod tests {
             disk: Thresholds::new(None),
             app_cpu: Thresholds::new(None),
             app_memory: Thresholds::new(None),
+            app_memory_bytes: None,
             pressure: Some(2),
             cooldown: Duration::from_secs(600),
         };
@@ -2811,6 +3013,7 @@ mod tests {
             disk: Thresholds::new(None),
             app_cpu: Thresholds::new(None),
             app_memory: Thresholds::new(None),
+            app_memory_bytes: None,
             pressure: Some(2),
             cooldown: Duration::from_secs(600),
         };
@@ -2856,6 +3059,7 @@ mod tests {
             disk: Thresholds::new(None),
             app_cpu: Thresholds::new(None),
             app_memory: Thresholds::new(None),
+            app_memory_bytes: None,
             pressure: Some(2),
             cooldown: Duration::from_secs(600),
         };
@@ -2887,6 +3091,7 @@ mod tests {
             disk: Thresholds::new(None),
             app_cpu: Thresholds::new(None),
             app_memory: Thresholds::new(None),
+            app_memory_bytes: None,
             pressure: Some(4),
             cooldown: Duration::from_secs(600),
         };
@@ -2914,6 +3119,7 @@ mod tests {
             disk: Thresholds::new(None),
             app_cpu: Thresholds::new(None),
             app_memory: Thresholds::new(None),
+            app_memory_bytes: None,
             pressure: Some(2),
             cooldown: Duration::from_secs(600),
         }
@@ -2931,7 +3137,10 @@ mod tests {
             let mut s = snapshot(vec![proc(1, 0.0, 40)], 100);
             s.memory.pressure_level = Some(2);
             s.process_groups = Some(std::sync::Arc::new(vec![
-                group(10, "Google Chrome", 37, 0.0, 40),
+                // Ranked on the footprint: on RSS alone Chrome would
+                // sort BELOW zed, which is exactly the inversion a
+                // compressing machine produces
+                group_with_footprint(10, "Google Chrome", 37, 15, 40),
                 group(20, "zed", 3, 0.0, 20),
                 group(30, "node", 1, 0.0, 10),
                 group(40, "Finder", 1, 0.0, 8),
@@ -3058,6 +3267,7 @@ mod tests {
             disk: Thresholds::new(None),
             app_cpu: Thresholds::new(None),
             app_memory: Thresholds::new(None),
+            app_memory_bytes: None,
             pressure: None,
             cooldown: Duration::from_secs(600),
         };

@@ -48,6 +48,10 @@ pub fn log_path() -> PathBuf {
     std::env::temp_dir().join(format!("zstats-{user}.log"))
 }
 
+/// How long a connected client has to send its command line before the
+/// server drops it
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Ring buffer of recent snapshots, pruned by timestamp span
 struct HistoryBuffer {
     retention_secs: i64,
@@ -158,8 +162,23 @@ pub async fn serve(
         let shutdown = Arc::clone(&shutdown);
         tokio::spawn(async move {
             loop {
-                let Ok((stream, _)) = listener.accept().await else {
-                    break;
+                let stream = match listener.accept().await {
+                    Ok((stream, _)) => stream,
+                    // Breaking here would leave a daemon that still
+                    // collects but never answers again — and since the
+                    // socket stays bound, `is_running` keeps reporting
+                    // true while attach and stop hang forever. Almost
+                    // every accept error is per-connection or transient
+                    // (ECONNABORTED, EMFILE under fd pressure), so log it
+                    // and keep serving
+                    Err(e) if is_fatal_accept_error(&e) => {
+                        tracing::error!("accept failed fatally, stopping the listener: {e}");
+                        break;
+                    }
+                    Err(e) => {
+                        tracing::warn!("accept failed, continuing: {e}");
+                        continue;
+                    }
                 };
                 let history = Arc::clone(&history);
                 let live = live_tx.clone();
@@ -184,6 +203,19 @@ pub async fn serve(
     ExitCode::SUCCESS
 }
 
+/// Whether an accept error means the listener itself is gone rather
+/// than one connection having failed. Only a broken socket qualifies:
+/// everything else (a peer that hung up mid-handshake, a momentary fd
+/// shortage) is survivable and the loop retries on the next accept
+fn is_fatal_accept_error(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::NotConnected
+            | std::io::ErrorKind::BrokenPipe
+            | std::io::ErrorKind::AddrNotAvailable
+    )
+}
+
 /// Returns Ok(true) when the client asked the daemon to stop
 async fn handle_client(
     stream: UnixStream,
@@ -192,7 +224,15 @@ async fn handle_client(
 ) -> std::io::Result<bool> {
     let (reader, mut writer) = stream.into_split();
     let mut lines = BufReader::new(reader).lines();
-    let command = lines.next_line().await?.unwrap_or_default();
+    // A peer that connects and then says nothing would otherwise hold a
+    // task for as long as the daemon lives
+    let command = match tokio::time::timeout(COMMAND_TIMEOUT, lines.next_line()).await {
+        Ok(line) => line?.unwrap_or_default(),
+        Err(_) => {
+            tracing::debug!("client sent no command within {COMMAND_TIMEOUT:?}, dropping it");
+            return Ok(false);
+        }
+    };
 
     match command.trim() {
         "STOP" => {

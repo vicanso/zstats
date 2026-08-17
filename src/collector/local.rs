@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
 use sysinfo::{
-    Components, CpuRefreshKind, DiskRefreshKind, Disks, Networks, Pid, ProcessRefreshKind,
+    Components, CpuRefreshKind, Disk, DiskRefreshKind, Disks, Networks, Pid, ProcessRefreshKind,
     ProcessesToUpdate, System, UpdateKind,
 };
 
@@ -308,13 +308,27 @@ impl LocalCollector {
         self.disks.refresh_specifics(true, kind);
         self.last_disk_io_refresh = Some(Instant::now());
 
+        // The enumeration above picks up a volume the moment it is mounted, but
+        // sysinfo fills a brand-new entry's capacity with 0 unless storage was
+        // requested — so a fresh mount would read 0/0 until the slow cadence
+        // comes round, and the dedupe below can let that zero entry win over a
+        // healthy mount of the same device. Pay one capacity read per new mount
+        // instead; the volumes already on their own cadence stay untouched
+        if !storage_due {
+            for disk in self.disks.list_mut() {
+                if is_new_mount(&disk_key(disk), &self.last_disk_counters) {
+                    disk.refresh_specifics(DiskRefreshKind::nothing().with_storage());
+                }
+            }
+        }
+
         let mut snapshots = Vec::new();
         let mut counters = HashMap::new();
 
         for disk in self.disks.list() {
+            let key = disk_key(disk);
             let name = disk.name().to_string_lossy().to_string();
             let mount_point = disk.mount_point().to_string_lossy().to_string();
-            let key = format!("{name}:{mount_point}");
 
             let usage = disk.usage();
             let current = DiskCounters {
@@ -595,6 +609,13 @@ impl LocalCollector {
                     parent: p.parent().map(|pp| pp.as_u32()),
                     cpu: p.cpu_usage(),
                     mem: p.memory(),
+                    // Over the FULL table, not just the ranked top-N: a
+                    // group total that skipped its unranked helpers would
+                    // undercount exactly the many-small-helper apps the
+                    // group rules exist for. ~0.5us per process, i.e.
+                    // tenths of a millisecond against the ~20ms the
+                    // process refresh already costs
+                    footprint: phys_footprint(pid),
                     io,
                 },
             );
@@ -620,6 +641,7 @@ impl LocalCollector {
                         process_count: g.process_count,
                         cpu_usage_percent: g.cpu,
                         memory_bytes: g.mem,
+                        phys_footprint_bytes: g.any_footprint.then_some(g.footprint_sum),
                         read_bytes_per_sec: rate(g.read_bytes),
                         write_bytes_per_sec: rate(g.written_bytes),
                     })
@@ -734,6 +756,24 @@ fn is_plausible_celsius(t: f32) -> bool {
 }
 
 /// `used / total * 100`, or 0 when total is zero
+/// Identifies one mounted volume across refreshes; a device can be mounted at
+/// several paths, so the mount point is part of the identity
+fn disk_key(disk: &Disk) -> String {
+    format!(
+        "{}:{}",
+        disk.name().to_string_lossy(),
+        disk.mount_point().to_string_lossy()
+    )
+}
+
+/// Whether this volume appeared since the previous refresh and therefore still
+/// has no capacity. Nothing counts as new before a refresh has recorded a mount
+/// set: the constructor's enumeration already carried capacity for every volume
+/// it listed, and treating them all as new would buy a redundant read at startup
+fn is_new_mount(key: &str, known: &HashMap<String, DiskCounters>) -> bool {
+    !known.is_empty() && !known.contains_key(key)
+}
+
 fn ratio_percent(used: u64, total: u64) -> f32 {
     if total == 0 {
         0.0
@@ -860,6 +900,8 @@ struct ProcNode {
     parent: Option<u32>,
     cpu: f32,
     mem: u64,
+    /// Physical footprint where the kernel let us read it
+    footprint: Option<u64>,
     /// Bytes read/written since the previous process refresh; None when
     /// process disk IO collection is off
     io: Option<(u64, u64)>,
@@ -872,6 +914,17 @@ struct GroupTotals {
     process_count: u32,
     cpu: f32,
     mem: u64,
+    /// Sum of the best figure available per member: the physical
+    /// footprint where the kernel provided one, that member's resident
+    /// size otherwise. Summing only the readable members would silently
+    /// understate a group whose helpers we may not inspect, and the
+    /// per-member fallback is the same one every footprint reader here
+    /// uses
+    footprint_sum: u64,
+    /// Whether any member had a real footprint. Without one the sum is
+    /// just resident memory again, which `mem` already reports — so the
+    /// caller publishes `None` rather than a second copy of RSS
+    any_footprint: bool,
     /// Summed bytes since the previous refresh (turned into rates by the
     /// caller, which knows the elapsed time)
     read_bytes: Option<u64>,
@@ -923,12 +976,20 @@ fn aggregate_process_groups(table: &HashMap<u32, ProcNode>, max: usize) -> Vec<G
             process_count: 0,
             cpu: 0.0,
             mem: 0,
+            footprint_sum: 0,
+            any_footprint: false,
             read_bytes: None,
             written_bytes: None,
         });
         entry.process_count += 1;
         entry.cpu += node.cpu;
         entry.mem = entry.mem.saturating_add(node.mem);
+        // Both parts unconditionally, so the total does not depend on the
+        // order the table happens to iterate in
+        entry.footprint_sum = entry
+            .footprint_sum
+            .saturating_add(node.footprint.unwrap_or(node.mem));
+        entry.any_footprint |= node.footprint.is_some();
         if let Some((read, written)) = node.io {
             entry.read_bytes = Some(entry.read_bytes.unwrap_or(0).saturating_add(read));
             entry.written_bytes = Some(entry.written_bytes.unwrap_or(0).saturating_add(written));
@@ -952,8 +1013,9 @@ fn aggregate_process_groups(table: &HashMap<u32, ProcNode>, max: usize) -> Vec<G
 ///
 /// Cheap enough to run unconditionally: the kernel maintains the
 /// footprint as a ledger value on the task, and this call copies it out
-/// in one round trip — measured ~0.5µs. It runs only for the
-/// materialised top-N, so a collect pays tens of microseconds against
+/// in one round trip — measured ~0.5µs. It runs for the materialised
+/// top-N and, when process groups are collected, once per process in the
+/// full table — a few hundred microseconds on a busy machine, against
 /// the ~20ms the process refresh already costs.
 ///
 /// `RUSAGE_INFO_V0` on purpose: `ri_phys_footprint` has been there
@@ -1150,7 +1212,20 @@ mod tests {
             parent,
             cpu,
             mem,
+            footprint: None,
             io: None,
+        }
+    }
+
+    fn node_with_footprint(
+        parent: Option<u32>,
+        cpu: f32,
+        mem: u64,
+        footprint: Option<u64>,
+    ) -> ProcNode {
+        ProcNode {
+            footprint,
+            ..node(parent, cpu, mem)
         }
     }
 
@@ -1373,6 +1448,53 @@ mod tests {
         assert_eq!(d0.mount_point, "/");
         assert_eq!(d0.read_bytes_per_sec, Some(3));
         assert!(out.iter().any(|d| d.name == "disk1"));
+    }
+
+    #[test]
+    fn only_a_volume_missing_from_a_known_mount_set_counts_as_new() {
+        let counters = DiskCounters {
+            total_read_bytes: 0,
+            total_written_bytes: 0,
+        };
+        let known: HashMap<String, DiskCounters> =
+            HashMap::from([("disk0:/".to_string(), counters)]);
+
+        assert!(is_new_mount("disk1:/Volumes/X", &known));
+        assert!(!is_new_mount("disk0:/", &known));
+        // A device already known under another mount point is still new here:
+        // the second mount is a separate entry with its own capacity
+        assert!(is_new_mount("disk0:/System/Volumes/Data", &known));
+        // Before the first refresh there is no set to compare against, and the
+        // constructor's enumeration already carried capacity
+        assert!(!is_new_mount("disk0:/", &HashMap::new()));
+    }
+
+    #[test]
+    fn a_group_sums_member_footprints_and_falls_back_per_member() {
+        // Root is pid 10 (a launchd child); INIT_PID itself is the
+        // boundary, never a group
+        let table = HashMap::from([
+            (10u32, node_with_footprint(None, 0.0, 100, Some(500))),
+            // Unreadable footprint: this member contributes its resident
+            // size rather than nothing, so the total is never partial
+            (11u32, node_with_footprint(Some(10), 0.0, 200, None)),
+            (12u32, node_with_footprint(Some(10), 0.0, 300, Some(900))),
+        ]);
+        let groups = aggregate_process_groups(&table, 10);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].mem, 600);
+        assert!(groups[0].any_footprint);
+        assert_eq!(groups[0].footprint_sum, 500 + 200 + 900);
+
+        // No member had one (every platform but macOS): the caller
+        // publishes None rather than a second copy of the resident sum
+        let table = HashMap::from([
+            (10u32, node(None, 0.0, 100)),
+            (11u32, node(Some(10), 0.0, 200)),
+        ]);
+        let groups = aggregate_process_groups(&table, 10);
+        assert!(!groups[0].any_footprint);
+        assert_eq!(groups[0].mem, 300);
     }
 
     #[test]

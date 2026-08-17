@@ -203,8 +203,24 @@ pub struct AlertsConfig {
     /// app whose members each stay under the per-process bar. 0 disables
     pub app_cpu: Option<f32>,
     /// Whole-application memory threshold as a percentage of total;
-    /// absent = builtin default (40). 0 disables
+    /// absent = builtin default (40). Combined with
+    /// [`Self::app_mem_bytes`] exactly like [`Self::mem`] is with
+    /// [`Self::mem_bytes`] — the group only has to reach the lower of
+    /// the two. 0 disables
     pub app_mem: Option<f64>,
+    /// Absolute ceiling for the whole-app memory rule, in bytes; absent
+    /// = builtin default (8 GiB), 0 = no absolute ceiling.
+    ///
+    /// Without it the rule is unreachable on the machines it was written
+    /// for: 40% is 9.6 GiB on a 24 GiB laptop and 25.6 GiB on a 64 GiB
+    /// desktop, so the browser holding gigabytes across dozens of
+    /// helpers never qualified
+    #[serde(
+        default,
+        with = "crate::config::option_size_serde",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub app_mem_bytes: Option<u64>,
     /// Per-process CPU overrides, keyed by process name
     pub cpu_overrides: BTreeMap<String, f32>,
     /// Per-process memory overrides, keyed by process name
@@ -230,7 +246,8 @@ cpu-freq-interval, battery-interval, process-boost, max-processes, \
 collect-processes, collect-disks, collect-networks, collect-temperatures, \
 collect-battery, process-disk-io, \
 process-groups, dedupe-disks, per-core-cpu, alert-cpu, alert-mem, \
-alert-mem-bytes, alert-app-cpu, alert-app-mem, alert-disk, alert-pressure, \
+alert-mem-bytes, alert-app-cpu, alert-app-mem, alert-app-mem-bytes, \
+alert-disk, alert-pressure, \
 alert-cooldown, alert-template";
 
 fn parse<T: std::str::FromStr>(key: &str, value: &str) -> Result<T, String> {
@@ -365,13 +382,19 @@ pub fn apply_add(config: &mut FileConfig, key: &str, value: &str) -> Result<Stri
                 config.alerts.mem = Some(pct);
             }
         }
-        "alert-mem-bytes" => {
+        "alert-mem-bytes" | "alert-app-mem-bytes" => {
             let bytes = crate::config::parse_size(value)
                 .map_err(|e| format!("invalid value for {key}: {e}"))?;
-            config.alerts.mem_bytes = Some(bytes);
+            let pct_key = if key == "alert-mem-bytes" {
+                config.alerts.mem_bytes = Some(bytes);
+                "alert-mem"
+            } else {
+                config.alerts.app_mem_bytes = Some(bytes);
+                "alert-app-mem"
+            };
             return Ok(format!(
                 "{key} = {} (0 removes the absolute ceiling; the effective bar is \
-                 the lower of this and alert-mem)",
+                 the lower of this and {pct_key})",
                 crate::config::format_size(bytes)
             ));
         }
@@ -475,6 +498,7 @@ pub fn apply_remove(
         "alert-cpu" => config.alerts.cpu = None,
         "alert-mem" => config.alerts.mem = None,
         "alert-mem-bytes" => config.alerts.mem_bytes = None,
+        "alert-app-mem-bytes" => config.alerts.app_mem_bytes = None,
         "alert-app-cpu" => config.alerts.app_cpu = None,
         "alert-app-mem" => config.alerts.app_mem = None,
         "alert-disk" => config.alerts.disk = None,

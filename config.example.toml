@@ -50,7 +50,9 @@ collect_disks = true
 # Disk sampling cadence (IO counters + snapshot rebuild)
 disk_io_refresh_interval = "0s"
 # Capacity (statfs) is ~25x more expensive than IO counters and barely
-# changes — it throttles separately underneath the disk cadence
+# changes — it throttles separately underneath the disk cadence. A volume
+# that just appeared is read right away regardless, since a new mount has
+# no capacity at all until its first storage read
 disk_storage_refresh_interval = "1m"
 # Collapse APFS synthetic mounts (e.g. "/" and "/System/Volumes/Data")
 # into one entry per device name, preferring the shortest mount point
@@ -136,7 +138,13 @@ mem_bytes = "4GiB"
 # per-process rules above. Chronic only (5-minute average) — a runaway
 # member is already the per-process runaway tier's job. 0 disables
 app_cpu = 200.0
+# app_mem has the same two halves as mem above, for the same reason: 40%
+# is 9.6 GiB on a 24 GiB laptop and 25.6 GiB on a 64 GiB desktop, so the
+# percentage alone put the rule out of reach on exactly the machines that
+# run those browsers. The effective bar is the lower of the two, and both
+# are measured on the group's summed physical footprint
 app_mem = 40.0
+app_mem_bytes = "8GiB"
 
 # Notification when a volume's used capacity crosses this percentage.
 # Crossing-based, not windowed: fires once, stays silent while the disk

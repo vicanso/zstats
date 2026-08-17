@@ -122,7 +122,7 @@ expensive subsystems are opt-out and throttled (`CollectorConfig`):
 |------|---------|--------|
 | `collect_disks` / `collect_networks` / `collect_processes` / `collect_temperatures` | `true` | Disable a subsystem entirely (its snapshot field becomes `None`) |
 | `temperature_refresh_interval` | 15s | Hardware temps change slowly; readings are reused between refreshes |
-| `disk_storage_refresh_interval` | 60s | Disk capacity (statfs, the most expensive call) refreshes on its own slow cadence; IO counters still refresh every collect |
+| `disk_storage_refresh_interval` | 60s | Disk capacity (statfs, the most expensive call) refreshes on its own slow cadence; IO counters still refresh every collect, and a newly mounted volume is read as soon as it appears |
 | `dedupe_disks` | `true` | Keep one entry per device name (shortest mount); collapses APFS synthetic mounts |
 | `cpu_frequency_refresh_interval` | 30s | CPU frequency refreshes on its own cadence; usage still every collect |
 | `process_refresh_interval` | 0 (every collect) | Throttle the process list; the last list is reused between refreshes |

@@ -110,7 +110,7 @@ SystemSnapshot
 | `file_system` | String | |
 | `kind` | String | `SSD` / `HDD` / `Unknown` |
 | `is_removable` | bool | Worth a distinct icon — a full USB stick is not an emergency |
-| `total_bytes`, `available_bytes` | bytes | **Refreshed every 60s** by default (~18ms syscall) |
+| `total_bytes`, `available_bytes` | bytes | **Refreshed every 60s** by default (~18ms syscall); a volume that just appeared is read immediately so a fresh mount never shows 0 |
 | `used_percent` | 0–100 | Pure ratio: `(total - available) / total * 100` (0 if total is 0). Same number the CLI paints on the capacity bar |
 | `read_bytes_per_sec`, `write_bytes_per_sec` | B/s | `None` on the first sample |
 
@@ -180,6 +180,7 @@ what makes a browser with 37 helpers legible as one row.
 | `process_count` | u32 | "Chrome — 37 processes" |
 | `cpu_usage_percent` | single-core % | Sum over the whole tree; hundreds of percent is normal |
 | `memory_bytes` | bytes | Sum over the whole tree |
+| `phys_footprint_bytes` | bytes | Sum over the whole tree, a member's RSS standing in where the kernel refused a footprint; `None` off macOS. **This is what the app memory rule measures** — RSS falls as the kernel compresses, exactly when a group is squeezing the machine |
 | `read_bytes_per_sec`, `write_bytes_per_sec` | B/s | Sum; only with `process-disk-io` |
 
 > **macOS quirk worth designing around:** every terminal session's
@@ -368,7 +369,9 @@ carries the validation.
 
 **Alert thresholds** — `alert-cpu` (30 single-core %), `alert-mem` (25% of
 total) with `alert-mem-bytes` (4GiB ceiling, whichever is lower),
-`alert-app-cpu` (200%), `alert-app-mem` (40%), `alert-disk` (90% per volume),
+`alert-app-cpu` (200%), `alert-app-mem` (40% of total) with
+`alert-app-mem-bytes` (8GiB ceiling, same lower-of-two shape),
+`alert-disk` (90% per volume),
 `alert-pressure` (`off`/`warning`/`critical`), `alert-cooldown` (600s),
 `alert-template` (the builtin per-app exemption list).
 

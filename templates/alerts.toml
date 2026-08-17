@@ -331,6 +331,7 @@ screen = 0.0
 qemu-system-aarch64 = 0.0
 prl_vm_app = 0.0
 vmware-vmx = 0.0
+"com.apple.Virtualization.VirtualMachine" = 0.0
 
 # --- Editors and browsers fan out across many helpers; a few cores
 # during an index rebuild or a heavy page is normal.
@@ -370,6 +371,9 @@ screen = 0.0
 qemu-system-aarch64 = 0.0
 prl_vm_app = 0.0
 vmware-vmx = 0.0
+# RAM handed to a guest is spent by definition; [mem] exempts this name
+# per process for the same reason
+"com.apple.Virtualization.VirtualMachine" = 0.0
 
 # --- A browser with many tabs routinely passes 40% of RAM
 "Google Chrome" = 60.0
@@ -378,7 +382,18 @@ vmware-vmx = 0.0
 Arc = 60.0
 firefox = 60.0
 Safari = 60.0
+# The same editors [app_cpu] already raises: an IDE plus its language
+# servers and their indexes is a several-GiB tree by design, and the
+# measurement is the physical FOOTPRINT — measured on a working 24 GiB
+# machine, zed's tree held 8.3 GiB of footprint against 1.3 GiB of
+# resident memory, i.e. it clears any absolute ceiling worth setting
 Xcode = 60.0
+idea = 60.0
+goland = 60.0
+clion = 60.0
+zed = 60.0
+Cursor = 60.0
+Code = 60.0
 # A booted device image plus its daemons runs to several GiB
 Simulator = 60.0
 "com.apple.CoreSimulator.CoreSimulatorService" = 60.0

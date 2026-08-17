@@ -207,6 +207,7 @@ impl MetricSink for AlertSink {
                 .unwrap_or_else(|e| e.into_inner())
                 .evaluate(Instant::now(), snapshot, &active)
         };
+        let mut pending = Vec::with_capacity(evaluation.events.len());
         for event in &evaluation.events {
             // Also log the alert, with the structured fields alongside
             // the text: `ZSTATS_LOG` output stays greppable by rule and
@@ -219,7 +220,23 @@ impl MetricSink for AlertSink {
                 "alert: {}",
                 event.summary()
             );
-            send_notification(&event.summary()).await;
+            pending.push(event.summary());
+        }
+        // Concurrently, not one after another: the engine has already
+        // recorded every one of these as notified, so a sink that runs
+        // out of its 5s budget partway through the list would drop the
+        // rest permanently — the episode state never re-offers them.
+        // Serially that needed only three alerts and a slow helper
+        // (NOTIFY_TIMEOUT is 2s each); concurrently the whole batch costs
+        // one timeout
+        let mut deliveries = Vec::with_capacity(pending.len());
+        for message in pending {
+            deliveries.push(tokio::spawn(
+                async move { send_notification(&message).await },
+            ));
+        }
+        for delivery in deliveries {
+            let _ = delivery.await;
         }
         if !evaluation.records.is_empty() {
             self.persist_records(&evaluation.records);

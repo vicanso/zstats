@@ -92,7 +92,12 @@ Config keys for -add (also accepted as key=value). Durations take 500ms /
   alert-app-cpu <pct|name=pct>  [alerts] whole-app CPU rule over a process
                               tree (default 200; catches the browser whose
                               helpers each stay under the per-process bar)
-  alert-app-mem <pct|name=pct>  [alerts] whole-app memory-share rule (40)
+  alert-app-mem <pct|name=pct>  [alerts] whole-app memory rule (default 40%
+                              of total, measured on the summed footprint).
+                              Same lower-of-two shape as alert-mem;
+                              0 disables the rule
+  alert-app-mem-bytes <size>  [alerts] absolute ceiling for that rule
+                              (default 8GiB; 0 removes it)
   alert-disk <pct|mount=pct>  [alerts] volume used-capacity crossing alert
                               (default 90; re-arms 5 pts below; 0 disables)
   alert-pressure <level>      [alerts] kernel memory-pressure alert, macOS:

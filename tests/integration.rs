@@ -371,6 +371,79 @@ impl MetricSink for FailingSink {
     }
 }
 
+/// Collector whose collect blocks until released, to stand in for the
+/// real stall this guards against: statfs on a network mount that went
+/// away, which the kernel can hold for a minute
+struct StallingCollector {
+    config: CollectorConfig,
+    started: Arc<std::sync::atomic::AtomicUsize>,
+    release: Arc<std::sync::Barrier>,
+}
+
+impl Collector for StallingCollector {
+    fn collect(&mut self) -> Result<SystemSnapshot, zstats::CollectError> {
+        // Only the first collect stalls; a later one must be able to
+        // finish, or the runtime could not shut down at all
+        if self
+            .started
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            == 0
+        {
+            self.release.wait();
+        }
+        LocalCollector::new(self.config.clone()).collect()
+    }
+
+    fn config(&self) -> &CollectorConfig {
+        &self.config
+    }
+}
+
+/// A collect that overruns `collect_timeout` cannot be cancelled — it
+/// keeps running on its blocking thread. The loop must therefore skip
+/// ticks while it is in flight instead of queueing one collect per tick
+/// behind the collector lock, which would all fire at once on release
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stalled_collect_is_not_queued_up_by_every_missed_tick() {
+    let started = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    // Two parties: the stalled collect and this test
+    let release = Arc::new(std::sync::Barrier::new(2));
+    let collector = StallingCollector {
+        config: CollectorConfig {
+            collect_processes: false,
+            collect_timeout: Duration::from_millis(100),
+            ..Default::default()
+        },
+        started: Arc::clone(&started),
+        release: Arc::clone(&release),
+    };
+    let mut scheduler = Scheduler::new(Box::new(collector), Vec::new(), Duration::from_millis(20));
+    scheduler.start().await.expect("start");
+
+    // Many ticks pass while the first collect is stuck
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        started.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "~20 ticks elapsed; none of them may start a second collect"
+    );
+
+    // Let it finish, then confirm the loop resumed. The released collect
+    // still has a real collection to do before the flag clears, so poll
+    // rather than guess how long that takes
+    let unblock = tokio::task::spawn_blocking(move || release.wait());
+    let _ = unblock.await;
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while started.load(std::sync::atomic::Ordering::SeqCst) < 2 {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the loop must resume once the stalled collect returns"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    scheduler.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn scheduler_delivers_snapshots_and_isolates_failing_sink() {
     let (sink, mut rx) = LocalChannelSink::channel();

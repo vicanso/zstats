@@ -2076,7 +2076,7 @@ mod tests {
     #[test]
     fn the_mem_template_raises_the_bar_for_names_that_are_large_by_design() {
         let file = AlertsConfig::default();
-        let merged = ActiveThresholds::from_config(&file);
+        let merged = merged_with_test_template(&file);
         let total = 24u64 << 30;
 
         // A language server measured against the machine again (30%),
@@ -3398,7 +3398,7 @@ mod tests {
 
     #[test]
     fn template_fills_names_the_user_did_not_configure() {
-        let merged = ActiveThresholds::from_config(&AlertsConfig::default());
+        let merged = merged_with_test_template(&AlertsConfig::default());
         // Template entries are active out of the box
         assert_eq!(merged.cpu.for_process("Google Chrome"), Some(100.0));
         assert_eq!(merged.cpu.for_process("SourceKitService"), Some(200.0));
@@ -3413,13 +3413,62 @@ mod tests {
         let mut file = AlertsConfig::default();
         file.cpu_overrides.insert("ghostty".into(), 60.0);
         file.cpu_overrides.insert("mds_stores".into(), 50.0);
-        let merged = ActiveThresholds::from_config(&file);
+        let merged = merged_with_test_template(&file);
 
         // User values win over same-name template entries (case-insensitive)
         assert_eq!(merged.cpu.for_process("Ghostty"), Some(60.0));
         assert_eq!(merged.cpu.for_process("mds_stores"), Some(50.0));
         // Untouched template entries stay active
         assert_eq!(merged.cpu.for_process("gopls"), Some(100.0));
+    }
+
+    /// A small template these tests own, instead of the one the build
+    /// happens to have compiled in.
+    ///
+    /// The merge tests below are about PRECEDENCE — user over template
+    /// over base, exact over pattern, 0 disabling a name — none of which
+    /// is a property of the shipped table. Reaching for
+    /// `Template::builtin()` tied them to macOS's data, so the moment
+    /// the table became per-platform they failed on Linux and Windows
+    /// while passing here. Shipped-DATA coverage lives in
+    /// `builtin_template_parses_and_every_key_is_usable`, which checks
+    /// each platform's file under its own `cfg`
+    fn test_template() -> Template {
+        Template::parse(
+            r#"
+version = 1
+
+[cpu]
+"Google Chrome" = 100.0
+"Google Chrome Helper (GPU)" = 100.0
+"Google Chrome Helper (Renderer)" = 100.0
+"Slack Helper (Renderer)" = 100.0
+"rust-analyzer*" = 100.0
+SourceKitService = 200.0
+gopls = 100.0
+ghostty = 0.0
+mds_stores = 0.0
+rustc = 0.0
+
+[mem]
+"rust-analyzer*" = 30.0
+rustc = 0.0
+"com.apple.Virtualization.VirtualMachine" = 0.0
+
+[app_cpu]
+login = 0.0
+"Google Chrome" = 400.0
+
+[app_mem]
+login = 0.0
+"Google Chrome" = 60.0
+"#,
+        )
+        .expect("the test template must parse")
+    }
+
+    fn merged_with_test_template(file: &AlertsConfig) -> ActiveThresholds {
+        ActiveThresholds::from_config_with_template(file, &test_template())
     }
 
     #[test]
@@ -3432,32 +3481,21 @@ mod tests {
         assert!(t.cpu.len() > 80, "cpu entries: {}", t.cpu.len());
         assert!(!t.app_cpu.is_empty() && !t.app_mem.is_empty());
 
-        // Spot-check one entry per tier, so a bad value cannot pass by
-        // merely parsing
-        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-        {
-            assert_eq!(t.cpu.get("rust-analyzer*"), Some(&100.0));
-            assert_eq!(t.cpu.get("rustc"), Some(&0.0));
-            assert_eq!(t.cpu.get("Xcode"), Some(&200.0));
-            assert_eq!(t.app_cpu.get("login"), Some(&0.0));
-            assert_eq!(t.app_mem.get("Google Chrome"), Some(&60.0));
-        }
-        #[cfg(target_os = "linux")]
-        {
-            assert_eq!(t.cpu.get("rust-analyzer*"), Some(&200.0));
-            assert_eq!(t.cpu.get("rustc"), Some(&0.0));
-            assert_eq!(t.cpu.get("gnome-shell"), Some(&100.0));
-            assert_eq!(t.app_cpu.get("bash"), Some(&0.0));
-            assert_eq!(t.app_mem.get("firefox"), Some(&60.0));
-        }
-        #[cfg(target_os = "windows")]
-        {
-            assert_eq!(t.cpu.get("rust-analyzer*"), Some(&200.0));
-            assert_eq!(t.cpu.get("rustc.exe"), Some(&0.0));
-            assert_eq!(t.cpu.get("chrome.exe"), Some(&100.0));
-            assert_eq!(t.app_cpu.get("powershell.exe"), Some(&0.0));
-            assert_eq!(t.app_mem.get("chrome.exe"), Some(&60.0));
-        }
+        // The one question only a native build can answer: did the
+        // right FILE get compiled in? Contents are checked for all
+        // three platforms, from any platform, by
+        // `every_platform_template_parses_from_any_platform`
+        let marker = if cfg!(target_os = "windows") {
+            "chrome.exe"
+        } else if cfg!(target_os = "linux") {
+            "gnome-shell"
+        } else {
+            "WindowServer"
+        };
+        assert!(
+            t.cpu.contains_key(marker),
+            "this build compiled in the wrong platform's template: no {marker:?}"
+        );
     }
 
     /// Every platform's table, parsed on whatever platform runs the
@@ -3479,6 +3517,78 @@ mod tests {
                 t.cpu.len() > 40 && !t.mem.is_empty(),
                 "{platform} template looks empty"
             );
+
+            // One entry per tier per platform, so a bad VALUE cannot
+            // pass by merely parsing, and so a name that stopped
+            // existing is noticed here rather than on a user's machine
+            let (interactive, indexer, own_build, session, browser_app) = match platform {
+                "macos" => ("Google Chrome", "Xcode", "rustc", "login", "Google Chrome"),
+                "linux" => ("gnome-shell", "clangd", "rustc", "bash", "firefox"),
+                _ => (
+                    "chrome.exe",
+                    "devenv.exe",
+                    "rustc.exe",
+                    "powershell.exe",
+                    "chrome.exe",
+                ),
+            };
+            assert_eq!(
+                t.cpu.get(interactive),
+                Some(&100.0),
+                "{platform} interactive tier"
+            );
+            assert_eq!(t.cpu.get(indexer), Some(&200.0), "{platform} indexer tier");
+            assert_eq!(
+                t.cpu.get(own_build),
+                Some(&0.0),
+                "{platform} own-build tier"
+            );
+            assert_eq!(
+                t.app_cpu.get(session),
+                Some(&0.0),
+                "{platform} session root"
+            );
+            assert_eq!(
+                t.app_mem.get(browser_app),
+                Some(&60.0),
+                "{platform} browser app bar"
+            );
+            // The pattern that exists because the name is not stable
+            assert!(
+                t.cpu.contains_key("rust-analyzer*"),
+                "{platform} lost the rust-analyzer pattern"
+            );
+            // Every value must sit on a defined tier. Keys are checked
+            // by `Matcher::parse` above; a mistyped VALUE (10 for 100,
+            // 60 in a table whose tiers are 0/30) parses perfectly and
+            // then quietly alerts on the wrong thing
+            let tiers: [(&str, Vec<f64>, Vec<f64>); 4] = [
+                (
+                    "cpu",
+                    t.cpu.values().map(|v| f64::from(*v)).collect(),
+                    vec![0.0, 100.0, 200.0],
+                ),
+                ("mem", t.mem.values().copied().collect(), vec![0.0, 30.0]),
+                (
+                    "app_cpu",
+                    t.app_cpu.values().map(|v| f64::from(*v)).collect(),
+                    vec![0.0, 400.0],
+                ),
+                (
+                    "app_mem",
+                    t.app_mem.values().copied().collect(),
+                    vec![0.0, 60.0],
+                ),
+            ];
+            for (table, values, allowed) in tiers {
+                for value in values {
+                    assert!(
+                        allowed.contains(&value),
+                        "{platform} [{table}] has {value}, which is not one of {allowed:?}"
+                    );
+                }
+            }
+
             let tables: [(&str, Vec<&String>); 4] = [
                 ("cpu", t.cpu.keys().collect()),
                 ("mem", t.mem.keys().collect()),
@@ -3640,7 +3750,7 @@ mod tests {
 
     #[test]
     fn template_pattern_covers_a_versioned_binary_and_its_siblings() {
-        let merged = ActiveThresholds::from_config(&AlertsConfig::default());
+        let merged = merged_with_test_template(&AlertsConfig::default());
         // Zed rewrites this name on every rust-analyzer update, so the
         // old exact `rust-analyzer` entry never matched and the indexer
         // alerted against the 30% base — seen in a real daemon log
@@ -3653,8 +3763,11 @@ mod tests {
             Some(100.0)
         );
         assert_eq!(merged.cpu.for_process("rust-analyzer"), Some(100.0));
-        // Still a prefix: an unrelated process is not swept up
-        assert_eq!(merged.cpu.for_process("rustc"), None);
+        // Still a PREFIX. `rustc` would pass this by being a 0 entry in
+        // its own right, so use a name the template says nothing about:
+        // reaching the base value is what proves it was not swept up
+        assert_eq!(merged.cpu.for_process("rustup"), Some(30.0));
+        assert_eq!(merged.cpu.for_process("rust-analyze"), Some(30.0));
     }
 
     #[test]
@@ -3666,7 +3779,7 @@ mod tests {
         // ...and the user's own exact name beats their own pattern
         file.cpu_overrides
             .insert("Google Chrome Helper (Renderer)".into(), 70.0);
-        let merged = ActiveThresholds::from_config(&file);
+        let merged = merged_with_test_template(&file);
 
         assert_eq!(
             merged.cpu.for_process("Google Chrome Helper (Renderer)"),
@@ -3701,7 +3814,7 @@ mod tests {
 
     #[test]
     fn app_template_silences_terminal_sessions_and_raises_browsers() {
-        let merged = ActiveThresholds::from_config(&AlertsConfig::default());
+        let merged = merged_with_test_template(&AlertsConfig::default());
         // Terminal sessions group under a `login` root on macOS: a build
         // there is your own work, and its members still have per-process
         // rules, so the whole-app rules stay out of it

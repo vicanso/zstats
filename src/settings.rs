@@ -850,15 +850,20 @@ detach = true
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("mkdir");
 
-        // No file at all is the normal install: the compiled-in table
+        // No file at all is the normal install: the compiled-in table.
+        // Probed by SIZE, not by a key — the builtin is per platform
+        // (`rustc` is `rustc.exe` on Windows), and what this test is
+        // about is which file was loaded, not what is in it
         let builtin = load_template(&dir).expect("load missing");
-        assert_eq!(builtin.cpu.get("rustc"), Some(&0.0));
+        let compiled_in = crate::alerts::Template::builtin();
+        assert!(!builtin.cpu.is_empty());
+        assert_eq!(builtin.cpu.len(), compiled_in.cpu.len());
 
         std::fs::write(template_path(&dir), "version = 1\n[cpu]\ngopls = 42.0")
             .expect("write template");
         let loaded = load_template(&dir).expect("load override");
         assert_eq!(loaded.cpu.get("gopls"), Some(&42.0));
-        assert!(!loaded.cpu.contains_key("rustc"), "replaces, not layers");
+        assert_eq!(loaded.cpu.len(), 1, "replaces, not layers");
 
         // A template that fails to parse is an ERROR, never a quiet
         // fallback — one that did not apply is indistinguishable from a

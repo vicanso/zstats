@@ -81,9 +81,67 @@ pub struct SystemSnapshot {
     #[serde(default)]
     pub io_totals: IoTotalsSnapshot,
 
+    /// What this build can measure at all, so a `None` above can be read
+    /// as "not on this platform" rather than "not right now"
+    #[serde(default)]
+    pub capabilities: Capabilities,
+
     /// Extension fields (reserved)
     #[serde(default)]
     pub extras: HashMap<String, serde_json::Value>,
+}
+
+/// Which platform-specific measurements this build can produce at all.
+///
+/// Every platform-specific metric here is an `Option` that reads `None`
+/// where it is unavailable — the designed degradation. What an `Option`
+/// alone cannot say is WHY it is empty: "this platform has no such
+/// concept", "the kernel refused for this process", or "not sampled
+/// yet". A frontend that wants to be honest has to distinguish them, and
+/// without this it either invents a reason or stays vague.
+///
+/// This answers the first case only, and it is a property of the BUILD,
+/// not of the machine: `cpu_perf_levels` is true on any macOS build,
+/// including an Intel Mac whose `perf_levels` is legitimately empty
+/// because the CPU is homogeneous. Per-value reasons (EPERM on another
+/// user's process) would need an `Unavailable { reason }` on the value
+/// itself; this is the cheap half, and it travels with the snapshot so a
+/// frontend attached to a daemon reads the DAEMON's capabilities rather
+/// than guessing from its own build
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Capabilities {
+    /// `ProcessSnapshot::phys_footprint_bytes` and the group sum can
+    /// carry a real footprint (macOS, Windows, Linux). When false the
+    /// memory rules silently measure resident size instead
+    pub memory_footprint: bool,
+    /// `MemorySnapshot::pressure_level` / `compressed_bytes` exist, i.e.
+    /// the pressure alert rule can fire (macOS only today; Linux PSI
+    /// would need a deliberate remapping, being a stall percentage over
+    /// 10/60/300s windows rather than a 1/2/4 level)
+    pub memory_pressure: bool,
+    /// `CpuSnapshot::perf_levels` can be reported (macOS only)
+    pub cpu_perf_levels: bool,
+}
+
+impl Capabilities {
+    /// What the build running this code can do
+    pub const fn current() -> Self {
+        Self {
+            memory_footprint: cfg!(any(
+                target_os = "macos",
+                target_os = "windows",
+                target_os = "linux"
+            )),
+            memory_pressure: cfg!(target_os = "macos"),
+            cpu_perf_levels: cfg!(target_os = "macos"),
+        }
+    }
+}
+
+impl Default for Capabilities {
+    fn default() -> Self {
+        Self::current()
+    }
 }
 
 /// Summed disk/network throughput for the whole machine.

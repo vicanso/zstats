@@ -120,7 +120,7 @@ expensive subsystems are opt-out and throttled (`CollectorConfig`):
 
 | Knob | Default | Effect |
 |------|---------|--------|
-| `collect_disks` / `collect_networks` / `collect_processes` / `collect_temperatures` | `true` | Disable a subsystem entirely (its snapshot field becomes `None`) |
+| `collect_disks` / `collect_networks` / `collect_processes` / `collect_temperatures` | `true` | Disable a subsystem entirely (its snapshot field becomes `None`). `collect_temperatures` defaults to `false` on Windows, where the reading goes through WMI and initialises COM process-wide |
 | `temperature_refresh_interval` | 15s | Hardware temps change slowly; readings are reused between refreshes |
 | `disk_storage_refresh_interval` | 60s | Disk capacity (statfs, the most expensive call) refreshes on its own slow cadence; IO counters still refresh every collect, and a newly mounted volume is read as soon as it appears |
 | `dedupe_disks` | `true` | Keep one entry per device name (shortest mount); collapses APFS synthetic mounts |

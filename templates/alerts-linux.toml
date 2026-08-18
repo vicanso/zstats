@@ -1,0 +1,340 @@
+# zstats builtin alert template — Linux
+#
+# Raised (or zeroed) alert bars for processes that legitimately sustain
+# high CPU or a large share of RAM. This is a refinement of the base
+# rules, not a source of alerts in its own right — unlike an ignore
+# list, a real runaway still alerts, and an override silences the
+# NOTIFICATION while the data point is still recorded to
+# <config-dir>/data/.
+#
+# This exact file is compiled into Linux builds. Drop an edited copy at
+# <config-dir>/template.toml to REPLACE it wholesale — the daemon picks
+# the change up within about a minute, no restart. To ADD one entry you
+# do not need this file at all; that is what user overrides are for:
+#
+#     zstats -add alert-cpu 'rust-analyzer*=200'
+#
+# Precedence, highest first: user override > this template > base value.
+# Set `template = false` in the config's [alerts] section to skip the
+# template entirely. A layer is also skipped when its base rule is
+# disabled (`alert-cpu 0` must mean "no CPU alerts", not "the templated
+# apps keep firing").
+#
+# KEYS may lead and/or end with `*` to claim a family of names. A `*`
+# anywhere else is an error. When several keys match one process: exact
+# beats pattern, and a longer pattern beats a shorter one.
+#
+# LINUX NAMES ARE TRUNCATED. A process name here is `comm` from
+# /proc/[pid]/stat, which the kernel caps at 15 bytes — `systemd-journald`
+# is reported as `systemd-journal` and `tracker-miner-fs-3` as
+# `tracker-miner-f`. Keys longer than 15 characters therefore match
+# NOTHING, which is exactly the failure this template exists to avoid.
+# Every key below is either within the cap or a pattern that survives it.
+#
+# Only processes that can outlive the 50s alert window are worth
+# listing — a burst that exits sooner never notifies anyway.
+
+# Bump only on an incompatible format change; an unknown version is
+# rejected rather than half-read
+version = 1
+
+# Per-process CPU, in single-core percent (200 = two full cores).
+#
+#   100  interrupt me only at a full core   (interactive apps)
+#   200  multi-core is its job              (IDE indexers, VM hosts)
+#     0  never interrupt, still record      (work you started yourself,
+#                                            periodic system maintenance)
+#
+# The dividing line for 0 is WHO ASKED, not how much CPU it uses: you
+# typed the build command, so "your compiler is compiling" tells you
+# nothing you did not know, while a background indexer pegged for
+# minutes is a real (and common) failure that keeps a raised bar
+# instead.
+[cpu]
+
+# --- Browsers: page loads / video / heavy-JS sites run for minutes.
+# Firefox names its content processes "Isolated Web Content", which the
+# kernel hands back as exactly 15 characters
+firefox = 100.0
+firefox-bin = 100.0
+"Isolated Web Co" = 100.0
+"Web Content" = 100.0
+WebExtensions = 100.0
+"RDD Process" = 100.0
+"GPU Process" = 100.0
+chrome = 100.0
+chromium = 100.0
+brave = 100.0
+"Privileged Cont" = 100.0
+epiphany = 100.0
+WebKitWebProces = 100.0
+
+# --- Electron and other desktop apps that render for a living
+code = 100.0
+electron = 100.0
+slack = 100.0
+discord = 100.0
+spotify = 100.0
+obs = 100.0
+zoom = 100.0
+telegram-deskto = 100.0
+
+# --- Desktop shells and compositors: an animation or a full redraw is
+# a core for as long as it lasts, and there is nothing to kill anyway
+Xorg = 100.0
+Xwayland = 100.0
+gnome-shell = 100.0
+mutter = 100.0
+kwin_x11 = 100.0
+kwin_wayland = 100.0
+plasmashell = 100.0
+xfwm4 = 100.0
+compton = 100.0
+picom = 100.0
+
+# --- Language servers and IDE indexers: multi-core is the job.
+# Version-stamped names are the norm here, hence the patterns
+"rust-analyzer*" = 200.0
+clangd = 200.0
+gopls = 200.0
+pylsp = 200.0
+pyright = 200.0
+"pyright-*" = 200.0
+"typescript-lang*" = 200.0
+"lua-language-s*" = 200.0
+jdtls = 200.0
+"metals*" = 200.0
+"zls" = 200.0
+
+# --- VM and container hosts: the guest's workload is supposed to use
+# cores, and it is not the host process that is misbehaving
+"qemu-system-*" = 200.0
+libvirtd = 200.0
+virtiofsd = 200.0
+VBoxHeadless = 200.0
+"VirtualBox*" = 200.0
+vmware-vmx = 200.0
+crosvm = 200.0
+
+# --- Work you started yourself: compilers, linkers, build drivers.
+# "Your build is building" is not actionable. Interpreted toolchains
+# are deliberately absent — tsc, gradle and webpack all run under
+# `node`/`java`/`python3`, names that also cover half the real runaways
+rustc = 0.0
+cargo = 0.0
+"cargo-*" = 0.0
+cc1 = 0.0
+cc1plus = 0.0
+"clang*" = 0.0
+gcc = 0.0
+"g++" = 0.0
+ld = 0.0
+"ld.*" = 0.0
+lld = 0.0
+mold = 0.0
+gold = 0.0
+as = 0.0
+make = 0.0
+gmake = 0.0
+ninja = 0.0
+cmake = 0.0
+meson = 0.0
+bazel = 0.0
+go = 0.0
+git = 0.0
+ffmpeg = 0.0
+x264 = 0.0
+x265 = 0.0
+HandBrakeCLI = 0.0
+tar = 0.0
+gzip = 0.0
+zstd = 0.0
+xz = 0.0
+"7z*" = 0.0
+rsync = 0.0
+borg = 0.0
+restic = 0.0
+
+# --- Periodic system maintenance: scheduled by the distribution, not
+# by you, and equally not something to interrupt for
+systemd-journal = 0.0
+systemd-udevd = 0.0
+systemd-oomd = 0.0
+"tracker-miner*" = 0.0
+tracker-extract = 0.0
+"baloo_file*" = 0.0
+"updatedb*" = 0.0
+"mlocate*" = 0.0
+plocate = 0.0
+packagekitd = 0.0
+unattended-upgr = 0.0
+apt = 0.0
+"apt-*" = 0.0
+dpkg = 0.0
+dnf = 0.0
+rpm = 0.0
+pacman = 0.0
+snapd = 0.0
+"fwupd*" = 0.0
+man-db = 0.0
+mandb = 0.0
+logrotate = 0.0
+
+# --- Kernel threads: real work on behalf of everything else, and never
+# a process a user can act on. kswapd in particular pegs a core exactly
+# when the machine is short of memory — which the pressure rule reports
+# far better than a CPU alert could
+"kworker*" = 0.0
+"ksoftirqd*" = 0.0
+"kswapd*" = 0.0
+khugepaged = 0.0
+"migration*" = 0.0
+"rcu_*" = 0.0
+"jbd2*" = 0.0
+"kcompactd*" = 0.0
+"z_wr_iss*" = 0.0
+"txg_sync*" = 0.0
+"btrfs-*" = 0.0
+
+# Per-process memory, in percent of total RAM, measured on the physical
+# footprint (RssAnon + VmSwap here). Same two tiers as CPU:
+#
+#    30  judge it by share of the machine, no absolute ceiling
+#     0  never alert on this one, still record
+#
+# The base rule is the LOWER of a percentage and an absolute ceiling
+# (25% / 4 GiB by default), which is right for a random process and
+# wrong for the handful of programs whose job is to hold memory. An
+# entry here REPLACES both halves.
+[mem]
+
+# --- Browsers hold gigabytes by design; the share of the machine is
+# the only question worth asking about them
+firefox = 30.0
+firefox-bin = 30.0
+"Isolated Web Co" = 30.0
+"Web Content" = 30.0
+chrome = 30.0
+chromium = 30.0
+brave = 30.0
+WebKitWebProces = 30.0
+
+# --- Editors, language servers and indexers: an index of a large repo
+# is measured in gigabytes and stays resident all day
+code = 30.0
+"rust-analyzer*" = 30.0
+clangd = 30.0
+gopls = 30.0
+jdtls = 30.0
+"metals*" = 30.0
+electron = 30.0
+slack = 30.0
+discord = 30.0
+
+# --- Databases and caches: resident by design, sized by their own
+# configuration, and shrinking them is a config change rather than an
+# incident
+mysqld = 30.0
+mariadbd = 30.0
+postgres = 30.0
+mongod = 30.0
+redis-server = 30.0
+memcached = 30.0
+clickhouse-serv = 30.0
+influxd = 30.0
+prometheus = 30.0
+
+# --- VM and container hosts: RAM handed to a guest is spent by
+# definition, and the number is the guest's allocation, not a leak
+"qemu-system-*" = 0.0
+libvirtd = 0.0
+VBoxHeadless = 0.0
+"VirtualBox*" = 0.0
+vmware-vmx = 0.0
+crosvm = 0.0
+
+# --- Your own toolchain: a big compile is big on purpose
+rustc = 0.0
+cargo = 0.0
+cc1plus = 0.0
+"clang*" = 0.0
+lld = 0.0
+mold = 0.0
+gold = 0.0
+ld = 0.0
+"ld.*" = 0.0
+go = 0.0
+
+# Whole-application CPU, keyed on the tree root name, in single-core
+# percent. Groups sum a whole process tree, so the numbers are larger
+# and the useful tiers are different:
+#
+#   400  a browser or IDE fanned out across helpers
+#     0  a session or host whose children are your own work
+[app_cpu]
+
+# --- Your own terminal sessions. A build under a shell shows up as
+# hundreds of percent under the session leader's name, which says
+# nothing; a genuine runaway among the members is still caught by the
+# per-process rules
+bash = 0.0
+zsh = 0.0
+fish = 0.0
+sshd = 0.0
+"sshd-*" = 0.0
+tmux = 0.0
+"tmux: server" = 0.0
+screen = 0.0
+login = 0.0
+"systemd" = 0.0
+
+# --- VM / container hosts: guest workload is supposed to use cores
+"qemu-system-*" = 0.0
+libvirtd = 0.0
+dockerd = 0.0
+containerd = 0.0
+"containerd-shi*" = 0.0
+crosvm = 0.0
+
+# --- Editors and browsers fan out across many helpers; a few cores
+# during an index rebuild or a heavy page is normal
+firefox = 400.0
+firefox-bin = 400.0
+chrome = 400.0
+chromium = 400.0
+brave = 400.0
+code = 400.0
+electron = 400.0
+
+# Whole-application memory, keyed on the tree root name, as a percent of
+# total RAM. Browsers and IDEs legitimately hold a large share of a
+# machine's RAM; the system memory-pressure rule is what catches
+# "actually too much", so these only need to not cry wolf.
+[app_mem]
+
+# --- Your own terminal work — the pressure rule covers real trouble
+bash = 0.0
+zsh = 0.0
+fish = 0.0
+sshd = 0.0
+tmux = 0.0
+screen = 0.0
+login = 0.0
+"systemd" = 0.0
+
+# --- VM / container hosts: RAM handed to a guest is spent by definition
+"qemu-system-*" = 0.0
+libvirtd = 0.0
+dockerd = 0.0
+containerd = 0.0
+crosvm = 0.0
+
+# --- A browser with many tabs routinely passes 40% of RAM, and an IDE
+# plus its language servers is a several-GiB tree by design
+firefox = 60.0
+firefox-bin = 60.0
+chrome = 60.0
+chromium = 60.0
+brave = 60.0
+code = 60.0
+electron = 60.0

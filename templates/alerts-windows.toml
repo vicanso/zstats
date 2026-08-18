@@ -1,0 +1,382 @@
+# zstats builtin alert template — Windows
+#
+# Raised (or zeroed) alert bars for processes that legitimately sustain
+# high CPU or a large share of RAM. This is a refinement of the base
+# rules, not a source of alerts in its own right — unlike an ignore
+# list, a real runaway still alerts, and an override silences the
+# NOTIFICATION while the data point is still recorded to
+# <config-dir>/data/.
+#
+# This exact file is compiled into Windows builds. Drop an edited copy at
+# <config-dir>/template.toml to REPLACE it wholesale — the daemon picks
+# the change up within about a minute, no restart. To ADD one entry you
+# do not need this file at all; that is what user overrides are for:
+#
+#     zstats -add alert-cpu "rust-analyzer.exe=200"
+#
+# Precedence, highest first: user override > this template > base value.
+# Set `template = false` in the config's [alerts] section to skip the
+# template entirely. A layer is also skipped when its base rule is
+# disabled (`alert-cpu 0` must mean "no CPU alerts", not "the templated
+# apps keep firing").
+#
+# KEYS may lead and/or end with `*` to claim a family of names —
+# "ServiceHub.*", "*.exe". A `*` anywhere else is an error. When several
+# keys match one process: exact beats pattern, and a longer pattern
+# beats a shorter one. Matching is case-insensitive, so the casing here
+# is only for readability.
+#
+# WINDOWS NAMES ARE IMAGE NAMES, `.exe` included — `chrome.exe`, not
+# `Google Chrome`. A few kernel-side entries (`System`, `Registry`,
+# `Memory Compression`) legitimately have no extension.
+#
+# Only processes that can outlive the 50s alert window are worth
+# listing — a burst that exits sooner never notifies anyway.
+
+# Bump only on an incompatible format change; an unknown version is
+# rejected rather than half-read
+version = 1
+
+# Per-process CPU, in single-core percent (200 = two full cores).
+#
+#   100  interrupt me only at a full core   (interactive apps)
+#   200  multi-core is its job              (IDE indexers, VM hosts)
+#     0  never interrupt, still record      (work you started yourself,
+#                                            periodic system maintenance)
+#
+# The dividing line for 0 is WHO ASKED, not how much CPU it uses: you
+# typed the build command, so "your compiler is compiling" tells you
+# nothing you did not know, while a background indexer pegged for
+# minutes is a real (and common) failure that keeps a raised bar
+# instead.
+[cpu]
+
+# --- Browsers: page loads / video / heavy-JS sites run for minutes.
+# Chromium reports every helper under the same image name, so one entry
+# covers renderers and the GPU process too
+"chrome.exe" = 100.0
+"msedge.exe" = 100.0
+"msedgewebview2.exe" = 100.0
+"firefox.exe" = 100.0
+"brave.exe" = 100.0
+"opera.exe" = 100.0
+"vivaldi.exe" = 100.0
+
+# --- Electron and other desktop apps that render for a living
+"Code.exe" = 100.0
+"Cursor.exe" = 100.0
+"Discord.exe" = 100.0
+"Slack.exe" = 100.0
+"ms-teams.exe" = 100.0
+"Teams.exe" = 100.0
+"Notion.exe" = 100.0
+"Spotify.exe" = 100.0
+"WhatsApp.exe" = 100.0
+"Obsidian.exe" = 100.0
+"obs64.exe" = 100.0
+"Zoom.exe" = 100.0
+
+# --- The shell and the compositor: an animation or a full redraw is a
+# core for as long as it lasts, and there is nothing to kill anyway
+"dwm.exe" = 100.0
+"explorer.exe" = 100.0
+"ShellExperienceHost.exe" = 100.0
+"StartMenuExperienceHost.exe" = 100.0
+"SearchHost.exe" = 100.0
+"TextInputHost.exe" = 100.0
+"ctfmon.exe" = 100.0
+
+# --- IDEs and language servers: multi-core is the job
+"devenv.exe" = 200.0
+"ServiceHub.*" = 200.0
+"VBCSCompiler.exe" = 200.0
+"OmniSharp.exe" = 200.0
+"Roslyn*" = 200.0
+"idea64.exe" = 200.0
+"pycharm64.exe" = 200.0
+"goland64.exe" = 200.0
+"clion64.exe" = 200.0
+"rider64.exe" = 200.0
+"webstorm64.exe" = 200.0
+"studio64.exe" = 200.0
+"rust-analyzer*" = 200.0
+"clangd.exe" = 200.0
+"gopls.exe" = 200.0
+"jetbrains*" = 200.0
+
+# --- VM and container hosts: the guest's workload is supposed to use
+# cores, and it is not the host process that is misbehaving.
+# `vmmem` / `vmmemWSL` are the kernel's accounting stubs for a running
+# WSL2 or Hyper-V guest — they carry the guest's whole usage
+"vmmem" = 200.0
+"vmmemWSL" = 200.0
+"vmwp.exe" = 200.0
+"vmcompute.exe" = 200.0
+"VBoxHeadless.exe" = 200.0
+"VirtualBoxVM.exe" = 200.0
+"vmware-vmx.exe" = 200.0
+"qemu-system-*" = 200.0
+"docker.exe" = 200.0
+"com.docker.backend.exe" = 200.0
+"wslservice.exe" = 200.0
+
+# --- Work you started yourself: compilers, linkers, build drivers.
+# "Your build is building" is not actionable. Interpreted toolchains
+# are deliberately absent — tsc, gradle and webpack all run under
+# `node.exe`/`java.exe`/`python.exe`, names that also cover half the
+# real runaways
+"rustc.exe" = 0.0
+"cargo.exe" = 0.0
+"cargo-*" = 0.0
+"cl.exe" = 0.0
+"link.exe" = 0.0
+"lld-link.exe" = 0.0
+"clang*" = 0.0
+"gcc.exe" = 0.0
+"g++.exe" = 0.0
+"ld.exe" = 0.0
+"MSBuild.exe" = 0.0
+"dotnet.exe" = 0.0
+"csc.exe" = 0.0
+"cmake.exe" = 0.0
+"ninja.exe" = 0.0
+"make.exe" = 0.0
+"mingw32-make.exe" = 0.0
+"go.exe" = 0.0
+"git.exe" = 0.0
+"ffmpeg.exe" = 0.0
+"HandBrakeCLI.exe" = 0.0
+"7z.exe" = 0.0
+"7zG.exe" = 0.0
+"WinRAR.exe" = 0.0
+"robocopy.exe" = 0.0
+
+# --- Periodic system maintenance: scheduled by Windows, not by you,
+# and equally not something to interrupt for. Defender and Windows
+# Search are this platform's Spotlight — famous CPU consumers that a
+# user can neither kill nor usefully act on
+"MsMpEng.exe" = 0.0
+"NisSrv.exe" = 0.0
+"MpDefenderCoreService.exe" = 0.0
+"MpCmdRun.exe" = 0.0
+"SearchIndexer.exe" = 0.0
+"SearchProtocolHost.exe" = 0.0
+"SearchFilterHost.exe" = 0.0
+"TiWorker.exe" = 0.0
+"TrustedInstaller.exe" = 0.0
+"MoUsoCoreWorker.exe" = 0.0
+"UsoClient.exe" = 0.0
+"wuauclt.exe" = 0.0
+"CompatTelRunner.exe" = 0.0
+"DeviceCensus.exe" = 0.0
+"sppsvc.exe" = 0.0
+"SgrmBroker.exe" = 0.0
+"WmiPrvSE.exe" = 0.0
+"msiexec.exe" = 0.0
+"defrag.exe" = 0.0
+"dfrgui.exe" = 0.0
+"OneDrive.exe" = 0.0
+"Dropbox.exe" = 0.0
+"backgroundTaskHost.exe" = 0.0
+
+# --- Kernel-side accounting entries: real work on behalf of everything
+# else, and never a process a user can act on
+"System" = 0.0
+"Registry" = 0.0
+"Memory Compression" = 0.0
+"Idle" = 0.0
+"csrss.exe" = 0.0
+"smss.exe" = 0.0
+"wininit.exe" = 0.0
+"services.exe" = 0.0
+"lsass.exe" = 0.0
+"audiodg.exe" = 0.0
+"WUDFHost.exe" = 0.0
+
+# Per-process memory, in percent of total RAM, measured on the physical
+# footprint (the private commit charge here). Same two tiers as CPU:
+#
+#    30  judge it by share of the machine, no absolute ceiling
+#     0  never alert on this one, still record
+#
+# The base rule is the LOWER of a percentage and an absolute ceiling
+# (25% / 4 GiB by default), which is right for a random process and
+# wrong for the handful of programs whose job is to hold memory. An
+# entry here REPLACES both halves.
+[mem]
+
+# --- Browsers hold gigabytes by design; the share of the machine is
+# the only question worth asking about them
+"chrome.exe" = 30.0
+"msedge.exe" = 30.0
+"msedgewebview2.exe" = 30.0
+"firefox.exe" = 30.0
+"brave.exe" = 30.0
+"opera.exe" = 30.0
+"vivaldi.exe" = 30.0
+
+# --- Editors, language servers and indexers: an index of a large repo
+# is measured in gigabytes and stays resident all day
+"devenv.exe" = 30.0
+"ServiceHub.*" = 30.0
+"Roslyn*" = 30.0
+"idea64.exe" = 30.0
+"pycharm64.exe" = 30.0
+"goland64.exe" = 30.0
+"clion64.exe" = 30.0
+"rider64.exe" = 30.0
+"webstorm64.exe" = 30.0
+"studio64.exe" = 30.0
+"Code.exe" = 30.0
+"Cursor.exe" = 30.0
+"rust-analyzer*" = 30.0
+"clangd.exe" = 30.0
+"gopls.exe" = 30.0
+"Discord.exe" = 30.0
+"Slack.exe" = 30.0
+"ms-teams.exe" = 30.0
+
+# --- Databases and caches: resident by design, sized by their own
+# configuration, and shrinking them is a config change rather than an
+# incident
+"sqlservr.exe" = 30.0
+"mysqld.exe" = 30.0
+"postgres.exe" = 30.0
+"mongod.exe" = 30.0
+"redis-server.exe" = 30.0
+"memcached.exe" = 30.0
+
+# --- VM and container hosts: RAM handed to a guest is spent by
+# definition, and the number is the guest's allocation, not a leak.
+# `vmmem`/`vmmemWSL` matter most here — a WSL2 guest shows up as a
+# single enormous process that no per-process bar should ever flag
+"vmmem" = 0.0
+"vmmemWSL" = 0.0
+"vmwp.exe" = 0.0
+"vmcompute.exe" = 0.0
+"VBoxHeadless.exe" = 0.0
+"VirtualBoxVM.exe" = 0.0
+"vmware-vmx.exe" = 0.0
+"qemu-system-*" = 0.0
+"docker.exe" = 0.0
+"com.docker.backend.exe" = 0.0
+"wslservice.exe" = 0.0
+
+# --- Your own toolchain: a big compile is big on purpose
+"rustc.exe" = 0.0
+"cargo.exe" = 0.0
+"cl.exe" = 0.0
+"link.exe" = 0.0
+"lld-link.exe" = 0.0
+"clang*" = 0.0
+"MSBuild.exe" = 0.0
+"dotnet.exe" = 0.0
+"go.exe" = 0.0
+
+# --- Kernel-side accounting: the compression store is not a process
+# that leaked, it is the machine coping
+"Memory Compression" = 0.0
+"System" = 0.0
+
+# Whole-application CPU, keyed on the tree root name, in single-core
+# percent. Groups sum a whole process tree, so the numbers are larger
+# and the useful tiers are different:
+#
+#   400  a browser or IDE fanned out across helpers
+#     0  a session or host whose children are your own work
+#
+# Windows has no init/launchd to reparent orphans, so a tree root is
+# whichever ancestor is still alive and plausible — see
+# `is_plausible_parent` in the collector, which rejects a recycled ppid
+# by start time.
+[app_cpu]
+
+# --- Your own shell sessions: a build under a terminal shows up as
+# hundreds of percent under the shell's name, which says nothing; a
+# genuine runaway among the members is still caught per-process
+"cmd.exe" = 0.0
+"powershell.exe" = 0.0
+"pwsh.exe" = 0.0
+"WindowsTerminal.exe" = 0.0
+"OpenConsole.exe" = 0.0
+"conhost.exe" = 0.0
+"bash.exe" = 0.0
+"wsl.exe" = 0.0
+"sshd.exe" = 0.0
+
+# --- VM / container hosts: guest workload is supposed to use cores
+"vmmem" = 0.0
+"vmmemWSL" = 0.0
+"vmwp.exe" = 0.0
+"vmcompute.exe" = 0.0
+"VBoxHeadless.exe" = 0.0
+"VirtualBoxVM.exe" = 0.0
+"vmware-vmx.exe" = 0.0
+"qemu-system-*" = 0.0
+"com.docker.backend.exe" = 0.0
+"wslservice.exe" = 0.0
+
+# --- Services and the shell host every background task hangs off:
+# a group rooted here is an accounting artefact, not an application
+"services.exe" = 0.0
+"svchost.exe" = 0.0
+"explorer.exe" = 0.0
+
+# --- Editors and browsers fan out across many helpers; a few cores
+# during an index rebuild or a heavy page is normal
+"chrome.exe" = 400.0
+"msedge.exe" = 400.0
+"firefox.exe" = 400.0
+"brave.exe" = 400.0
+"Code.exe" = 400.0
+"Cursor.exe" = 400.0
+"devenv.exe" = 400.0
+"idea64.exe" = 400.0
+"rider64.exe" = 400.0
+
+# Whole-application memory, keyed on the tree root name, as a percent of
+# total RAM. Browsers and IDEs legitimately hold a large share of a
+# machine's RAM; the system memory-pressure rule is what catches
+# "actually too much" — and that rule does not exist on Windows, so
+# these bars are the only thing standing between a normal working
+# machine and a daily false alarm.
+[app_mem]
+
+# --- Your own shell work
+"cmd.exe" = 0.0
+"powershell.exe" = 0.0
+"pwsh.exe" = 0.0
+"WindowsTerminal.exe" = 0.0
+"conhost.exe" = 0.0
+"bash.exe" = 0.0
+"wsl.exe" = 0.0
+"sshd.exe" = 0.0
+
+# --- VM / container hosts: RAM handed to a guest is spent by definition
+"vmmem" = 0.0
+"vmmemWSL" = 0.0
+"vmwp.exe" = 0.0
+"vmcompute.exe" = 0.0
+"VBoxHeadless.exe" = 0.0
+"VirtualBoxVM.exe" = 0.0
+"vmware-vmx.exe" = 0.0
+"qemu-system-*" = 0.0
+"com.docker.backend.exe" = 0.0
+"wslservice.exe" = 0.0
+
+# --- Service and shell hosts: an accounting artefact, not an app
+"services.exe" = 0.0
+"svchost.exe" = 0.0
+"explorer.exe" = 0.0
+
+# --- A browser with many tabs routinely passes 40% of RAM, and an IDE
+# plus its language servers is a several-GiB tree by design
+"chrome.exe" = 60.0
+"msedge.exe" = 60.0
+"firefox.exe" = 60.0
+"brave.exe" = 60.0
+"Code.exe" = 60.0
+"Cursor.exe" = 60.0
+"devenv.exe" = 60.0
+"idea64.exe" = 60.0
+"rider64.exe" = 60.0

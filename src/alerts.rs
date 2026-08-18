@@ -71,7 +71,7 @@ use serde::{Deserialize, Serialize};
 use crate::records::MetricRecord;
 use crate::rolling::ProcessWindows;
 use crate::settings::AlertsConfig;
-use crate::snapshot::SystemSnapshot;
+use crate::snapshot::{Capabilities, SystemSnapshot};
 
 /// Fast window: the acute (runaway) rule and metrics recording
 const WINDOW: Duration = Duration::from_secs(60);
@@ -224,15 +224,33 @@ const DEFAULT_COOLDOWN: Duration = Duration::from_secs(600);
 /// "still full" nagging, no cooldown involved
 const DISK_REARM_MARGIN: f64 = 0.05;
 
-/// Builtin CPU-override template: resident apps that legitimately sustain
-/// The builtin template, compiled in from `templates/alerts.toml`.
+/// The builtin template, compiled in from `templates/`.
 ///
 /// It is a FILE rather than a table in this source for two reasons. It
-/// is data, not logic — 144 entries that change as apps and toolchains
-/// come and go, and every change used to be a code edit plus a hand-kept
-/// duplicate in `config.example.toml`. And it is the same format, read
-/// by the same parser, as the optional `<config-dir>/template.toml`
-/// override, so updating the table never requires a new binary.
+/// is data, not logic — a few hundred entries that change as apps and
+/// toolchains come and go, and every change used to be a code edit plus
+/// a hand-kept duplicate in `config.example.toml`. And it is the same
+/// format, read by the same parser, as the optional
+/// `<config-dir>/template.toml` override, so updating the table never
+/// requires a new binary.
+///
+/// One file PER PLATFORM, selected at compile time. Process names are
+/// not portable in the slightest — macOS's `Google Chrome Helper
+/// (Renderer)` is `chrome.exe` on Windows and `Isolated Web Co` (the
+/// kernel truncates `comm` to 15 bytes) on Linux — so a single table
+/// would leave two of the three platforms matching nothing at all,
+/// every process falling through to the base bar, and the machine
+/// alerting constantly. That destroys the one property the template
+/// exists for. Separate files rather than sections inside one keep
+/// `Template::parse`'s `deny_unknown_fields` strict, and
+/// `<config-dir>/template.toml` still replaces whichever was selected.
+#[cfg(target_os = "windows")]
+const BUILTIN_TEMPLATE: &str = include_str!("../templates/alerts-windows.toml");
+#[cfg(target_os = "linux")]
+const BUILTIN_TEMPLATE: &str = include_str!("../templates/alerts-linux.toml");
+/// macOS, and the fallback for any other unix — the Apple daemon names
+/// simply match nothing there, which is the pre-existing behaviour
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
 const BUILTIN_TEMPLATE: &str = include_str!("../templates/alerts.toml");
 
 /// Format version of `templates/alerts.toml`. A file claiming anything
@@ -1080,13 +1098,39 @@ impl ActiveThresholds {
         }
     }
 
+    /// Whether any rule is both configured AND able to fire on this
+    /// platform — what a caller should ask before wiring up alerting at
+    /// all. A rule this build cannot evaluate does not count as enabled:
+    /// answering "alerting is live" for a settings screen whose only
+    /// active rule can never fire is worse than answering nothing
     pub fn any_enabled(&self) -> bool {
         self.cpu.any_enabled()
             || self.memory.any_enabled()
             || self.disk.any_enabled()
             || self.app_cpu.any_enabled()
             || self.app_memory.any_enabled()
-            || self.pressure.is_some()
+            || (self.pressure.is_some() && Self::supports(AlertKind::Pressure))
+    }
+
+    /// Whether this build can evaluate `kind` at all, independent of
+    /// whether the user configured it.
+    ///
+    /// A settings UI needs both answers: "off" is a choice the user can
+    /// reverse, "not available here" is not, and rendering the second as
+    /// the first offers a control that silently does nothing. Only the
+    /// pressure rule is platform-limited today — it reads the kernel's
+    /// own verdict (`MemorySnapshot::pressure_level`), which does not
+    /// exist off macOS, so the rule is skipped entirely rather than
+    /// firing on a substitute
+    pub fn supports(kind: AlertKind) -> bool {
+        match kind {
+            AlertKind::Pressure => Capabilities::current().memory_pressure,
+            AlertKind::Cpu
+            | AlertKind::Memory
+            | AlertKind::AppCpu
+            | AlertKind::AppMemory
+            | AlertKind::Disk => true,
+        }
     }
 }
 
@@ -1737,6 +1781,7 @@ mod tests {
             },
             temperatures: None,
             io_totals: Default::default(),
+            capabilities: Default::default(),
             extras: Default::default(),
         }
     }
@@ -3389,11 +3434,123 @@ mod tests {
 
         // Spot-check one entry per tier, so a bad value cannot pass by
         // merely parsing
-        assert_eq!(t.cpu.get("rust-analyzer*"), Some(&100.0));
-        assert_eq!(t.cpu.get("rustc"), Some(&0.0));
-        assert_eq!(t.cpu.get("Xcode"), Some(&200.0));
-        assert_eq!(t.app_cpu.get("login"), Some(&0.0));
-        assert_eq!(t.app_mem.get("Google Chrome"), Some(&60.0));
+        #[cfg(not(any(target_os = "windows", target_os = "linux")))]
+        {
+            assert_eq!(t.cpu.get("rust-analyzer*"), Some(&100.0));
+            assert_eq!(t.cpu.get("rustc"), Some(&0.0));
+            assert_eq!(t.cpu.get("Xcode"), Some(&200.0));
+            assert_eq!(t.app_cpu.get("login"), Some(&0.0));
+            assert_eq!(t.app_mem.get("Google Chrome"), Some(&60.0));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(t.cpu.get("rust-analyzer*"), Some(&200.0));
+            assert_eq!(t.cpu.get("rustc"), Some(&0.0));
+            assert_eq!(t.cpu.get("gnome-shell"), Some(&100.0));
+            assert_eq!(t.app_cpu.get("bash"), Some(&0.0));
+            assert_eq!(t.app_mem.get("firefox"), Some(&60.0));
+        }
+        #[cfg(target_os = "windows")]
+        {
+            assert_eq!(t.cpu.get("rust-analyzer*"), Some(&200.0));
+            assert_eq!(t.cpu.get("rustc.exe"), Some(&0.0));
+            assert_eq!(t.cpu.get("chrome.exe"), Some(&100.0));
+            assert_eq!(t.app_cpu.get("powershell.exe"), Some(&0.0));
+            assert_eq!(t.app_mem.get("chrome.exe"), Some(&60.0));
+        }
+    }
+
+    /// Every platform's table, parsed on whatever platform runs the
+    /// tests. Only one of them is compiled into any given binary, so
+    /// without this a typo in the Windows file would ship — and the
+    /// symptom (a template that silently did not apply) is
+    /// indistinguishable from a quiet machine
+    #[test]
+    fn every_platform_template_parses_from_any_platform() {
+        let files = [
+            ("macos", include_str!("../templates/alerts.toml")),
+            ("linux", include_str!("../templates/alerts-linux.toml")),
+            ("windows", include_str!("../templates/alerts-windows.toml")),
+        ];
+        for (platform, text) in files {
+            let t = Template::parse(text)
+                .unwrap_or_else(|e| panic!("{platform} template must parse: {e}"));
+            assert!(
+                t.cpu.len() > 40 && !t.mem.is_empty(),
+                "{platform} template looks empty"
+            );
+            let tables: [(&str, Vec<&String>); 4] = [
+                ("cpu", t.cpu.keys().collect()),
+                ("mem", t.mem.keys().collect()),
+                ("app_cpu", t.app_cpu.keys().collect()),
+                ("app_mem", t.app_mem.keys().collect()),
+            ];
+            for (table, keys) in tables {
+                for key in keys {
+                    assert!(
+                        !key.trim().is_empty(),
+                        "{platform} [{table}] has an empty key"
+                    );
+                    // Linux names come from /proc/[pid]/stat's `comm`,
+                    // which the kernel truncates to 15 bytes — a longer
+                    // literal can never match anything at all
+                    if platform == "linux" {
+                        let literal = key.trim_matches('*');
+                        assert!(
+                            literal.len() <= 15,
+                            "linux [{table}] key {key:?} exceeds the 15-byte comm cap"
+                        );
+                    }
+                    // Windows reports image names; a key without an
+                    // extension has to be one of the kernel-side
+                    // entries that genuinely have none
+                    if platform == "windows" {
+                        const EXTENSIONLESS: [&str; 5] =
+                            ["System", "Registry", "Memory Compression", "Idle", "vmmem"];
+                        assert!(
+                            key.to_ascii_lowercase().contains(".exe")
+                                || key.ends_with('*')
+                                || EXTENSIONLESS.contains(&key.as_str())
+                                || key.starts_with("vmmem"),
+                            "windows [{table}] key {key:?} is neither an image name nor a pattern"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_rule_this_build_cannot_evaluate_does_not_count_as_enabled() {
+        // Every rule but pressure reads cross-platform inputs
+        assert!(ActiveThresholds::supports(AlertKind::Cpu));
+        assert!(ActiveThresholds::supports(AlertKind::Memory));
+        assert!(ActiveThresholds::supports(AlertKind::AppCpu));
+        assert!(ActiveThresholds::supports(AlertKind::AppMemory));
+        assert!(ActiveThresholds::supports(AlertKind::Disk));
+        assert_eq!(
+            ActiveThresholds::supports(AlertKind::Pressure),
+            Capabilities::current().memory_pressure
+        );
+
+        // A config with nothing but the pressure rule left on: enabled
+        // where it can fire, and honestly reported as not where it
+        // cannot — a settings screen must not offer a live control for
+        // a rule the build skips entirely
+        let file = AlertsConfig {
+            cpu: Some(0.0),
+            mem: Some(0.0),
+            disk: Some(0.0),
+            app_cpu: Some(0.0),
+            app_mem: Some(0.0),
+            ..Default::default()
+        };
+        let merged = ActiveThresholds::from_config(&file);
+        assert!(merged.pressure.is_some(), "still configured");
+        assert_eq!(
+            merged.any_enabled(),
+            ActiveThresholds::supports(AlertKind::Pressure)
+        );
     }
 
     #[test]

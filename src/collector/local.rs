@@ -20,8 +20,8 @@ use std::time::{Duration, Instant};
 
 use jiff::Timestamp;
 use sysinfo::{
-    Components, CpuRefreshKind, Disk, DiskRefreshKind, Disks, Networks, Pid, ProcessRefreshKind,
-    ProcessesToUpdate, System, UpdateKind,
+    Components, CpuRefreshKind, Disk, DiskRefreshKind, Disks, Networks, Pid, Process,
+    ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind,
 };
 
 use crate::collector::Collector;
@@ -554,7 +554,7 @@ impl LocalCollector {
                 // that produces cpu_usage, under the same refresh kind
                 cpu_time_ms: p.accumulated_cpu_time(),
                 memory_bytes: p.memory(),
-                phys_footprint_bytes: phys_footprint(pid),
+                phys_footprint_bytes: process_footprint(p, pid),
                 virtual_memory_bytes: p.virtual_memory(),
                 run_time_secs: p.run_time(),
                 parent_pid: p.parent().map(|pp| pp.as_u32()),
@@ -607,15 +607,16 @@ impl LocalCollector {
                 pid,
                 ProcNode {
                     parent: p.parent().map(|pp| pp.as_u32()),
+                    start_time_secs: p.start_time(),
                     cpu: p.cpu_usage(),
                     mem: p.memory(),
                     // Over the FULL table, not just the ranked top-N: a
                     // group total that skipped its unranked helpers would
                     // undercount exactly the many-small-helper apps the
-                    // group rules exist for. ~0.5us per process, i.e.
-                    // tenths of a millisecond against the ~20ms the
-                    // process refresh already costs
-                    footprint: phys_footprint(pid),
+                    // group rules exist for. ~0.5us per process on macOS
+                    // and free on Windows; a /proc read each on Linux,
+                    // see `process_footprint`
+                    footprint: process_footprint(p, pid),
                     io,
                 },
             );
@@ -879,9 +880,23 @@ fn select_top_pids(mut keys: Vec<ProcKey>, max: usize) -> Vec<u32> {
 
 /// Keep one entry per device name, preferring the shortest mount point
 /// (collapses APFS synthetic mounts that share a volume).
+///
+/// A volume with an EMPTY name is never collapsed. The name is a device
+/// identity on macOS and Linux, but on Windows `sysinfo` fills it from
+/// `GetVolumeInformationW` — the volume LABEL, which is routinely blank.
+/// Two unlabelled volumes would key on `""`, merge into one row, and the
+/// loser would silently stop being evaluated by the disk rule: a
+/// monitoring library quietly ceasing to monitor a disk, with a
+/// remaining row that looks perfectly healthy. Keying on identity is
+/// only valid where there IS one
 fn dedupe_disks_by_name(disks: Vec<DiskSnapshot>) -> Vec<DiskSnapshot> {
     let mut best: HashMap<String, DiskSnapshot> = HashMap::new();
+    let mut unnamed = Vec::new();
     for disk in disks {
+        if disk.name.is_empty() {
+            unnamed.push(disk);
+            continue;
+        }
         match best.get(&disk.name) {
             Some(existing) if existing.mount_point.len() <= disk.mount_point.len() => {}
             _ => {
@@ -889,7 +904,7 @@ fn dedupe_disks_by_name(disks: Vec<DiskSnapshot>) -> Vec<DiskSnapshot> {
             }
         }
     }
-    let mut out: Vec<_> = best.into_values().collect();
+    let mut out: Vec<_> = best.into_values().chain(unnamed).collect();
     out.sort_by(|a, b| a.mount_point.cmp(&b.mount_point));
     out
 }
@@ -898,6 +913,9 @@ fn dedupe_disks_by_name(disks: Vec<DiskSnapshot>) -> Vec<DiskSnapshot> {
 #[derive(Debug, Clone, Copy)]
 struct ProcNode {
     parent: Option<u32>,
+    /// Seconds since the epoch, 0 when unreadable — used to reject a
+    /// recycled ppid, see [`is_plausible_parent`]
+    start_time_secs: u64,
     cpu: f32,
     mem: u64,
     /// Physical footprint where the kernel let us read it
@@ -934,6 +952,34 @@ struct GroupTotals {
 /// Pid of init / launchd — the boundary that defines application roots
 const INIT_PID: u32 = 1;
 
+/// Whether `parent` can really be `child`'s parent, i.e. whether the
+/// recorded ppid still refers to the process that spawned it.
+///
+/// A parent cannot have started after its own child, so a later start
+/// time is proof the pid was RECYCLED. Unix hides this problem by
+/// reparenting orphans to init, which [`INIT_PID`] already terminates
+/// the walk on; Windows leaves the dead parent's pid in place and hands
+/// that number to an unrelated process, so without this check the walk
+/// climbs into a stranger's tree and merges two applications into one
+/// group — and `process_groups` feeds two live alert rules, so the
+/// damage is a fabricated aggregate being evaluated, not just a wrong
+/// row.
+///
+/// Deliberately conservative: only a start time known for BOTH sides and
+/// strictly later on the parent rejects the link. Seconds are the
+/// resolution every platform agrees on, so a pid reused inside the same
+/// second as its successor's start still slips through — that is a much
+/// smaller window than the process lifetimes this protects
+fn is_plausible_parent(table: &HashMap<u32, ProcNode>, child: u32, parent: u32) -> bool {
+    let (Some(child), Some(parent)) = (table.get(&child), table.get(&parent)) else {
+        return false;
+    };
+    if child.start_time_secs == 0 || parent.start_time_secs == 0 {
+        return true;
+    }
+    parent.start_time_secs <= child.start_time_secs
+}
+
 /// Resolve every process to the root of its tree (the ancestor whose
 /// parent is init/launchd, missing from the table, or absent) and sum
 /// CPU/memory per root. Returns at most `max` groups ranked by CPU
@@ -955,8 +1001,8 @@ fn aggregate_process_groups(table: &HashMap<u32, ProcNode>, max: usize) -> Vec<G
                 Some(parent)
                     if parent != INIT_PID
                         && parent != current
-                        && table.contains_key(&parent)
-                        && path.len() < 512 =>
+                        && path.len() < 512
+                        && is_plausible_parent(table, current, parent) =>
                 {
                     current = parent;
                 }
@@ -1037,9 +1083,82 @@ fn phys_footprint(pid: u32) -> Option<u64> {
         .map(|r| r.ri_phys_footprint)
 }
 
-#[cfg(not(target_os = "macos"))]
-fn phys_footprint(_pid: u32) -> Option<u64> {
-    None
+/// The platform's answer to "how much memory is this process really
+/// holding" — the quantity the memory rules measure, in bytes.
+///
+/// Resident size is the wrong basis everywhere, not just on macOS: it
+/// counts shared framework pages the process is not really costing the
+/// machine, and it cannot see pages that were compressed or paged out,
+/// so a process under memory pressure reads as SHRINKING exactly while
+/// it squeezes the machine hardest. Each platform's closest equivalent
+/// of macOS's `phys_footprint`:
+///
+/// - macOS: `ri_phys_footprint` (anonymous + compressed, shared clean
+///   pages excluded).
+/// - Windows: `PROCESS_MEMORY_COUNTERS_EX.PrivateUsage`, the private
+///   commit charge — private bytes including those paged out. `sysinfo`
+///   already reads it for every process (it surfaces the same number as
+///   `virtual_memory`), so this costs nothing extra.
+/// - Linux: `RssAnon + VmSwap` from `/proc/[pid]/status` — resident
+///   anonymous pages plus the anonymous pages swapped out, which is
+///   what zram/zswap compression moves a leak into. `smaps_rollup`'s
+///   `Pss + SwapPss` is the more precise answer but walks every VMA in
+///   the kernel, far too expensive to run over the full process table on
+///   each refresh; this is one small read per process.
+///
+/// `None` means "no answer", never zero — a zero would read as a
+/// measurement. Callers fall back to `memory_bytes` (see
+/// `ProcessStats::footprint_avg_bytes`), so a platform that cannot
+/// answer degrades to resident size rather than to nothing
+fn process_footprint(process: &Process, pid: u32) -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = process;
+        phys_footprint(pid)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = pid;
+        // sysinfo stores PrivateUsage here; 0 is its "could not read"
+        match process.virtual_memory() {
+            0 => None,
+            bytes => Some(bytes),
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _ = process;
+        let text = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        parse_proc_status_footprint(&text)
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
+    {
+        let _ = (process, pid);
+        None
+    }
+}
+
+/// Pull `RssAnon + VmSwap` out of `/proc/[pid]/status`, in bytes.
+///
+/// Kernel-reported values are in kB and the field is absent on kernels
+/// before 4.5 (and for kernel threads), which is a `None` rather than a
+/// zero. `VmSwap` missing while `RssAnon` is present just means nothing
+/// is swapped out
+///
+/// Compiled in for the test on every platform so a change to the parser
+/// is caught by the reference platform's `make check`, not by a Linux
+/// user
+#[cfg(any(target_os = "linux", test))]
+fn parse_proc_status_footprint(status: &str) -> Option<u64> {
+    let field = |name: &str| -> Option<u64> {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix(name)?.strip_suffix("kB"))
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .map(|kb| kb.saturating_mul(1024))
+    };
+    let anon = field("RssAnon:")?;
+    Some(anon.saturating_add(field("VmSwap:").unwrap_or(0)))
 }
 
 /// Safe sysctl readers via the `sysctl` crate (the library forbids
@@ -1190,6 +1309,7 @@ impl Collector for LocalCollector {
             load: self.collect_load(),
             temperatures: self.collect_temperatures(),
             io_totals,
+            capabilities: crate::snapshot::Capabilities::current(),
             extras: HashMap::new(),
         })
     }
@@ -1210,10 +1330,20 @@ mod tests {
     fn node(parent: Option<u32>, cpu: f32, mem: u64) -> ProcNode {
         ProcNode {
             parent,
+            // 0 = unknown, which never rejects a parent link — the
+            // grouping tests are about topology, not pid reuse
+            start_time_secs: 0,
             cpu,
             mem,
             footprint: None,
             io: None,
+        }
+    }
+
+    fn node_started_at(parent: Option<u32>, start_time_secs: u64) -> ProcNode {
+        ProcNode {
+            start_time_secs,
+            ..node(parent, 0.0, 0)
         }
     }
 
@@ -1470,6 +1600,39 @@ mod tests {
     }
 
     #[test]
+    fn a_parent_that_started_after_its_child_is_a_recycled_pid() {
+        // pid 200 died; the number was handed to a process that started
+        // later than the child still pointing at it. Without the check
+        // the walk climbs into 200's tree and reports one merged app
+        let table = HashMap::from([
+            (200u32, node_started_at(None, 5_000)),
+            (201u32, node_started_at(Some(200), 5_001)),
+            // Stale ppid: this one predates its alleged parent
+            (300u32, node_started_at(Some(200), 1_000)),
+            (301u32, node_started_at(Some(300), 1_001)),
+        ]);
+        let groups = aggregate_process_groups(&table, 10);
+        let mut roots: Vec<u32> = groups.iter().map(|g| g.root_pid).collect();
+        roots.sort_unstable();
+        assert_eq!(roots, vec![200, 300], "two apps, not one");
+        let counts: HashMap<u32, u32> = groups
+            .iter()
+            .map(|g| (g.root_pid, g.process_count))
+            .collect();
+        assert_eq!(counts[&200], 2);
+        assert_eq!(counts[&300], 2);
+
+        // An unknown start time on either side must not break grouping
+        let table = HashMap::from([
+            (200u32, node_started_at(None, 0)),
+            (201u32, node_started_at(Some(200), 5_001)),
+        ]);
+        let groups = aggregate_process_groups(&table, 10);
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0].process_count, 2);
+    }
+
+    #[test]
     fn a_group_sums_member_footprints_and_falls_back_per_member() {
         // Root is pid 10 (a launchd child); INIT_PID itself is the
         // boundary, never a group
@@ -1495,6 +1658,25 @@ mod tests {
         let groups = aggregate_process_groups(&table, 10);
         assert!(!groups[0].any_footprint);
         assert_eq!(groups[0].mem, 300);
+    }
+
+    #[test]
+    fn proc_status_footprint_is_anonymous_resident_plus_swap() {
+        let status = "Name:\tcargo\nVmSize:\t 2445508 kB\nRssAnon:\t  102400 kB\n\
+                      RssFile:\t   51200 kB\nVmSwap:\t    2048 kB\n";
+        assert_eq!(
+            parse_proc_status_footprint(status),
+            Some((102_400 + 2_048) * 1024)
+        );
+
+        // Nothing swapped out is not the same as nothing readable
+        let status = "RssAnon:\t  102400 kB\n";
+        assert_eq!(parse_proc_status_footprint(status), Some(102_400 * 1024));
+
+        // Kernel threads and pre-4.5 kernels have no RssAnon at all: no
+        // answer, rather than an answer of zero
+        assert_eq!(parse_proc_status_footprint("VmSwap:\t 2048 kB\n"), None);
+        assert_eq!(parse_proc_status_footprint(""), None);
     }
 
     #[test]

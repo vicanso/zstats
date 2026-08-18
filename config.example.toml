@@ -73,6 +73,11 @@ battery_refresh_interval = "30s"
 # --------------------------------------------------------------- temperatures
 # Hardware sensors via sysinfo Components; platform-dependent, implausible
 # firmware readings are filtered out
+# Default true, except on Windows: the reading there goes through WMI,
+# which calls CoInitializeEx on the collector thread and sets a
+# process-global CoInitializeSecurity — an integration hazard for an
+# embedded frontend, in exchange for at most one sensor labelled
+# "Computer". Set it explicitly if you want it there
 collect_temperatures = true
 temperature_refresh_interval = "15s"
 

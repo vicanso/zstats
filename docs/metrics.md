@@ -161,7 +161,8 @@ rankings), returned sorted by CPU descending.
 | `cpu_usage_percent` | single-core % | May exceed 100 |
 | `cpu_time_ms` | single-core ms | **A counter, not a rate.** Lifetime CPU consumed. Diff two samples for the amount burned in between — the only way a steady low-percentage process becomes visible |
 | `memory_bytes` | bytes | Resident |
-| `virtual_memory_bytes` | bytes | Rarely useful; hide by default |
+| `phys_footprint_bytes` | bytes | **What the memory rules measure**, and the better number for a memory column: resident size cannot see compressed or paged-out pages, so a process under pressure reads as shrinking exactly when it squeezes hardest. macOS `phys_footprint`, Windows `PrivateUsage`, Linux `RssAnon + VmSwap`; `None` elsewhere, or where the kernel refused (EPERM on another user's process) |
+| `virtual_memory_bytes` | bytes | Rarely useful; hide by default. On Windows `sysinfo` reports `PrivateUsage` here, i.e. the same number as `phys_footprint_bytes` |
 | `run_time_secs` | seconds | |
 | `parent_pid` | Option\<u32\> | Lets a UI build the tree itself if it wants |
 | `user_id` | Option\<String\> | Text on purpose: numeric uid on unix, SID on Windows |
@@ -449,5 +450,24 @@ all need private APIs or hand-written FFI on macOS.
 macOS is the reference platform. Linux and Windows compile and run, with
 gaps: `perf_levels`, `compressed_bytes` and `pressure_level` are macOS-only
 (the Linux analogues — sysfs CPU capacity, PSI — are known future work);
-Windows load averages are emulated, temperatures are usually empty, and
-process-group roots have no init anchor.
+Windows load averages are emulated and temperatures are usually empty (and
+so `collect_temperatures` defaults to **false** there — `sysinfo` reaches
+them through WMI, which initialises COM process-wide on the collector
+thread).
+
+Rather than guess from its own build, a frontend should read
+`capabilities` off the snapshot — `memory_footprint`, `memory_pressure`,
+`cpu_perf_levels`, each a property of the build that produced the
+snapshot. It answers "this platform has no such concept" and nothing
+else: a `None` that means "the kernel refused for this process" or "not
+sampled yet" still looks the same. The alert engine exposes the matching
+question for rules: `ActiveThresholds::supports(AlertKind::Pressure)` is
+false off macOS, and `any_enabled()` will not claim alerting is live when
+the pressure rule is the only one left on.
+
+The builtin alert template is per platform — `templates/alerts.toml`
+(macOS), `alerts-linux.toml`, `alerts-windows.toml` — because process
+names are not portable: `Google Chrome Helper (Renderer)` is
+`chrome.exe` on Windows and `Isolated Web Co` on Linux, where the kernel
+truncates every name to 15 bytes. `<config-dir>/template.toml` replaces
+whichever one was compiled in.

@@ -388,7 +388,18 @@ impl Default for CollectorConfig {
             network_refresh_interval: Duration::ZERO,
             collect_battery: true,
             battery_refresh_interval: Duration::from_secs(30),
-            collect_temperatures: true,
+            // Off by default on Windows only. `sysinfo` reads
+            // temperatures there through WMI
+            // (`MSAcpi_ThermalZoneTemperature`), which calls
+            // `CoInitializeEx` on the calling thread and sets a
+            // PROCESS-GLOBAL `CoInitializeSecurity` — on the collector
+            // thread, every cadence. For an embedded frontend that is a
+            // real integration hazard, since the host may have its own
+            // COM apartment or security requirements. The payload it
+            // buys is at most one component hard-labelled "Computer",
+            // and on most consumer hardware none at all. Set it to true
+            // explicitly if you want it
+            collect_temperatures: !cfg!(target_os = "windows"),
             // Temps drift over seconds/minutes, not milliseconds
             temperature_refresh_interval: Duration::from_secs(15),
             labels: HashMap::new(),

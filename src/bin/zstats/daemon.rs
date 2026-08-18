@@ -431,6 +431,7 @@ mod tests {
             },
             temperatures: None,
             io_totals: Default::default(),
+            capabilities: Default::default(),
             extras: Default::default(),
         }
     }

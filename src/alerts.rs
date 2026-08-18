@@ -248,12 +248,14 @@ const DISK_REARM_MARGIN: f64 = 0.05;
 const BUILTIN_TEMPLATE: &str = include_str!("../templates/alerts-windows.toml");
 #[cfg(target_os = "linux")]
 const BUILTIN_TEMPLATE: &str = include_str!("../templates/alerts-linux.toml");
-/// macOS, and the fallback for any other unix — the Apple daemon names
-/// simply match nothing there, which is the pre-existing behaviour
+/// macOS, and the fallback for every other target. The Apple daemon
+/// names simply match nothing on, say, FreeBSD, which is the
+/// pre-existing behaviour there — a platform gets its own file when
+/// someone can name its processes, not before
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
-const BUILTIN_TEMPLATE: &str = include_str!("../templates/alerts.toml");
+const BUILTIN_TEMPLATE: &str = include_str!("../templates/alerts-macos.toml");
 
-/// Format version of `templates/alerts.toml`. A file claiming anything
+/// Format version shared by every `templates/alerts-*.toml`. A file claiming anything
 /// else is refused outright rather than half-read into thresholds the
 /// user did not ask for
 pub const TEMPLATE_VERSION: u32 = 1;
@@ -264,7 +266,7 @@ pub const TEMPLATE_VERSION: u32 = 1;
 /// Applied below the user's own overrides (a matching user entry always
 /// wins) unless `[alerts] template = false`, and skipped entirely when
 /// the corresponding base rule is disabled. Keys are [`Matcher`]
-/// patterns; see `templates/alerts.toml` for the tiers and the reasoning
+/// patterns; see `templates/alerts-<platform>.toml` for the tiers and the reasoning
 /// behind each group.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3506,7 +3508,7 @@ login = 0.0
     #[test]
     fn every_platform_template_parses_from_any_platform() {
         let files = [
-            ("macos", include_str!("../templates/alerts.toml")),
+            ("macos", include_str!("../templates/alerts-macos.toml")),
             ("linux", include_str!("../templates/alerts-linux.toml")),
             ("windows", include_str!("../templates/alerts-windows.toml")),
         ];

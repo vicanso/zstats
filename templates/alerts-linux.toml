@@ -7,6 +7,16 @@
 # NOTIFICATION while the data point is still recorded to
 # <config-dir>/data/.
 #
+# HAND-MAINTAINED DATA, not generated — there is no generator to run,
+# and editing this file is exactly how the table is meant to change.
+# `BUILTIN_TEMPLATE` in src/alerts.rs pulls it in with include_str!, so
+# an edit here takes effect on the next BUILD; changing the table on an
+# installed zstats is the <config-dir>/template.toml route below, no
+# rebuild involved. `every_platform_template_parses_from_any_platform`
+# guards all three files from whatever platform runs the tests: it
+# rejects a version mismatch, an unknown table, a key `Matcher` cannot
+# honour, and a value that is not one of this table's tiers.
+#
 # This exact file is compiled into Linux builds. Drop an edited copy at
 # <config-dir>/template.toml to REPLACE it wholesale — the daemon picks
 # the change up within about a minute, no restart. To ADD one entry you

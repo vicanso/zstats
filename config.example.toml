@@ -215,11 +215,14 @@ template = true
 # exact name beats a pattern, and a longer pattern beats a shorter one.
 # From a shell, quote it: `zstats -add alert-cpu 'rust-analyzer*=200'`.
 #
-# The builtin template (default on, see above) lives in
-# `templates/alerts.toml` in the source tree — ~144 entries covering
-# browsers, Electron apps, IDE indexers, toolchains and periodic macOS
-# system work. It used to be reproduced here, which meant keeping two
-# copies of the same 144 lines in sync by hand; read that file instead.
+# The builtin template (default on, see above) lives in the source tree
+# as `templates/alerts-macos.toml`, `-linux.toml` and `-windows.toml`,
+# one of which is compiled in — a couple of hundred entries each,
+# covering browsers, Electron apps, IDE indexers, toolchains and the
+# platform's own periodic maintenance. Process names are not portable,
+# which is why there is one file per platform. It used to be reproduced
+# here, which meant keeping two copies in sync by hand; read the file
+# for your platform instead.
 #
 # To ADD an entry, put it below — a user override outranks the template
 # whatever the template says. To REPLACE the table wholesale (for
@@ -259,8 +262,8 @@ template = true
 # on macOS every terminal session's descendants group under a `login`
 # root, so "the cargo build I started" is a `login` group, not `ghostty`.
 #
-# The builtin app template (same `template` switch as above, and the same
-# `templates/alerts.toml` file — the `[app_cpu]` and `[app_mem]` tables)
+# The builtin app template (same `template` switch as above, and the
+# `[app_cpu]` / `[app_mem]` tables of the same per-platform file)
 # already covers the two cases that matter: terminal sessions and VM
 # hosts are silenced (0 — you started that work, and its members still
 # have per-process rules), browsers and IDEs get a raised bar rather than

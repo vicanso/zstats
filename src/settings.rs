@@ -58,7 +58,7 @@ pub fn config_path(dir: &Path) -> PathBuf {
 
 /// The optional alert-template override inside a config directory.
 ///
-/// Absent on a normal install — the compiled-in `templates/alerts.toml`
+/// Absent on a normal install — the compiled-in `templates/alerts-<platform>.toml`
 /// is used. Dropping a file here REPLACES it wholesale (rather than
 /// layering, which would make a removed entry impossible to remove and
 /// turn three precedence levels into five). To ADD a single entry, use a

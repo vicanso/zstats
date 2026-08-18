@@ -398,7 +398,7 @@ A settings UI should surface which rule actually applied to a process; the
 merged view is `alerts::ActiveThresholds::from_config`.
 
 The template layer itself is a TOML file, not a table in the source —
-`templates/alerts.toml`, compiled in via `include_str!` and parsed into
+`templates/alerts-<platform>.toml`, compiled in via `include_str!` and parsed into
 `alerts::Template` (`version`, `[cpu]`, `[mem]`, `[app_cpu]`, `[app_mem]`). A copy at
 `<config-dir>/template.toml` **replaces** it wholesale, so the table can be
 refreshed on a schedule (`curl -o`) without a new binary; the daemon reloads it
@@ -465,8 +465,8 @@ question for rules: `ActiveThresholds::supports(AlertKind::Pressure)` is
 false off macOS, and `any_enabled()` will not claim alerting is live when
 the pressure rule is the only one left on.
 
-The builtin alert template is per platform — `templates/alerts.toml`
-(macOS), `alerts-linux.toml`, `alerts-windows.toml` — because process
+The builtin alert template is per platform — `templates/alerts-macos.toml`,
+`alerts-linux.toml`, `alerts-windows.toml` — because process
 names are not portable: `Google Chrome Helper (Renderer)` is
 `chrome.exe` on Windows and `Isolated Web Co` on Linux, where the kernel
 truncates every name to 15 bytes. `<config-dir>/template.toml` replaces

@@ -74,8 +74,9 @@ accidental: `firefox`, `git`, `make`, `rustc`, `ninja`, `ffmpeg` matched; the
 ~40 Apple daemons did not.
 
 **Done:** one file per platform, selected by `cfg(target_os)` at the
-`include_str!` — `templates/alerts.toml` (macOS and other unixes),
-`alerts-linux.toml`, `alerts-windows.toml`. Separate files rather than
+`include_str!` — `templates/alerts-macos.toml` (also the fallback for any
+target without a file of its own), `alerts-linux.toml`,
+`alerts-windows.toml`. Separate files rather than
 sections inside one keep `Template::parse`'s `deny_unknown_fields` strict,
 and `<config-dir>/template.toml` still replaces whichever was selected.
 

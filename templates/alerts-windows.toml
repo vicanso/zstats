@@ -73,6 +73,11 @@ version = 1
 "vivaldi.exe" = 100.0
 
 # --- Electron and other desktop apps that render for a living
+# The stock name, for an app packaged without renaming the binary.
+# Unlike macOS, Chromium's child processes here reuse the parent's image
+# name (`--type=renderer`), so this one key covers the main process and
+# every renderer alike — same as "chrome.exe" below
+"electron.exe" = 100.0
 "Code.exe" = 100.0
 "Cursor.exe" = 100.0
 "Discord.exe" = 100.0
@@ -239,6 +244,7 @@ version = 1
 "studio64.exe" = 30.0
 "Code.exe" = 30.0
 "Cursor.exe" = 30.0
+"electron.exe" = 30.0
 "rust-analyzer*" = 30.0
 "clangd.exe" = 30.0
 "gopls.exe" = 30.0
@@ -340,6 +346,7 @@ version = 1
 "brave.exe" = 400.0
 "Code.exe" = 400.0
 "Cursor.exe" = 400.0
+"electron.exe" = 400.0
 "devenv.exe" = 400.0
 "idea64.exe" = 400.0
 "rider64.exe" = 400.0
@@ -357,6 +364,7 @@ version = 1
 "powershell.exe" = 0.0
 "pwsh.exe" = 0.0
 "WindowsTerminal.exe" = 0.0
+"OpenConsole.exe" = 0.0
 "conhost.exe" = 0.0
 "bash.exe" = 0.0
 "wsl.exe" = 0.0
@@ -387,6 +395,7 @@ version = 1
 "brave.exe" = 60.0
 "Code.exe" = 60.0
 "Cursor.exe" = 60.0
+"electron.exe" = 60.0
 "devenv.exe" = 60.0
 "idea64.exe" = 60.0
 "rider64.exe" = 60.0

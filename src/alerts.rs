@@ -362,13 +362,23 @@ pub enum Severity {
 pub enum AlertSubject {
     Process {
         pid: u32,
+        /// The name every threshold, template entry and override is
+        /// matched against
         name: String,
+        /// What to show a person instead, when `name` is the executable
+        /// of a bundle that carries the real one — see
+        /// `ProcessSnapshot::display_name`. Never matched on: a rule
+        /// that fired against `name` has to be explainable by `name`.
+        #[serde(default)]
+        display_name: Option<String>,
     },
     /// A whole process tree; `root_pid` matches
     /// `ProcessGroupSnapshot::root_pid`
     App {
         root_pid: u32,
         name: String,
+        #[serde(default)]
+        display_name: Option<String>,
         process_count: u32,
     },
     Volume {
@@ -445,6 +455,10 @@ pub struct MemoryConsumer {
     /// The process, or the group's root process
     pub pid: u32,
     pub name: String,
+    /// See `ProcessSnapshot::display_name` — presentation only, and the
+    /// half of a pressure alert a person acts on, so it matters most here
+    #[serde(default)]
+    pub display_name: Option<String>,
     /// Physical footprint where the kernel allows reading it, resident
     /// size otherwise; for an application, its members' summed resident
     /// size (which counts shared pages more than once — the same basis
@@ -577,12 +591,20 @@ impl AlertSubject {
     /// How this subject is named in a sentence
     fn label(&self) -> String {
         match self {
-            Self::Process { pid, name } => format!("{name} (pid {pid})"),
+            Self::Process {
+                pid,
+                name,
+                display_name,
+            } => format!("{} (pid {pid})", display_name.as_deref().unwrap_or(name)),
             Self::App {
                 name,
+                display_name,
                 process_count,
                 ..
-            } => format!("{name} ({process_count} processes)"),
+            } => format!(
+                "{} ({process_count} processes)",
+                display_name.as_deref().unwrap_or(name)
+            ),
             Self::Volume { mount_point } => format!("disk {mount_point}"),
             Self::System => "system".to_string(),
         }
@@ -618,7 +640,7 @@ fn consumer_label(consumers: &[MemoryConsumer]) -> String {
         .map(|c| {
             format!(
                 "{} {:.1} GiB ({:.0}%)",
-                c.name,
+                c.display_name.as_deref().unwrap_or(&c.name),
                 c.bytes as f64 / f64::from(1 << 30),
                 c.share_percent
             )
@@ -657,6 +679,7 @@ fn top_memory_consumers(snapshot: &SystemSnapshot) -> Vec<MemoryConsumer> {
                 MemoryConsumer {
                     pid: g.root_pid,
                     name: g.name.clone(),
+                    display_name: g.display_name.clone(),
                     bytes,
                     share_percent: share(bytes) * 100.0,
                     process_count: g.process_count,
@@ -677,6 +700,7 @@ fn top_memory_consumers(snapshot: &SystemSnapshot) -> Vec<MemoryConsumer> {
                         MemoryConsumer {
                             pid: p.pid,
                             name: p.name.clone(),
+                            display_name: p.display_name.clone(),
                             bytes,
                             share_percent: share(bytes) * 100.0,
                             process_count: 1,
@@ -1355,6 +1379,7 @@ impl AlertEngine {
                 .map(|g| crate::snapshot::ProcessSnapshot {
                     pid: g.root_pid,
                     name: g.name.clone(),
+                    display_name: g.display_name.clone(),
                     cmd: String::new(),
                     cpu_usage_percent: g.cpu_usage_percent,
                     // Groups carry no CPU-time counter on purpose: their
@@ -1402,6 +1427,7 @@ impl AlertEngine {
                             subject: AlertSubject::App {
                                 root_pid: g.root_pid,
                                 name: g.name.clone(),
+                                display_name: g.display_name.clone(),
                                 process_count: g.process_count,
                             },
                             detail: AlertDetail::Cpu {
@@ -1429,6 +1455,7 @@ impl AlertEngine {
                             subject: AlertSubject::App {
                                 root_pid: g.root_pid,
                                 name: g.name.clone(),
+                                display_name: g.display_name.clone(),
                                 process_count: g.process_count,
                             },
                             detail: AlertDetail::Memory {
@@ -1520,6 +1547,7 @@ impl AlertEngine {
                         subject: AlertSubject::Process {
                             pid: p.pid,
                             name: p.name.clone(),
+                            display_name: p.display_name.clone(),
                         },
                         // The tier that fired decides which window and
                         // which bar the numbers refer to
@@ -1554,6 +1582,7 @@ impl AlertEngine {
                         subject: AlertSubject::Process {
                             pid: p.pid,
                             name: p.name.clone(),
+                            display_name: p.display_name.clone(),
                         },
                         detail: AlertDetail::Memory {
                             avg_bytes: held_bytes as u64,
@@ -1583,6 +1612,7 @@ impl AlertEngine {
                         timestamp: snapshot.timestamp,
                         pid: p.pid,
                         name: p.name.clone(),
+                        display_name: p.display_name.clone(),
                         cpu_avg_percent: fast.cpu_avg as f32,
                         memory_avg_bytes: fast.memory_avg_bytes as u64,
                         memory_share_percent: (mem_share(fast.memory_avg_bytes) * 100.0) as f32,
@@ -1722,6 +1752,7 @@ mod tests {
         ProcessSnapshot {
             pid,
             name: format!("p{pid}"),
+            display_name: None,
             cmd: String::new(),
             cpu_usage_percent: cpu,
             cpu_time_ms,
@@ -2213,6 +2244,55 @@ mod tests {
     }
 
     #[test]
+    fn a_display_name_is_what_the_reader_sees_and_never_what_a_rule_matched() {
+        // The whole point: "Electron (22 processes)" names no
+        // application a person could act on, and every stock-named
+        // Electron app would read identically
+        let app = AlertEvent {
+            subject: AlertSubject::App {
+                root_pid: 41213,
+                name: "Electron".into(),
+                display_name: Some("CodeBuddy CN".into()),
+                process_count: 22,
+            },
+            detail: AlertDetail::Cpu {
+                avg_percent: 420.0,
+                threshold_percent: 200.0,
+                window: SLOW_WINDOW,
+                runaway: false,
+            },
+            repeat_after: None,
+        };
+        assert!(app.summary().starts_with("CodeBuddy CN (22 processes)"));
+
+        // ...but the threshold that fired is still keyed on `Electron`,
+        // so the event carries the name a person needs to write an
+        // override against. Rendering must not be able to lose it
+        let AlertSubject::App { name, .. } = &app.subject else {
+            unreachable!()
+        };
+        assert_eq!(name, "Electron");
+
+        // No bundle to add anything: the label is unchanged, not
+        // doubled up
+        let plain = AlertEvent {
+            subject: AlertSubject::Process {
+                pid: 7,
+                name: "rustc".into(),
+                display_name: None,
+            },
+            detail: AlertDetail::Cpu {
+                avg_percent: 99.0,
+                threshold_percent: 30.0,
+                window: WINDOW,
+                runaway: false,
+            },
+            repeat_after: None,
+        };
+        assert!(plain.summary().starts_with("rustc (pid 7)"));
+    }
+
+    #[test]
     fn events_carry_structure_a_gui_can_render_without_parsing_text() {
         let active = ActiveThresholds {
             cpu: Thresholds::new(Some(30.0)),
@@ -2249,7 +2329,8 @@ mod tests {
             cpu.subject,
             AlertSubject::Process {
                 pid: 1,
-                name: "p1".into()
+                name: "p1".into(),
+                display_name: None
             }
         );
         let AlertDetail::Cpu {
@@ -2636,6 +2717,7 @@ mod tests {
         ProcessGroupSnapshot {
             root_pid,
             name: name.into(),
+            display_name: None,
             process_count: count,
             cpu_usage_percent: cpu,
             memory_bytes: mem,
@@ -3560,6 +3642,60 @@ login = 0.0
                 t.cpu.contains_key("rust-analyzer*"),
                 "{platform} lost the rust-analyzer pattern"
             );
+            // Apps packaged without renaming Electron's binary report
+            // the stock name to every kernel interface there is, so this
+            // is the only key that can reach them. macOS had no entry at
+            // all while Linux did, which left a whole class of desktop
+            // apps running against the 30% / 200% base — the gap that
+            // produced a real "Electron (22 processes)" alert. The names
+            // differ per platform because the packaging does: macOS
+            // renames the helper BUNDLES after productName but not
+            // always the main binary, while Chromium's children on Linux
+            // and Windows reuse the parent's own name
+            let (stock_proc, stock_app) = match platform {
+                "macos" => ("Electron Helper (Renderer)", "Electron"),
+                "linux" => ("electron", "electron"),
+                _ => ("electron.exe", "electron.exe"),
+            };
+            assert_eq!(
+                t.cpu.get(stock_proc),
+                Some(&100.0),
+                "{platform} lost the stock Electron process entry"
+            );
+            assert_eq!(
+                t.app_cpu.get(stock_app),
+                Some(&400.0),
+                "{platform} lost the stock Electron app entry"
+            );
+            assert_eq!(
+                t.app_mem.get(stock_app),
+                Some(&60.0),
+                "{platform} lost the stock Electron app memory entry"
+            );
+            // Anything the app CPU rule silences is work the user asked
+            // for — a build, a guest, a container — and work you asked
+            // for holds memory while it runs, so the app MEMORY rule has
+            // to silence it too. Subset rather than equality: the
+            // converse is legitimately asymmetric (a database whose
+            // resident cache is the whole point still deserves a CPU
+            // alert). Caught two real drifts in the files written for
+            // platforms nobody here runs: `tmux: server` and `sshd-*`
+            // on Linux, `OpenConsole.exe` on Windows, each silenced for
+            // CPU only, which would have charged a whole session's
+            // memory to a shell
+            let cpu_silent: Vec<&String> = t
+                .app_cpu
+                .iter()
+                .filter(|(_, v)| **v == 0.0)
+                .map(|(k, _)| k)
+                .collect();
+            for k in cpu_silent {
+                assert_eq!(
+                    t.app_mem.get(k),
+                    Some(&0.0),
+                    "{platform}: {k:?} is silenced for app CPU but not for app memory"
+                );
+            }
             // Every value must sit on a defined tier. Keys are checked
             // by `Matcher::parse` above; a mistyped VALUE (10 for 100,
             // 60 in a table whose tiers are 0/30) parses perfectly and

@@ -274,6 +274,7 @@ mod tests {
                 timestamp: jiff::Timestamp::from_second(1).expect("ts"),
                 pid: 1,
                 name: "demo".into(),
+                display_name: None,
                 cpu_avg_percent: 50.0,
                 memory_avg_bytes: 1024,
                 memory_share_percent: 1.0,

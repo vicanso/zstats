@@ -917,6 +917,7 @@ TOP   NAME            MEM
         ProcessSnapshot {
             pid,
             name: format!("p{pid}"),
+            display_name: None,
             cmd: String::new(),
             cpu_usage_percent: cpu,
             cpu_time_ms: 0,

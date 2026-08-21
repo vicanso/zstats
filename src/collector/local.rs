@@ -63,6 +63,16 @@ struct ProcKey {
     mem: u64,
 }
 
+/// Accumulated-cpu-time sample from a process refresh, the baseline the
+/// next refresh diffs against. The start time is what tells a recycled
+/// pid from the process the baseline belongs to — the same concern
+/// `is_plausible_parent` has about recycled ppids.
+#[derive(Debug, Clone, Copy)]
+struct CpuTimeBaseline {
+    cpu_time_ms: u64,
+    start_time_secs: u64,
+}
+
 pub struct LocalCollector {
     config: CollectorConfig,
     system: System,
@@ -75,6 +85,16 @@ pub struct LocalCollector {
     last_disk_counters: HashMap<String, DiskCounters>,
     last_net_counters: HashMap<String, NetCounters>,
     last_process_disk_counters: HashMap<u32, DiskCounters>,
+    /// Per-pid accumulated-cpu-time baselines from the previous process
+    /// refresh; replaced wholesale each refresh so exited pids drop with
+    /// the map, like the disk counters above.
+    last_cpu_times: HashMap<u32, CpuTimeBaseline>,
+    /// Per-pid CPU percent for the CURRENT process refresh, derived in
+    /// [`Self::update_cpu_percents`]. Computed exactly once per refresh
+    /// and read by ranking, materialization and group sums alike: those
+    /// are separate passes, and if each diffed the baselines itself the
+    /// second one would read a delta of zero.
+    cpu_percents: HashMap<u32, f32>,
     last_disk_storage_refresh: Option<Instant>,
     last_disk_io_refresh: Option<Instant>,
     last_network_refresh: Option<Instant>,
@@ -153,6 +173,8 @@ impl LocalCollector {
             last_disk_counters: HashMap::new(),
             last_net_counters: HashMap::new(),
             last_process_disk_counters: HashMap::new(),
+            last_cpu_times: HashMap::new(),
+            cpu_percents: HashMap::new(),
             last_disk_storage_refresh,
             last_disk_io_refresh: None,
             last_network_refresh: None,
@@ -216,13 +238,70 @@ impl LocalCollector {
             .with_cpu()
             .with_cmd(UpdateKind::OnlyIfNotSet)
             .with_user(UpdateKind::OnlyIfNotSet);
+        // macOS only, because `app_bundle_name` is the only consumer and
+        // a `.app` bundle is the only thing it can recognise. Free here:
+        // sysinfo parses the exe path out of the same KERN_PROCARGS2
+        // buffer it already reads for `cmd` on every refresh, so
+        // OnlyIfNotSet buys one PathBuf per new process and no syscall.
+        #[cfg(target_os = "macos")]
+        {
+            kind = kind.with_exe(UpdateKind::OnlyIfNotSet);
+        }
         if self.config.collect_process_disk_io {
             kind = kind.with_disk_usage();
         }
         self.system
             .refresh_processes_specifics(ProcessesToUpdate::All, true, kind);
         self.last_process_refresh = Some(Instant::now());
+        self.update_cpu_percents(elapsed);
         elapsed
+    }
+
+    /// Derive every process's CPU percent from two accumulated-cpu-time
+    /// samples over the wall clock — sysinfo's own `cpu_usage()` is
+    /// deliberately not used.
+    ///
+    /// sysinfo (0.39, macOS `compute_cpu_usage`) skips its update when a
+    /// process burned zero CPU between refreshes, so a fully idle
+    /// process keeps reporting its last busy window's percentage
+    /// indefinitely — observed as an idle XPC service wearing "14%" for
+    /// 16 hours on an accumulated time that never moved, squatting in
+    /// the CPU-ranked top-N via the memory half of the budget and
+    /// polluting group sums and alert inputs the whole while. A counter
+    /// diff cannot go stale: no work reads as zero. Deriving it here,
+    /// once, also gives all three platforms one definition instead of
+    /// three sysinfo code paths with their own quirks.
+    ///
+    /// `elapsed` is `None` on the collector's first refresh: baselines
+    /// are recorded but every percent is 0.0 — no baseline, no claim,
+    /// the same first-sample stance as the rate metrics (their `None`
+    /// is not available here: the field is not optional in the
+    /// snapshot, and 0.0 is also what sysinfo reported for a first
+    /// sample, so downstream behaviour is unchanged).
+    fn update_cpu_percents(&mut self, elapsed: Option<Duration>) {
+        let mut percents = HashMap::with_capacity(self.system.processes().len());
+        let mut baselines = HashMap::with_capacity(self.system.processes().len());
+        for p in self.system.processes().values() {
+            let pid = p.pid().as_u32();
+            let current = CpuTimeBaseline {
+                cpu_time_ms: p.accumulated_cpu_time(),
+                start_time_secs: p.start_time(),
+            };
+            let percent = match (elapsed, self.last_cpu_times.get(&pid)) {
+                (Some(elapsed), Some(prev)) => percent_between(prev, &current, elapsed),
+                _ => 0.0,
+            };
+            percents.insert(pid, percent);
+            baselines.insert(pid, current);
+        }
+        self.last_cpu_times = baselines;
+        self.cpu_percents = percents;
+    }
+
+    /// The derived percent for a pid, 0.0 for one that appeared after
+    /// the refresh (it has no baseline and made no measurable claim).
+    fn cpu_percent_for(&self, pid: u32) -> f32 {
+        self.cpu_percents.get(&pid).copied().unwrap_or(0.0)
     }
 
     fn collect_cpu(&self) -> CpuSnapshot {
@@ -490,7 +569,8 @@ impl LocalCollector {
             let pid = p.pid().as_u32();
             keys.push(ProcKey {
                 pid,
-                cpu: p.cpu_usage(),
+                // Derived, never sysinfo's cpu_usage() — see update_cpu_percents
+                cpu: self.cpu_percent_for(pid),
                 mem: p.memory(),
             });
             if self.config.collect_process_disk_io {
@@ -543,13 +623,14 @@ impl LocalCollector {
             selected.push(ProcessSnapshot {
                 pid,
                 name: p.name().to_string_lossy().to_string(),
+                display_name: process_display_name(p),
                 cmd: p
                     .cmd()
                     .iter()
                     .map(|c| c.to_string_lossy())
                     .collect::<Vec<_>>()
                     .join(" "),
-                cpu_usage_percent: p.cpu_usage(),
+                cpu_usage_percent: self.cpu_percent_for(pid),
                 // Free: sysinfo fills this from the same task_info call
                 // that produces cpu_usage, under the same refresh kind
                 cpu_time_ms: p.accumulated_cpu_time(),
@@ -608,7 +689,7 @@ impl LocalCollector {
                 ProcNode {
                     parent: p.parent().map(|pp| pp.as_u32()),
                     start_time_secs: p.start_time(),
-                    cpu: p.cpu_usage(),
+                    cpu: self.cpu_percent_for(pid),
                     mem: p.memory(),
                     // Over the FULL table, not just the ranked top-N: a
                     // group total that skipped its unranked helpers would
@@ -639,6 +720,7 @@ impl LocalCollector {
                     Some(ProcessGroupSnapshot {
                         root_pid: g.root_pid,
                         name: root.name().to_string_lossy().to_string(),
+                        display_name: process_display_name(root),
                         process_count: g.process_count,
                         cpu_usage_percent: g.cpu,
                         memory_bytes: g.mem,
@@ -854,6 +936,28 @@ fn process_boost_active(
     busy_cores >= threshold
 }
 
+/// Percent of one core between two accumulated-cpu-time samples. Sums
+/// over threads, so >100% is normal for a multithreaded process — the
+/// same single-core semantics the field has always had.
+///
+/// A start-time mismatch or a backwards counter means the pid was
+/// recycled: the baseline belongs to a dead process, and diffing across
+/// it would either report a huge spurious spike (new counter far above
+/// the old) or underflow. A recycled pid is a first sighting — zero this
+/// round, honest from the next.
+fn percent_between(prev: &CpuTimeBaseline, current: &CpuTimeBaseline, elapsed: Duration) -> f32 {
+    if current.start_time_secs != prev.start_time_secs || current.cpu_time_ms < prev.cpu_time_ms {
+        return 0.0;
+    }
+    let elapsed_ms = elapsed.as_secs_f64() * 1000.0;
+    if elapsed_ms < 1.0 {
+        // Two refreshes inside a millisecond cannot carry a meaningful
+        // rate; better no claim than a wild one.
+        return 0.0;
+    }
+    ((current.cpu_time_ms - prev.cpu_time_ms) as f64 / elapsed_ms * 100.0) as f32
+}
+
 fn by_cpu_then_memory(a: &ProcKey, b: &ProcKey) -> std::cmp::Ordering {
     b.cpu
         .total_cmp(&a.cpu)
@@ -1051,6 +1155,48 @@ fn aggregate_process_groups(table: &HashMap<u32, ProcNode>, max: usize) -> Vec<G
     });
     groups.truncate(max);
     groups
+}
+
+/// The application a process belongs to, when its executable name does
+/// not say it. macOS only: a `.app` bundle is the one place on any of
+/// the three platforms where the path to an executable names the
+/// application, and `with_exe` is requested nowhere else.
+#[cfg(target_os = "macos")]
+fn process_display_name(process: &Process) -> Option<String> {
+    app_bundle_name(process.exe()?, &process.name().to_string_lossy())
+}
+
+#[cfg(not(target_os = "macos"))]
+fn process_display_name(_process: &Process) -> Option<String> {
+    None
+}
+
+/// The bundle a macOS executable sits in, or `None` when it sits in
+/// none or the bundle only repeats `name`.
+///
+/// This exists because the stock Electron binary is called `Electron`,
+/// so every app that shipped without renaming it — CodeBuddy CN being
+/// one — reports that single name to every kernel interface there is.
+/// The bundle directory is what Finder and Activity Monitor show, and
+/// deriving it is pure string work on a path already in hand.
+///
+/// NEAREST enclosing bundle, not the outermost, because Chromium nests
+/// its helper bundles inside the browser's own
+/// (`Google Chrome.app/Contents/Frameworks/.../Google Chrome Helper
+/// (Renderer).app/Contents/MacOS/...`). Resolving those up to `Google
+/// Chrome` would erase exactly the distinction the per-process template
+/// is built on — helpers and the main process carry different bars. The
+/// nearest bundle instead repeats the helper's own name, which reports
+/// as `None`: a display name equal to `name` carries no information,
+/// and returning it would make every caller's fallback a no-op it still
+/// had to write.
+#[cfg(any(target_os = "macos", test))]
+fn app_bundle_name(exe: &std::path::Path, name: &str) -> Option<String> {
+    let bundle = exe
+        .ancestors()
+        .filter_map(|a| a.file_name())
+        .find_map(|f| f.to_str()?.strip_suffix(".app"))?;
+    (!bundle.is_empty() && bundle != name).then(|| bundle.to_string())
 }
 
 /// Physical footprint via `proc_pid_rusage`, through the `libproc`
@@ -1321,6 +1467,8 @@ impl Collector for LocalCollector {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     fn key(pid: u32, cpu: f32, mem: u64) -> ProcKey {
@@ -1661,6 +1809,76 @@ mod tests {
     }
 
     #[test]
+    fn a_bundle_names_the_app_its_executable_does_not() {
+        // The case this exists for: the stock Electron binary name is
+        // shared by every app that shipped without renaming it
+        assert_eq!(
+            app_bundle_name(
+                Path::new("/Applications/CodeBuddy CN.app/Contents/MacOS/Electron"),
+                "Electron"
+            )
+            .as_deref(),
+            Some("CodeBuddy CN")
+        );
+        // Measured on a live machine: binaries that name a component
+        // rather than the product
+        assert_eq!(
+            app_bundle_name(
+                Path::new(
+                    "/Applications/Shadowrocket.app/Contents/PlugIns/\
+                     MacPacketTunnel.appex/Contents/MacOS/MacPacketTunnel"
+                ),
+                "MacPacketTunnel"
+            )
+            .as_deref(),
+            Some("Shadowrocket")
+        );
+    }
+
+    #[test]
+    fn a_bundle_that_only_repeats_the_executable_name_is_not_a_display_name() {
+        // Reported as None rather than as a copy, so a caller's
+        // `display_name.unwrap_or(name)` never renders the same string
+        // twice over and the field means "there is something to add"
+        assert_eq!(
+            app_bundle_name(
+                Path::new("/Applications/Cursor.app/Contents/MacOS/Cursor"),
+                "Cursor"
+            ),
+            None
+        );
+        // Not in a bundle at all — every Linux and Windows path, and
+        // most macOS daemons
+        assert_eq!(
+            app_bundle_name(Path::new("/usr/sbin/mDNSResponder"), "mDNSResponder"),
+            None
+        );
+        assert_eq!(app_bundle_name(Path::new("/opt/foo/bin/foo"), "foo"), None);
+    }
+
+    #[test]
+    fn a_nested_helper_bundle_resolves_to_itself_not_to_the_browser() {
+        // Chromium nests helper bundles inside the browser's own. The
+        // per-process template gives helpers and the main process
+        // different bars on purpose, so resolving a renderer up to
+        // "Google Chrome" would erase the distinction the rules run on —
+        // the NEAREST bundle wins, and here it repeats the helper's own
+        // name, i.e. adds nothing
+        assert_eq!(
+            app_bundle_name(
+                Path::new(
+                    "/Applications/Google Chrome.app/Contents/Frameworks/\
+                     Google Chrome Framework.framework/Versions/141.0.0.0/Helpers/\
+                     Google Chrome Helper (Renderer).app/Contents/MacOS/\
+                     Google Chrome Helper (Renderer)"
+                ),
+                "Google Chrome Helper (Renderer)"
+            ),
+            None
+        );
+    }
+
+    #[test]
     fn proc_status_footprint_is_anonymous_resident_plus_swap() {
         let status = "Name:\tcargo\nVmSize:\t 2445508 kB\nRssAnon:\t  102400 kB\n\
                       RssFile:\t   51200 kB\nVmSwap:\t    2048 kB\n";
@@ -1684,6 +1902,76 @@ mod tests {
         assert!((ratio_percent(50, 100) - 50.0).abs() < f32::EPSILON);
         assert_eq!(ratio_percent(1, 0), 0.0);
         assert_eq!(ratio_percent(0, 0), 0.0);
+    }
+
+    fn cputime(cpu_time_ms: u64, start_time_secs: u64) -> CpuTimeBaseline {
+        CpuTimeBaseline {
+            cpu_time_ms,
+            start_time_secs,
+        }
+    }
+
+    /// The regression this whole derivation exists for: sysinfo keeps a
+    /// process's last computed cpu_usage when its time counter stops
+    /// moving, so a fully idle process wore its last busy window's
+    /// percentage indefinitely (observed: "14%" for 16 hours on an
+    /// unmoving counter). A counter diff cannot go stale.
+    #[test]
+    fn an_idle_process_reads_zero_not_its_last_busy_window() {
+        let prev = cputime(28_140, 100);
+        let current = cputime(28_140, 100);
+        assert_eq!(
+            percent_between(&prev, &current, Duration::from_secs(15)),
+            0.0
+        );
+    }
+
+    #[test]
+    fn percent_is_time_delta_over_wall_clock() {
+        // 3 busy seconds inside a 15-second window is 20% of one core.
+        let rate = percent_between(
+            &cputime(10_000, 100),
+            &cputime(13_000, 100),
+            Duration::from_secs(15),
+        );
+        assert!((rate - 20.0).abs() < 0.01, "got {rate}");
+        // Threads sum: 30s of CPU in a 15s window is 200%, unclamped.
+        let multi = percent_between(
+            &cputime(0, 100),
+            &cputime(30_000, 100),
+            Duration::from_secs(15),
+        );
+        assert!((multi - 200.0).abs() < 0.01, "got {multi}");
+    }
+
+    #[test]
+    fn a_recycled_pid_starts_from_zero_not_from_the_dead_ones_baseline() {
+        // Same pid, later start time: another program. Its first window
+        // must not be diffed against the dead process's counter — that
+        // would report either a wild spike or (backwards) nothing sane.
+        let dead = cputime(500_000, 100);
+        let reborn = cputime(2_000, 900);
+        assert_eq!(
+            percent_between(&dead, &reborn, Duration::from_secs(15)),
+            0.0
+        );
+        // A backwards counter alone is the same verdict even if the
+        // start times happen to collide.
+        let backwards = cputime(400, 100);
+        assert_eq!(
+            percent_between(&dead, &backwards, Duration::from_secs(15)),
+            0.0
+        );
+    }
+
+    #[test]
+    fn a_sub_millisecond_window_makes_no_claim() {
+        let rate = percent_between(
+            &cputime(0, 100),
+            &cputime(50, 100),
+            Duration::from_micros(200),
+        );
+        assert_eq!(rate, 0.0, "no meaningful rate fits in 200µs");
     }
 
     #[test]

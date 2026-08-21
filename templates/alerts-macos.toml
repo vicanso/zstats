@@ -73,6 +73,11 @@ plugin-container = 100.0
 "com.apple.WebKit.GPU" = 100.0
 
 # --- Electron / Chromium desktop apps: same engine, same bursts
+# The stock name. electron-builder renames the helper bundles after the
+# app's productName, so most apps land on a "X Helper (Renderer)" entry
+# below; one packaged without that step keeps Electron's own name, and
+# its renderers burst for exactly the same reasons
+"Electron Helper (Renderer)" = 100.0
 "Slack Helper (Renderer)" = 100.0
 "Discord Helper (Renderer)" = 100.0
 "Notion Helper (Renderer)" = 100.0
@@ -282,6 +287,12 @@ rider = 30.0
 zed = 30.0
 Cursor = 30.0
 Code = 30.0
+# Apps that ship Electron's stock binary name — `Contents/MacOS/Electron`
+# rather than a renamed one — report `Electron` to every kernel
+# interface, so this one key is all the template can address them by.
+# Deliberately blunt: the alternative is that a whole class of desktop
+# apps stays invisible to the table and runs against the 25%/4 GiB base
+Electron = 30.0
 
 # --- Browsers: one heavy page can hold gigabytes, and that is the page's
 # doing rather than the browser's fault
@@ -365,6 +376,9 @@ Code = 400.0
 Arc = 400.0
 firefox = 400.0
 Safari = 400.0
+# See the [mem] note: an app that never renamed its binary roots its
+# tree under `Electron`, which is the name the whole-app rules match on
+Electron = 400.0
 
 # Whole-application memory, keyed on the tree root name, as a percent of
 # total RAM. Browsers and IDEs legitimately hold a large share of a
@@ -406,6 +420,7 @@ clion = 60.0
 zed = 60.0
 Cursor = 60.0
 Code = 60.0
+Electron = 60.0
 # A booted device image plus its daemons runs to several GiB
 Simulator = 60.0
 "com.apple.CoreSimulator.CoreSimulatorService" = 60.0

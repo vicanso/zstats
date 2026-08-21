@@ -308,6 +308,22 @@ pub struct NetworkSnapshot {
 pub struct ProcessSnapshot {
     pub pid: u32,
     pub name: String,
+    /// The application this process belongs to, when the executable's
+    /// own name does not say it: `/Applications/CodeBuddy CN.app/
+    /// Contents/MacOS/Electron` is named `Electron` by every kernel
+    /// interface, which is the stock Electron binary name shared by
+    /// every app that never renamed it. Derived from the enclosing
+    /// `.app` bundle, so it is the name Finder and Activity Monitor
+    /// show, and `None` whenever the executable is not inside a bundle
+    /// (all of Linux and Windows, and most macOS daemons).
+    ///
+    /// PRESENTATION ONLY. `name` stays the identity that alert
+    /// thresholds, templates and overrides match on — one process has
+    /// exactly one matchable name, and a bundle holds several distinct
+    /// processes (`Google Chrome` and `Google Chrome Helper (Renderer)`
+    /// carry different bars on purpose) that this field would collapse.
+    #[serde(default)]
+    pub display_name: Option<String>,
     pub cmd: String,
     pub cpu_usage_percent: f32,
     /// Total CPU time consumed since the process started, in single-core
@@ -376,6 +392,13 @@ pub struct ProcessGroupSnapshot {
     pub root_pid: u32,
     /// Name of the root process
     pub name: String,
+    /// The application this tree belongs to, when the root executable's
+    /// own name does not say it — see `ProcessSnapshot::display_name`.
+    /// Presentation only, for the same reason: the group's matchable
+    /// identity has to stay the one name a threshold key can be written
+    /// against.
+    #[serde(default)]
+    pub display_name: Option<String>,
     /// Number of processes in the group (root included)
     pub process_count: u32,
     /// Sum of member CPU usage (single-core units, like per-process CPU)

@@ -327,7 +327,13 @@ bash = 0.0
 zsh = 0.0
 fish = 0.0
 sshd = 0.0
+# The sshd per-session child, whose comm carries the peer
+"sshd-*" = 0.0
 tmux = 0.0
+# tmux's server renames itself via prctl(PR_SET_NAME); both spellings
+# are listed because which one `comm` reports depends on the build, and
+# a session root missed here is a whole build's memory charged to it
+"tmux: server" = 0.0
 screen = 0.0
 login = 0.0
 "systemd" = 0.0
@@ -337,6 +343,7 @@ login = 0.0
 libvirtd = 0.0
 dockerd = 0.0
 containerd = 0.0
+"containerd-shi*" = 0.0
 crosvm = 0.0
 
 # --- A browser with many tabs routinely passes 40% of RAM, and an IDE

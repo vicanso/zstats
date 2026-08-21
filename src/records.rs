@@ -64,7 +64,22 @@ pub struct MetricRecord {
     /// containing file is named by LOCAL date, so the two can disagree
     pub timestamp: jiff::Timestamp,
     pub pid: u32,
+    /// The name the alert rules matched on, so a line can be traced back
+    /// to the threshold that selected it
     pub name: String,
+    /// The application `name` belongs to, where the executable's own
+    /// name does not say it — see `ProcessSnapshot::display_name`.
+    ///
+    /// Carried for the same reason `memory_footprint_bytes` is: a
+    /// history that cannot be read against the notifications it explains
+    /// is a worse history. A stock-packaged Electron app notifies as
+    /// "CodeBuddy CN" and would otherwise appear here only as
+    /// "Electron" — and since `read_range` is what a GUI charts from,
+    /// one frontend would label its live view and its history chart
+    /// differently. Absent from files written before this field existed,
+    /// and wherever the executable is not inside a bundle
+    #[serde(default)]
+    pub display_name: Option<String>,
     /// 1-minute average CPU, single-core units
     pub cpu_avg_percent: f32,
     /// 1-minute average resident memory
@@ -217,6 +232,7 @@ mod tests {
             timestamp: jiff::Timestamp::from_second(second).expect("valid timestamp"),
             pid,
             name: format!("p{pid}"),
+            display_name: None,
             cpu_avg_percent: 50.0,
             memory_avg_bytes: 1024,
             memory_share_percent: 10.0,

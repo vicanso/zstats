@@ -156,7 +156,8 @@ rankings), returned sorted by CPU descending.
 | Field | Unit | Notes |
 |---|---|---|
 | `pid` | u32 | Stable key for a row — and the key alerts link back on |
-| `name` | String | |
+| `name` | String | The executable's own name — **and the only name alert thresholds, template entries and overrides match on** |
+| `display_name` | Option\<String\> | The application `name` belongs to, when `name` does not say it: the enclosing `.app` bundle. Show `display_name ?? name`. macOS only, `None` when there is no bundle or it merely repeats `name` — so a value always carries new information. See the note below |
 | `cmd` | String | Full command line; a detail-panel field, too long for a table cell |
 | `cpu_usage_percent` | single-core % | May exceed 100 |
 | `cpu_time_ms` | single-core ms | **A counter, not a rate.** Lifetime CPU consumed. Diff two samples for the amount burned in between — the only way a steady low-percentage process becomes visible |
@@ -177,12 +178,32 @@ what makes a browser with 37 helpers legible as one row.
 | Field | Unit | Notes |
 |---|---|---|
 | `root_pid` | u32 | Row key; also the key app-level alerts use |
-| `name` | String | Root process name |
+| `name` | String | Root process name; the key app-level thresholds match on |
+| `display_name` | Option\<String\> | As above — this is the one that turns `Electron — 22 processes` into `CodeBuddy CN — 22 processes` |
 | `process_count` | u32 | "Chrome — 37 processes" |
 | `cpu_usage_percent` | single-core % | Sum over the whole tree; hundreds of percent is normal |
 | `memory_bytes` | bytes | Sum over the whole tree |
 | `phys_footprint_bytes` | bytes | Sum over the whole tree, a member's RSS standing in where the kernel refused a footprint; `None` off macOS. **This is what the app memory rule measures** — RSS falls as the kernel compresses, exactly when a group is squeezing the machine |
 | `read_bytes_per_sec`, `write_bytes_per_sec` | B/s | Sum; only with `process-disk-io` |
+
+> **Name your rows `display_name ?? name`, but never key anything on it.**
+> A process's name is its executable's, and the stock Electron binary is
+> called `Electron` — so every app that shipped without renaming it reports
+> that single name to every kernel interface there is
+> (`/Applications/CodeBuddy CN.app/Contents/MacOS/Electron`). A card titled
+> "Electron — 22 processes" names nothing a person can act on, and two such
+> apps are indistinguishable. `display_name` is the enclosing `.app` bundle,
+> which is what Finder and Activity Monitor show. Measured on one live
+> machine: 3 of 50 groups resolve — `MacPacketTunnel` → Shadowrocket, `node`
+> → 企业微信, `zed` → Zed — because most apps do rename their binary, so this
+> is a low-noise fallback rather than a second naming scheme.
+>
+> It is presentation only. `name` stays the identity thresholds match on, so
+> a settings UI offering "raise the bar for this app" must write `name`, and
+> a rule that fired has to stay explainable by `name`. The NEAREST bundle
+> wins: Chromium nests helper bundles inside the browser's own, and
+> resolving a renderer up to `Google Chrome` would erase the distinction the
+> per-process template is built on.
 
 > **macOS quirk worth designing around:** every terminal session's
 > descendants group under a `login` root, not under the terminal app. So a
@@ -256,8 +277,8 @@ AlertEvent
 
 | Variant | Payload | Frontend action |
 |---|---|---|
-| `Process` | `pid`, `name` | Select that row in the process table |
-| `App` | `root_pid`, `name`, `process_count` | Select that row in the app table |
+| `Process` | `pid`, `name`, `display_name` | Select that row in the process table |
+| `App` | `root_pid`, `name`, `display_name`, `process_count` | Select that row in the app table |
 | `Volume` | `mount_point` | Select that volume |
 | `System` | — | Machine-level banner |
 
@@ -296,7 +317,7 @@ rather than a culprit — nothing to kill, and it can legitimately hold all day:
   `repeat_after` counts from the episode's first notification.
 
 It also carries the **attribution**: `top_consumers` is up to 3
-`MemoryConsumer { pid, name, bytes, share_percent, process_count }`, biggest
+`MemoryConsumer { pid, name, display_name, bytes, share_percent, process_count }`, biggest
 first, taken from the snapshot at the moment the alert fired — whole
 applications where `process_groups` is collected (`process_count` > 1 and `pid`
 is the group root, so a UI can select the app row), individual processes
@@ -325,7 +346,8 @@ automatically on append.
 | Field | Notes |
 |---|---|
 | `timestamp` | UTC |
-| `pid`, `name` | |
+| `pid`, `name` | `name` is what the rule matched on |
+| `display_name` | The application `name` belongs to, where the executable does not say it (§3.7). Present so a history line can be read against the notification it explains — a stock-packaged Electron app notifies as `CodeBuddy CN` but records under `Electron`. Chart `display_name ?? name`, the same as a live row |
 | `cpu_avg_percent` | 1-minute average |
 | `memory_avg_bytes` | 1-minute average resident size |
 | `memory_share_percent` | Share of total RAM |

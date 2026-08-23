@@ -157,7 +157,7 @@ rankings), returned sorted by CPU descending.
 |---|---|---|
 | `pid` | u32 | Stable key for a row — and the key alerts link back on |
 | `name` | String | The executable's own name — **and the only name alert thresholds, template entries and overrides match on** |
-| `display_name` | Option\<String\> | The application `name` belongs to, when `name` does not say it: the enclosing `.app` bundle. Show `display_name ?? name`. macOS only, `None` when there is no bundle or it merely repeats `name` — so a value always carries new information. See the note below |
+| `display_name` | Option\<String\> | The application `name` belongs to, when `name` does not say it: the `.app` bundle whose own executable this is (`<bundle>/Contents/MacOS/<exe>`). Show `display_name ?? name`. macOS only, `None` when the executable is not a bundle's own — not in one at all, or merely shipped inside one — or the bundle merely repeats `name`, so a value always carries new information. See the note below |
 | `cmd` | String | Full command line; a detail-panel field, too long for a table cell |
 | `cpu_usage_percent` | single-core % | May exceed 100 |
 | `cpu_time_ms` | single-core ms | **A counter, not a rate.** Lifetime CPU consumed. Diff two samples for the amount burned in between — the only way a steady low-percentage process becomes visible |
@@ -204,6 +204,15 @@ what makes a browser with 37 helpers legible as one row.
 > wins: Chromium nests helper bundles inside the browser's own, and
 > resolving a renderer up to `Google Chrome` would erase the distinction the
 > per-process template is built on.
+>
+> Only a bundle's OWN executable resolves — the path has to be
+> `<bundle>/Contents/MacOS/<exe>`. Being merely inside a bundle does not
+> count: Xcode ships a whole toolchain under `Xcode.app/Contents/Developer/`
+> (`make`, `clang`, `ld`, `git`, …), and matching any `.app` ancestor named
+> every one of them "Xcode" — a `make` in a terminal reported as Xcode while
+> Xcode was not running. Apps' bundled CLIs (`Docker.app/Contents/Resources/
+> bin/docker`) are the same case. Activity Monitor shows those by their own
+> names; so does this.
 
 > **macOS quirk worth designing around:** every terminal session's
 > descendants group under a `login` root, not under the terminal app. So a

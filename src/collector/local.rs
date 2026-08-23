@@ -1190,12 +1190,28 @@ fn process_display_name(_process: &Process) -> Option<String> {
 /// as `None`: a display name equal to `name` carries no information,
 /// and returning it would make every caller's fallback a no-op it still
 /// had to write.
+///
+/// Only a bundle's OWN executable qualifies — the path must be
+/// `<bundle>/Contents/MacOS/<exe>`. Being merely *inside* a bundle is
+/// not the same thing: Xcode ships an entire toolchain under
+/// `Xcode.app/Contents/Developer/` (make, clang, ld, git, python3, …),
+/// and matching any `.app` ancestor named every one of them "Xcode" —
+/// a `make dev` in a terminal reported as Xcode while Xcode was not
+/// running. The CLIs apps drop under `Contents/Resources/bin` (Docker's
+/// `docker`) are the same case. Activity Monitor shows those by their
+/// own names, and so does this. The nested-bundle rule above is
+/// unaffected: a helper `.app` or `.appex` has a `Contents/MacOS` of
+/// its own, and the search for the nearest bundle starts from there.
 #[cfg(any(target_os = "macos", test))]
 fn app_bundle_name(exe: &std::path::Path, name: &str) -> Option<String> {
-    let bundle = exe
+    let mut dirs = exe
         .ancestors()
-        .filter_map(|a| a.file_name())
-        .find_map(|f| f.to_str()?.strip_suffix(".app"))?;
+        .skip(1)
+        .filter_map(|a| a.file_name()?.to_str());
+    if dirs.next() != Some("MacOS") || dirs.next() != Some("Contents") {
+        return None;
+    }
+    let bundle = dirs.find_map(|f| f.strip_suffix(".app"))?;
     (!bundle.is_empty() && bundle != name).then(|| bundle.to_string())
 }
 
@@ -1854,6 +1870,57 @@ mod tests {
             None
         );
         assert_eq!(app_bundle_name(Path::new("/opt/foo/bin/foo"), "foo"), None);
+    }
+
+    /// Inside a bundle is not the bundle's executable. Measured on a
+    /// live machine: `/usr/bin/make` is a shim onto Xcode's toolchain,
+    /// so a `make dev` in a terminal wore the name "Xcode" — and every
+    /// clang and ld of the link stage would have too.
+    #[test]
+    fn a_tool_shipped_inside_a_bundle_is_not_the_app() {
+        assert_eq!(
+            app_bundle_name(
+                Path::new("/Applications/Xcode.app/Contents/Developer/usr/bin/make"),
+                "make"
+            ),
+            None
+        );
+        assert_eq!(
+            app_bundle_name(
+                Path::new(
+                    "/Applications/Xcode.app/Contents/Developer/Toolchains/\
+                     XcodeDefault.xctoolchain/usr/bin/clang"
+                ),
+                "clang"
+            ),
+            None
+        );
+        // An app's bundled CLI, same shape
+        assert_eq!(
+            app_bundle_name(
+                Path::new("/Applications/Docker.app/Contents/Resources/bin/docker"),
+                "docker"
+            ),
+            None
+        );
+        // The bundle's own executable still resolves — the rule is the
+        // `Contents/MacOS` parent, not the depth
+        assert_eq!(
+            app_bundle_name(
+                Path::new("/Applications/Xcode.app/Contents/MacOS/Xcode"),
+                "Xcode"
+            ),
+            None,
+            "repeats the name, so adds nothing"
+        );
+        assert_eq!(
+            app_bundle_name(
+                Path::new("/Applications/Docker.app/Contents/MacOS/com.docker.backend"),
+                "com.docker.backend"
+            )
+            .as_deref(),
+            Some("Docker")
+        );
     }
 
     #[test]

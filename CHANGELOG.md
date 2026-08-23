@@ -1,5 +1,19 @@
 # Changelog
 
+## [0.5.4](https://github.com/vicanso/zstats/compare/v0.5.2..v0.5.4) - 2026-08-23
+
+### ⛰️  Features
+
+- Application display names, and the Electron template gap they exposed - ([2bb5503](https://github.com/vicanso/zstats/commit/2bb5503e5bc468015bb4b3dd796d493cd3f20a6d))
+
+### 🐛 Bug Fixes
+
+- A tool shipped inside a .app wore that app's display name - ([1f022ec](https://github.com/vicanso/zstats/commit/1f022ece9f997a6b97362be7327ad4cafd1a4061))
+
+### ⚙️ Miscellaneous Tasks
+
+- Version 0.5.3 - ([1cdf955](https://github.com/vicanso/zstats/commit/1cdf955e9c2823d2e558570930b2a93556c13136))
+
 ## [0.5.3](https://github.com/vicanso/zstats/compare/v0.5.2..v0.5.3) - 2026-08-21
 
 ### ⛰️  Features

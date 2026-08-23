@@ -391,7 +391,7 @@ carries the validation.
 **Collection toggles** — `collect-processes`, `collect-disks`,
 `collect-networks`, `collect-temperatures`, `collect-battery`,
 `process-groups`, `process-disk-io`, `per-core-cpu`, `dedupe-disks`,
-`max-processes` (50), `process-boost` (2.0 cores).
+`max-processes` (50), `process-boost` (default auto: 30% of the machine's logical cores; an explicit value is a bar in core units, 0 = off).
 
 **Cadences** — `interval` (daemon sampling), `process-interval`,
 `disk-interval`, `disk-storage-interval` (60s), `network-interval`,

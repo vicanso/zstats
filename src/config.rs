@@ -251,24 +251,27 @@ pub struct CollectorConfig {
     /// While overall CPU load is at or above this many *logical cores* of
     /// work, the process list refreshes on every collect regardless of
     /// `process_refresh_interval` — busy periods get precise per-process
-    /// attribution, idle periods stay cheap. None or a value <= 0
-    /// disables the boost (0 is what the config file round-trips, since
-    /// an absent field would revert to the default on reload).
+    /// attribution, idle periods stay cheap.
     ///
-    /// Units match per-process CPU% (single-core units): `1.0` means "at
-    /// least one full core busy". The effective overall-usage threshold is
-    /// therefore `cores / logical_cores * 100`, so the same setting scales
-    /// across machine sizes.
+    /// Three states. `Some(t)` with `t > 0` is an explicit bar in
+    /// single-core units (the unit per-process CPU% speaks): `1.0` means
+    /// "at least one full core busy". A value <= 0 disables the boost —
+    /// 0 is what the config file round-trips for "off". `None` — the
+    /// default, and what an absent key reads as — means **auto: the bar
+    /// is [`AUTO_PROCESS_BOOST_FRACTION`] (30%) of the machine's logical
+    /// cores**, resolved against the actual core count at each collect.
     ///
-    /// Default `Some(2.0)`: a modern desktop's ambient load (browser +
-    /// language servers + background services) is already around one full
-    /// core, so 1.0 would keep the boost pinned on during any working
-    /// session — 2.0 means "ambient plus a whole extra core of anomaly".
+    /// Auto is a fraction rather than a fixed core count because a fixed
+    /// one scales backwards: the old default of 2.0 cores was half of a
+    /// 4-core machine but 8% of a 24-core one — the bigger the machine,
+    /// the more of its ordinary ambient load tripped the boost. Thirty
+    /// percent of the machine is the same share of headroom everywhere.
     /// Alert correctness does not depend on the boost (window averages
     /// are time-weighted over whatever cadence is active); it only buys
-    /// finer per-process attribution while things are busy. Raise it
-    /// (e.g. 4.0) when baseline load is high and you want fewer forced
-    /// process refreshes.
+    /// finer per-process attribution while things are busy. Set an
+    /// explicit value when the fraction is wrong for a machine — lower
+    /// to boost earlier, higher (or 0) when baseline load is high and
+    /// forced refreshes are unwelcome.
     pub process_boost_cpu_cores: Option<f32>,
 
     /// Max number of processes to keep. The budget is split between the
@@ -369,12 +372,17 @@ pub struct CollectorConfig {
     pub collect_timeout: Duration,
 }
 
+/// The auto bar for `process_boost_cpu_cores` when the caller passes
+/// none: this share of the machine's logical cores. Public so an
+/// embedder can display or reason about the resolved default.
+pub const AUTO_PROCESS_BOOST_FRACTION: f32 = 0.3;
+
 impl Default for CollectorConfig {
     fn default() -> Self {
         Self {
             collect_processes: true,
             process_refresh_interval: Duration::ZERO,
-            process_boost_cpu_cores: Some(2.0),
+            process_boost_cpu_cores: None,
             max_processes: 50,
             collect_process_disk_io: false,
             collect_process_groups: true,

@@ -24,11 +24,11 @@ collect_processes = true
 process_refresh_interval = "0s"
 # While overall load is at least this many logical cores of work, the
 # process list refreshes every collect regardless of the cadence above —
-# busy periods get precise attribution. Core units; scales with machine
-# size. Default 2.0: a modern desktop's ambient load is already ~1 core,
-# so this means "ambient plus a whole extra core of anomaly" (1.0 would
-# keep the boost pinned on during any working session). 0 disables
-process_boost_cpu_cores = 2.0
+# busy periods get precise attribution. Core units. Unset = auto: 30% of
+# the machine's logical cores, the same share of headroom on every
+# machine size (a fixed count scaled backwards — 2.0 was half of a
+# 4-core and 8% of a 24-core). Set a value to pin the bar; 0 disables
+# process_boost_cpu_cores = 3.6
 # Kept processes; the budget is split between top-by-CPU and top-by-memory
 # so idle memory hogs stay visible
 max_processes = 50

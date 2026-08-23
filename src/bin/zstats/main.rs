@@ -68,7 +68,7 @@ Config keys for -add (also accepted as key=value). Durations take 500ms /
   temp-interval <dur>         [collector] temperature cadence (default 15s)
   cpu-freq-interval <dur>     [collector] CPU frequency cadence (default 30s)
   battery-interval <dur>      [collector] battery cadence (default 30s)
-  process-boost <cores>       [collector] busy-cores boost (default 2, 0 = off)
+  process-boost <cores>       [collector] busy-cores boost (default 30% of cores, 0 = off)
   max-processes <n>           [collector] kept processes (default 50)
   collect-processes | collect-disks | collect-networks | collect-temperatures
   collect-battery | process-disk-io | process-groups | dedupe-disks

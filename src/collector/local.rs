@@ -920,18 +920,22 @@ fn io_totals_from(
 /// refresh this round.
 ///
 /// `cpu_usage_percent` is sysinfo's global usage (0..=100 over *all* cores).
-/// Converting to core-units: `logical_cores * usage / 100`.
+/// Converting to core-units: `logical_cores * usage / 100`. `None` is the
+/// auto bar — [`crate::config::AUTO_PROCESS_BOOST_FRACTION`] of the
+/// machine's cores — and a value <= 0 is off; see the config field's doc.
 fn process_boost_active(
     threshold_cores: Option<f32>,
     cpu_usage_percent: f32,
     logical_cores: u32,
 ) -> bool {
-    let Some(threshold) = threshold_cores else {
-        return false;
-    };
-    if logical_cores == 0 || !threshold.is_finite() || threshold <= 0.0 {
+    if logical_cores == 0 {
         return false;
     }
+    let threshold = match threshold_cores {
+        Some(t) if !t.is_finite() || t <= 0.0 => return false,
+        Some(t) => t,
+        None => logical_cores as f32 * crate::config::AUTO_PROCESS_BOOST_FRACTION,
+    };
     let busy_cores = logical_cores as f32 * (cpu_usage_percent / 100.0);
     busy_cores >= threshold
 }
@@ -1667,7 +1671,14 @@ mod tests {
         assert!(process_boost_active(Some(1.0), 15.0, 64));
         assert!(process_boost_active(Some(2.0), 50.0, 4));
         assert!(!process_boost_active(Some(2.0), 40.0, 4));
-        assert!(!process_boost_active(None, 99.0, 64));
+        // None is the auto bar: 30% of the machine, whatever its size —
+        // the same share of headroom on 4 cores as on 64.
+        assert!(process_boost_active(None, 31.0, 12));
+        assert!(!process_boost_active(None, 29.0, 12));
+        assert!(!process_boost_active(None, 29.0, 4));
+        assert!(!process_boost_active(None, 29.0, 64));
+        assert!(process_boost_active(None, 31.0, 64));
+        assert!(!process_boost_active(None, 100.0, 0));
         assert!(!process_boost_active(Some(1.0), 100.0, 0));
         assert!(!process_boost_active(Some(0.0), 100.0, 8));
     }

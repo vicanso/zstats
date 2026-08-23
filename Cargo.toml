@@ -1,6 +1,6 @@
 [package]
 name = "zstats"
-version = "0.5.4"
+version = "0.5.5"
 edition = "2024"
 # sysinfo 0.39 requires Rust 1.95+
 rust-version = "1.95.0"

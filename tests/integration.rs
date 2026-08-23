@@ -184,9 +184,10 @@ fn disk_and_network_intervals_reuse_cached_lists() {
 fn process_refresh_interval_reuses_cached_list() {
     let config = CollectorConfig {
         // Effectively never due again within this test; the CPU boost must
-        // be off too, or a busy test machine would force a refresh
+        // be off too, or a busy test machine would force a refresh. Off is
+        // `Some(0.0)` — `None` is the auto bar, a share of the machine
         process_refresh_interval: Duration::from_secs(3600),
-        process_boost_cpu_cores: None,
+        process_boost_cpu_cores: Some(0.0),
         ..Default::default()
     };
     let mut collector = LocalCollector::new(config);
@@ -280,9 +281,10 @@ fn process_groups_aggregate_trees_and_respect_toggle_and_cache() {
     let max_processes = CollectorConfig::default().max_processes;
     let mut collector = LocalCollector::new(CollectorConfig {
         // Freeze the process cadence after the first collect so the
-        // second one must serve the cached groups
+        // second one must serve the cached groups; `Some(0.0)` is off,
+        // `None` would be the auto bar and a busy machine would clear it
         process_refresh_interval: Duration::from_secs(3600),
-        process_boost_cpu_cores: None,
+        process_boost_cpu_cores: Some(0.0),
         ..Default::default()
     });
 

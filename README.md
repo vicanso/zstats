@@ -40,6 +40,32 @@ binary.
 Upgrade later with `cargo install zstats --force` (or re-run the git/path
 form with `--force`).
 
+## Desktop app
+
+For a GUI, [zstats.app](https://github.com/vicanso/zstats.app) is a
+menu-bar monitor built on this crate: live CPU in the tray, a panel with
+processes, whole-app process trees, hardware and history, per-app alert
+thresholds delivered as native notifications, and disk-space analysis with
+recoverable cleanup.
+
+- **macOS** (Apple Silicon and Intel; universal, signed and notarized):
+  download `zstats.dmg` from its
+  [Releases](https://github.com/vicanso/zstats.app/releases) and drag it
+  into Applications.
+- **Linux** (preview, Wayland only): `zstats-linux-x86_64.tar.gz` and
+  `zstats-linux-aarch64.tar.gz` on the same page, each with an install
+  script.
+
+Releases are mirrored to
+[Gitee](https://gitee.com/vicanso/zstats.app/releases) for networks that
+cannot reach GitHub.
+
+The app and the CLI share `~/.zstats`, so config, alert overrides and the
+daily history carry over between them. The app collects in-process through
+`Monitor`, though, so run it **instead of** `zstats serve`, not alongside:
+two collectors would each raise every alert and each append the same
+history.
+
 ## Design
 
 ```

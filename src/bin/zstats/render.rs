@@ -278,6 +278,36 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
         levels,
     );
 
+    // One line per GPU, right under the CPU it shares the die with. The
+    // registry has no per-process split, so this line is the whole story
+    for gpu in s.gpus.iter().flatten() {
+        let mut extra = String::new();
+        if let Some(cores) = gpu.cores {
+            let _ = write!(extra, " · {cores} cores");
+        }
+        if let (Some(renderer), Some(tiler)) = (
+            gpu.renderer_utilization_percent,
+            gpu.tiler_utilization_percent,
+        ) {
+            let _ = write!(extra, "  ·  renderer {renderer:.0}% · tiler {tiler:.0}%");
+        }
+        if let Some(bytes) = gpu.memory_in_use_bytes {
+            let _ = write!(extra, "  ·  mem {}", human_bytes(bytes));
+        }
+        let _ = writeln!(
+            out,
+            "GPU   {}  {:>5.1}%  {}{}",
+            styled_gauge(
+                f64::from(gpu.utilization_percent) / 100.0,
+                GAUGE_WIDTH,
+                theme
+            ),
+            gpu.utilization_percent,
+            gpu.name,
+            extra,
+        );
+    }
+
     let mem_fraction = f64::from(s.memory.used_percent) / 100.0;
     // Compressor footprint + the kernel's pressure verdict: growth there
     // is the real "memory is tight" signal on macOS, not used%
@@ -296,6 +326,11 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
         }
         _ => {}
     }
+    // The kernel's own available figure sits next to its verdict, since
+    // the verdict is computed from it and not from used%
+    if let Some(avail) = s.memory.kernel_available_percent {
+        let _ = write!(mem_extra, " (kernel avail {avail}%)");
+    }
     let _ = writeln!(
         out,
         "MEM   {}  {:>5.1}%  {} / {}{mem_extra}",
@@ -307,9 +342,20 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
 
     if s.memory.swap_total_bytes > 0 {
         let swap_fraction = f64::from(s.memory.swap_used_percent) / 100.0;
+        // Activity beside the level: a full swap that is not moving is a
+        // machine that has settled, one moving hundreds of segments a
+        // second is still fighting. Units are the kernel's compressor
+        // segments, so no byte suffix
+        let mut swap_extra = String::new();
+        if let (Some(ins), Some(outs)) = (s.memory.swap_ins_per_sec, s.memory.swap_outs_per_sec) {
+            let _ = write!(swap_extra, "  ·  out {outs}/s · in {ins}/s");
+        }
+        if s.memory.swap_thrashing == Some(true) {
+            swap_extra.push_str(&theme.paint(RED_BOLD, "  ·  thrashing"));
+        }
         let _ = writeln!(
             out,
-            "SWP   {}  {:>5.1}%  {} / {}",
+            "SWP   {}  {:>5.1}%  {} / {}{swap_extra}",
             styled_gauge(swap_fraction, GAUGE_WIDTH, theme),
             s.memory.swap_used_percent,
             human_bytes(s.memory.swap_used_bytes),
@@ -415,9 +461,15 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
         || io.network_received_bytes_per_sec.is_some()
         || io.network_transmitted_bytes_per_sec.is_some()
     {
+        // Operations beside bytes: a drive can be saturated by tiny
+        // random IO while the byte rate looks idle
+        let ops = match (io.disk_read_ops_per_sec, io.disk_write_ops_per_sec) {
+            (Some(reads), Some(writes)) => format!(" · {reads}/{writes} IOPS"),
+            _ => String::new(),
+        };
         let _ = writeln!(
             out,
-            "IO    disk {}↓ {}↑  ·  net {}↓ {}↑",
+            "IO    disk {}↓ {}↑{ops}  ·  net {}↓ {}↑",
             human_rate(io.disk_read_bytes_per_sec),
             human_rate(io.disk_write_bytes_per_sec),
             human_rate(io.network_received_bytes_per_sec),
@@ -459,6 +511,66 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
                 Align::Left,
                 Align::Left,
                 Align::Left,
+                Align::Right,
+                Align::Right,
+                Align::Right,
+                Align::Right,
+                Align::Right,
+            ],
+            &rows,
+            theme,
+        );
+    }
+
+    if let Some(drives) = &s.drives {
+        // Whole disks, not volumes: this is where IOPS, service time and
+        // queue depth live. One row per attached drive — a stable count,
+        // like DISK, so nothing below jumps between ticks
+        let ms = |v: Option<f32>| {
+            v.map(|ms| format!("{ms:.1}ms"))
+                .unwrap_or_else(|| "-".into())
+        };
+        let ops = |v: Option<u64>| v.map(|n| n.to_string()).unwrap_or_else(|| "-".into());
+        let rows: Vec<Vec<String>> = drives
+            .iter()
+            .map(|d| {
+                let errors = d.read_errors + d.write_errors;
+                vec![
+                    d.name.clone(),
+                    d.model.clone().unwrap_or_else(|| "-".into()),
+                    d.size_bytes.map(human_bytes).unwrap_or_else(|| "-".into()),
+                    ops(d.read_ops_per_sec),
+                    ops(d.write_ops_per_sec),
+                    human_rate(d.read_bytes_per_sec),
+                    human_rate(d.write_bytes_per_sec),
+                    ms(d.read_latency_ms),
+                    ms(d.write_latency_ms),
+                    d.queue_depth
+                        .map(|q| format!("{q:.2}"))
+                        .unwrap_or_else(|| "-".into()),
+                    // Errors since boot are rare and always worth a look
+                    if errors > 0 {
+                        theme.paint(RED_BOLD, &errors.to_string())
+                    } else {
+                        "0".into()
+                    },
+                ]
+            })
+            .collect();
+        write_table(
+            &mut out,
+            "DRIVE",
+            &[
+                "NAME", "MODEL", "SIZE", "R/S", "W/S", "READ", "WRITE", "R-LAT", "W-LAT", "QUEUE",
+                "ERR",
+            ],
+            &[
+                Align::Left,
+                Align::Left,
+                Align::Right,
+                Align::Right,
+                Align::Right,
+                Align::Right,
                 Align::Right,
                 Align::Right,
                 Align::Right,

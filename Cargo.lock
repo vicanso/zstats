@@ -1190,6 +1190,7 @@ dependencies = [
  "jiff",
  "libc",
  "libproc",
+ "plist",
  "serde",
  "serde_json",
  "snafu",

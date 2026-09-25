@@ -32,7 +32,14 @@ five this audit started with. Five are still macOS-only — `phys_footprint`,
 two came out of item 4: `process_footprint`, which is the only three-way
 branch in the crate, and `parse_proc_status_footprint`, gated
 `cfg(any(target_os = "linux", test))` so the reference platform still tests
-it. Three cfg points live outside that file: the template selection
+it. Since then the file gained two more macOS/else pairs of the
+`memory_pressure` shape — `swap_counters` and `kernel_available_percent`,
+plain sysctls — and one whole module, `collector/ioreg.rs`, whose sample
+types compile everywhere while its queries (`gpus`, `drives`, the `ioreg`
+child process) are macOS and its stubs return `None`; the collector's
+diffing and caching around them is platform-neutral, so the Linux
+analogues (`/sys/class/drm/*/gpu_busy_percent`, `/proc/diskstats`) would
+slot in behind the same two functions. Three cfg points live outside that file: the template selection
 (`alerts.rs`), the Windows temperature default (`config.rs`) and
 `Capabilities::current` (`snapshot.rs`). Everything else rides `sysinfo` and
 `starship-battery`, both with real Windows and Linux backends.

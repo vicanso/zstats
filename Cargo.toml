@@ -83,6 +83,11 @@ sysctl = "0.7.1"
 # bindings, no bindgen) is unmaintained and pins `memchr ~2.3`, which
 # collides with sysinfo's `^2.5` — it cannot resolve in this tree.
 libproc = "0.14"
+# Parses `ioreg -a` output (XML plist) for GPU utilisation and
+# block-storage driver statistics. The IORegistry's own API is IOKit —
+# unsafe FFI with no safe wrapper — so the registry is read through the
+# stock `ioreg` tool instead; see `collector/ioreg.rs`
+plist = "1.10"
 
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time"] }

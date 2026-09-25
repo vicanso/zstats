@@ -364,6 +364,33 @@ pub struct CollectorConfig {
     #[serde(with = "duration_serde")]
     pub temperature_refresh_interval: Duration,
 
+    /// Whether to collect GPU utilisation and memory (macOS only today;
+    /// `None` elsewhere, see `Capabilities::gpu`). Read from the
+    /// IORegistry through the `ioreg` tool — the library's one child
+    /// process, bounded by a 1s kill deadline — at ~13ms per read, so it
+    /// runs on its own cadence below rather than every collect.
+    pub collect_gpu: bool,
+
+    /// How often to refresh the GPU sample. The value is the driver's
+    /// instantaneous gauge, so a longer cadence means sparser samples,
+    /// not a smoother average. Zero refreshes every collect.
+    #[serde(with = "duration_serde")]
+    pub gpu_refresh_interval: Duration,
+
+    /// Whether to collect per-drive IO statistics — operations per
+    /// second, service time and queue depth for each physical disk
+    /// (macOS only today; see `Capabilities::drive_io`). Same `ioreg`
+    /// path and cost as the GPU read. These are the figures `disks[]`
+    /// cannot carry: the volume layer exposes bytes only.
+    pub collect_drives: bool,
+
+    /// How often to refresh drive statistics. Rates are diffed across
+    /// the interval, so a longer cadence yields a smoother average, the
+    /// same way `disk_io_refresh_interval` does. Zero refreshes every
+    /// collect.
+    #[serde(with = "duration_serde")]
+    pub drive_refresh_interval: Duration,
+
     /// Custom host labels
     pub labels: HashMap<String, String>,
 
@@ -410,6 +437,13 @@ impl Default for CollectorConfig {
             collect_temperatures: !cfg!(target_os = "windows"),
             // Temps drift over seconds/minutes, not milliseconds
             temperature_refresh_interval: Duration::from_secs(15),
+            // Two ~12ms `ioreg` runs; at 10s that is ~0.25% of one core
+            // for the daemon, the same order as the process table on its
+            // 10s serve cadence. The foreground view forces both to zero
+            collect_gpu: true,
+            gpu_refresh_interval: Duration::from_secs(10),
+            collect_drives: true,
+            drive_refresh_interval: Duration::from_secs(10),
             labels: HashMap::new(),
             collect_timeout: Duration::from_secs(2),
         }

@@ -68,11 +68,14 @@ Config keys for -add (also accepted as key=value). Durations take 500ms /
   temp-interval <dur>         [collector] temperature cadence (default 15s)
   cpu-freq-interval <dur>     [collector] CPU frequency cadence (default 30s)
   battery-interval <dur>      [collector] battery cadence (default 30s)
+  gpu-interval <dur>          [collector] GPU cadence (default 10s; macOS)
+  drive-interval <dur>        [collector] per-drive IOPS/latency cadence
+                              (default 10s; macOS)
   process-boost <cores>       [collector] busy-cores boost (default 30% of cores, 0 = off)
   max-processes <n>           [collector] kept processes (default 50)
   collect-processes | collect-disks | collect-networks | collect-temperatures
-  collect-battery | process-disk-io | process-groups | dedupe-disks
-  per-core-cpu                                         <true|false>
+  collect-battery | collect-gpu | collect-drives | process-disk-io
+  process-groups | dedupe-disks | per-core-cpu         <true|false>
   alert-cpu <pct|name=pct>    [alerts] CPU rules: 5-min avg >= pct (chronic)
                               or 1-min avg >= 3x pct (runaway); name=pct sets
                               a per-process override, e.g. alert-cpu ghostty=100
@@ -137,6 +140,8 @@ fn foreground_config(mut config: CollectorConfig) -> CollectorConfig {
     config.disk_io_refresh_interval = Duration::ZERO;
     config.network_refresh_interval = Duration::ZERO;
     config.temperature_refresh_interval = Duration::ZERO;
+    config.gpu_refresh_interval = Duration::ZERO;
+    config.drive_refresh_interval = Duration::ZERO;
     config
 }
 

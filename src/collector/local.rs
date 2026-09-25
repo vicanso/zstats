@@ -25,12 +25,13 @@ use sysinfo::{
 };
 
 use crate::collector::Collector;
+use crate::collector::ioreg::{self, DriveCounters, GpuSample};
 use crate::config::CollectorConfig;
 use crate::error::CollectError;
 use crate::snapshot::{
-    BatterySnapshot, CpuSnapshot, DiskSnapshot, HostInfo, IoTotalsSnapshot, LoadSnapshot,
-    MemorySnapshot, NetworkSnapshot, PerfLevelSnapshot, ProcessGroupSnapshot, ProcessSnapshot,
-    SystemSnapshot, TemperatureSnapshot,
+    BatterySnapshot, CpuSnapshot, DiskSnapshot, DriveSnapshot, GpuSnapshot, HostInfo,
+    IoTotalsSnapshot, LoadSnapshot, MemorySnapshot, NetworkSnapshot, PerfLevelSnapshot,
+    ProcessGroupSnapshot, ProcessSnapshot, SystemSnapshot, TemperatureSnapshot,
 };
 use crate::utils::rate::rate_per_sec;
 
@@ -43,6 +44,17 @@ const TEMP_CELSIUS_MAX: f32 = 150.0;
 struct DiskCounters {
     total_read_bytes: u64,
     total_written_bytes: u64,
+}
+
+/// The compressor swapper's cumulative counters (macOS sysctls), the
+/// baseline the next collect diffs into `swap_ins_per_sec` and friends
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+struct SwapCounters {
+    swapins: u64,
+    swapouts: u64,
+    /// The kernel's thrash detector; advancing means it fired
+    thrash_detected: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -123,6 +135,16 @@ pub struct LocalCollector {
     battery_manager: Option<starship_battery::Manager>,
     last_battery_refresh: Option<Instant>,
     cached_battery: Option<BatterySnapshot>,
+    /// Previous swap counters and when they were read; the rates in the
+    /// memory snapshot are diffed against these every collect
+    last_swap_counters: Option<(Instant, SwapCounters)>,
+    last_gpu_refresh: Option<Instant>,
+    cached_gpus: Option<Vec<GpuSnapshot>>,
+    last_drive_refresh: Option<Instant>,
+    /// Per-drive cumulative counters from the previous drive refresh,
+    /// keyed on BSD name; replaced wholesale so detached drives drop
+    last_drive_counters: HashMap<String, DriveCounters>,
+    cached_drives: Option<Vec<DriveSnapshot>>,
 }
 
 impl LocalCollector {
@@ -201,6 +223,12 @@ impl LocalCollector {
                 }),
             last_battery_refresh: None,
             cached_battery: None,
+            last_swap_counters: None,
+            last_gpu_refresh: None,
+            cached_gpus: None,
+            last_drive_refresh: None,
+            last_drive_counters: HashMap::new(),
+            cached_drives: None,
         }
     }
 
@@ -341,12 +369,29 @@ impl LocalCollector {
         }
     }
 
-    fn collect_memory(&self) -> MemorySnapshot {
+    fn collect_memory(&mut self) -> MemorySnapshot {
         let (compressed_bytes, pressure_level) = memory_pressure();
         let total_bytes = self.system.total_memory();
         let used_bytes = self.system.used_memory();
         let swap_total_bytes = self.system.total_swap();
         let swap_used_bytes = self.system.used_swap();
+
+        // Swap activity: cumulative sysctl counters diffed against the
+        // previous collect, like every other rate here. A few
+        // microseconds, so no cadence of its own
+        let now = Instant::now();
+        let current = swap_counters();
+        let (swap_ins_per_sec, swap_outs_per_sec, swap_thrashing) =
+            match (current, self.last_swap_counters) {
+                (Some(current), Some((at, prev))) => {
+                    swap_rates(prev, current, now.duration_since(at))
+                }
+                _ => (None, None, None),
+            };
+        if let Some(current) = current {
+            self.last_swap_counters = Some((now, current));
+        }
+
         MemorySnapshot {
             total_bytes,
             used_bytes,
@@ -357,7 +402,70 @@ impl LocalCollector {
             swap_used_percent: ratio_percent(swap_used_bytes, swap_total_bytes),
             compressed_bytes,
             pressure_level,
+            swap_ins_per_sec,
+            swap_outs_per_sec,
+            swap_thrashing,
+            kernel_available_percent: kernel_available_percent(),
         }
+    }
+
+    fn collect_gpus(&mut self) -> Option<Vec<GpuSnapshot>> {
+        if !self.config.collect_gpu {
+            return None;
+        }
+        let due = self.config.gpu_refresh_interval.is_zero()
+            || self
+                .last_gpu_refresh
+                .is_none_or(|t| t.elapsed() >= self.config.gpu_refresh_interval);
+        if !due {
+            return self.cached_gpus.clone();
+        }
+        self.last_gpu_refresh = Some(Instant::now());
+
+        // A failed or timed-out read reports None for this round rather
+        // than a stale cache: the value is an instantaneous gauge, and a
+        // ten-second-old "12% busy" presented as current would be a lie
+        let gpus = ioreg::gpus().map(|samples| samples.into_iter().map(gpu_snapshot).collect());
+        self.cached_gpus = gpus.clone();
+        gpus
+    }
+
+    fn collect_drives(&mut self) -> Option<Vec<DriveSnapshot>> {
+        if !self.config.collect_drives {
+            return None;
+        }
+        let due = self.config.drive_refresh_interval.is_zero()
+            || self
+                .last_drive_refresh
+                .is_none_or(|t| t.elapsed() >= self.config.drive_refresh_interval);
+        if !due {
+            return self.cached_drives.clone();
+        }
+
+        // A failed read leaves the baselines untouched, so the next
+        // successful one still diffs against real counters
+        let Some(current) = ioreg::drives() else {
+            self.last_drive_refresh = Some(Instant::now());
+            self.cached_drives = None;
+            return None;
+        };
+        // Rate diffs span the time since the previous drive refresh
+        let elapsed = self.last_drive_refresh.map(|t| t.elapsed());
+        self.last_drive_refresh = Some(Instant::now());
+
+        let mut counters = HashMap::with_capacity(current.len());
+        let snapshots = current
+            .into_iter()
+            .map(|drive| {
+                let snapshot =
+                    drive_snapshot(self.last_drive_counters.get(&drive.name), &drive, elapsed);
+                counters.insert(drive.name.clone(), drive);
+                snapshot
+            })
+            .collect::<Vec<_>>();
+        self.last_drive_counters = counters;
+        self.cached_drives = Some(snapshots.clone());
+        Some(snapshots)
     }
 
     fn collect_disks(&mut self) -> Option<Vec<DiskSnapshot>> {
@@ -881,11 +989,21 @@ fn sum_optional_rates<'a>(rates: impl IntoIterator<Item = Option<&'a u64>>) -> O
 fn io_totals_from(
     disks: Option<&[DiskSnapshot]>,
     networks: Option<&[NetworkSnapshot]>,
+    drives: Option<&[DriveSnapshot]>,
 ) -> IoTotalsSnapshot {
     let (disk_read_bytes_per_sec, disk_write_bytes_per_sec) = match disks {
         Some(disks) => (
             sum_optional_rates(disks.iter().map(|d| d.read_bytes_per_sec.as_ref())),
             sum_optional_rates(disks.iter().map(|d| d.write_bytes_per_sec.as_ref())),
+        ),
+        None => (None, None),
+    };
+    // Operations come from the DRIVE list; its byte rates are left out of
+    // the totals above because the volume list already counts them
+    let (disk_read_ops_per_sec, disk_write_ops_per_sec) = match drives {
+        Some(drives) => (
+            sum_optional_rates(drives.iter().map(|d| d.read_ops_per_sec.as_ref())),
+            sum_optional_rates(drives.iter().map(|d| d.write_ops_per_sec.as_ref())),
         ),
         None => (None, None),
     };
@@ -913,7 +1031,104 @@ fn io_totals_from(
         disk_write_bytes_per_sec,
         network_received_bytes_per_sec,
         network_transmitted_bytes_per_sec,
+        disk_read_ops_per_sec,
+        disk_write_ops_per_sec,
     }
+}
+
+fn gpu_snapshot(sample: GpuSample) -> GpuSnapshot {
+    GpuSnapshot {
+        name: sample.name,
+        cores: sample.cores,
+        utilization_percent: sample.utilization_percent,
+        renderer_utilization_percent: sample.renderer_utilization_percent,
+        tiler_utilization_percent: sample.tiler_utilization_percent,
+        memory_in_use_bytes: sample.memory_in_use_bytes,
+        memory_allocated_bytes: sample.memory_allocated_bytes,
+    }
+}
+
+/// Average service time per operation over the window, milliseconds.
+/// None when no operation of this kind completed (an average over zero
+/// operations claims nothing) or a counter went backwards (the drive was
+/// re-attached and the baseline belongs to its previous life)
+fn latency_ms(prev_time_ns: u64, time_ns: u64, prev_ops: u64, ops: u64) -> Option<f32> {
+    if ops <= prev_ops || time_ns < prev_time_ns {
+        return None;
+    }
+    let per_op_ns = (time_ns - prev_time_ns) as f64 / (ops - prev_ops) as f64;
+    Some((per_op_ns / 1e6) as f32)
+}
+
+/// Diff one drive's counters against its previous sample into rates.
+/// Everything derived is None without a baseline or a positive window
+fn drive_snapshot(
+    prev: Option<&DriveCounters>,
+    current: &DriveCounters,
+    elapsed: Option<Duration>,
+) -> DriveSnapshot {
+    let diffed = match (prev, elapsed) {
+        (Some(prev), Some(elapsed)) if !elapsed.is_zero() => Some((prev, elapsed)),
+        _ => None,
+    };
+    let rate = |pick: fn(&DriveCounters) -> u64| {
+        diffed.map(|(prev, elapsed)| rate_per_sec(pick(prev), pick(current), elapsed))
+    };
+    // Summed service time over wall-clock time = mean operations in
+    // flight. A backwards counter is a re-attached drive: no claim
+    let queue_depth = diffed.and_then(|(prev, elapsed)| {
+        let busy_ns = current
+            .read_time_ns
+            .checked_sub(prev.read_time_ns)?
+            .checked_add(current.write_time_ns.checked_sub(prev.write_time_ns)?)?;
+        Some((busy_ns as f64 / elapsed.as_nanos() as f64) as f32)
+    });
+    DriveSnapshot {
+        name: current.name.clone(),
+        model: current.model.clone(),
+        size_bytes: current.size_bytes,
+        is_removable: current.is_removable,
+        read_ops_per_sec: rate(|d| d.read_ops),
+        write_ops_per_sec: rate(|d| d.write_ops),
+        read_bytes_per_sec: rate(|d| d.read_bytes),
+        write_bytes_per_sec: rate(|d| d.write_bytes),
+        read_latency_ms: diffed.and_then(|(prev, _)| {
+            latency_ms(
+                prev.read_time_ns,
+                current.read_time_ns,
+                prev.read_ops,
+                current.read_ops,
+            )
+        }),
+        write_latency_ms: diffed.and_then(|(prev, _)| {
+            latency_ms(
+                prev.write_time_ns,
+                current.write_time_ns,
+                prev.write_ops,
+                current.write_ops,
+            )
+        }),
+        queue_depth,
+        read_errors: current.read_errors,
+        write_errors: current.write_errors,
+    }
+}
+
+/// Swap-in / swap-out segment rates plus the thrash verdict over one
+/// window. The thrash detector is a counter: it advanced, or it did not
+fn swap_rates(
+    prev: SwapCounters,
+    current: SwapCounters,
+    elapsed: Duration,
+) -> (Option<u64>, Option<u64>, Option<bool>) {
+    if elapsed.is_zero() {
+        return (None, None, None);
+    }
+    (
+        Some(rate_per_sec(prev.swapins, current.swapins, elapsed)),
+        Some(rate_per_sec(prev.swapouts, current.swapouts, elapsed)),
+        Some(current.thrash_detected > prev.thrash_detected),
+    )
 }
 
 /// Whether overall load (in logical-core units) should force a process
@@ -1408,6 +1623,39 @@ fn memory_pressure() -> (Option<u64>, Option<u32>) {
     (None, None)
 }
 
+/// The compressor swapper's cumulative segment counters and its thrash
+/// detector. These are the `_total` counters, not the
+/// `vm.compressor.segment.*` sysctls, which look like counters but are
+/// state gauges (observed decreasing) and cannot be diffed
+#[cfg(target_os = "macos")]
+fn swap_counters() -> Option<SwapCounters> {
+    Some(SwapCounters {
+        swapins: sysctl_u64("vm.compressor.swapper.swapins_total")?,
+        swapouts: sysctl_u64("vm.compressor.swapper.swapouts_total")?,
+        thrash_detected: sysctl_u64("vm.compressor_swapper_swapout_thrashing_detected")
+            .unwrap_or(0),
+    })
+}
+
+#[cfg(not(target_os = "macos"))]
+fn swap_counters() -> Option<SwapCounters> {
+    None
+}
+
+/// `kern.memorystatus_level`: the kernel's available-memory percentage,
+/// the input its pressure verdict is computed from
+#[cfg(target_os = "macos")]
+fn kernel_available_percent() -> Option<u32> {
+    sysctl_u64("kern.memorystatus_level")
+        .and_then(|v| u32::try_from(v).ok())
+        .filter(|v| *v <= 100)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn kernel_available_percent() -> Option<u32> {
+    None
+}
+
 /// Split per-core usage into per-performance-level averages. `levels` is
 /// highest-performance first (perflevel0), while core NUMBERING starts
 /// with the LOWEST level — E-cores occupy the first indices on Apple
@@ -1459,7 +1707,8 @@ impl Collector for LocalCollector {
 
         let disks = self.collect_disks();
         let networks = self.collect_networks();
-        let io_totals = io_totals_from(disks.as_deref(), networks.as_deref());
+        let drives = self.collect_drives();
+        let io_totals = io_totals_from(disks.as_deref(), networks.as_deref(), drives.as_deref());
 
         Ok(SystemSnapshot {
             timestamp: Timestamp::now(),
@@ -1472,6 +1721,8 @@ impl Collector for LocalCollector {
             process_groups: self.collect_process_groups(processes_due, process_elapsed),
             total_processes: self.collect_total_processes(),
             battery: self.collect_battery(),
+            gpus: self.collect_gpus(),
+            drives,
             load: self.collect_load(),
             temperatures: self.collect_temperatures(),
             io_totals,
@@ -2100,11 +2351,153 @@ mod tests {
                 transmitted_errors_per_sec: None,
             },
         ];
-        let totals = io_totals_from(Some(&disks), Some(&nets));
+        let drives = [
+            drive_snapshot(
+                Some(&counters("disk0", 1_000, 500, 1 << 20, 1 << 19, 0, 0)),
+                &counters("disk0", 1_100, 540, 2 << 20, 1 << 20, 0, 0),
+                Some(Duration::from_secs(2)),
+            ),
+            // No baseline yet: contributes nothing, but does not veto
+            drive_snapshot(None, &counters("disk4", 5, 5, 0, 0, 0, 0), None),
+        ];
+        let totals = io_totals_from(Some(&disks), Some(&nets), Some(&drives));
         assert_eq!(totals.disk_read_bytes_per_sec, Some(15));
         assert_eq!(totals.disk_write_bytes_per_sec, Some(20));
         assert_eq!(totals.network_received_bytes_per_sec, Some(103));
         assert_eq!(totals.network_transmitted_bytes_per_sec, Some(53));
-        assert!(io_totals_from(None, None).disk_read_bytes_per_sec.is_none());
+        assert_eq!(totals.disk_read_ops_per_sec, Some(50));
+        assert_eq!(totals.disk_write_ops_per_sec, Some(20));
+        let none = io_totals_from(None, None, None);
+        assert!(none.disk_read_bytes_per_sec.is_none());
+        assert!(none.disk_read_ops_per_sec.is_none());
+    }
+
+    fn counters(
+        name: &str,
+        read_ops: u64,
+        write_ops: u64,
+        read_bytes: u64,
+        write_bytes: u64,
+        read_time_ns: u64,
+        write_time_ns: u64,
+    ) -> DriveCounters {
+        DriveCounters {
+            name: name.into(),
+            model: Some("Test SSD".into()),
+            size_bytes: Some(1 << 40),
+            is_removable: false,
+            read_ops,
+            write_ops,
+            read_bytes,
+            write_bytes,
+            read_time_ns,
+            write_time_ns,
+            read_errors: 0,
+            write_errors: 2,
+        }
+    }
+
+    #[test]
+    fn a_drive_without_a_baseline_claims_no_rates() {
+        let snap = drive_snapshot(None, &counters("disk0", 10, 10, 10, 10, 10, 10), None);
+        assert_eq!(snap.name, "disk0");
+        assert_eq!(snap.model.as_deref(), Some("Test SSD"));
+        assert!(snap.read_ops_per_sec.is_none());
+        assert!(snap.write_bytes_per_sec.is_none());
+        assert!(snap.read_latency_ms.is_none());
+        assert!(snap.queue_depth.is_none());
+        // Cumulative figures ride along regardless
+        assert_eq!(snap.write_errors, 2);
+        // A baseline with a zero-length window is the same as none
+        let same = counters("disk0", 10, 10, 10, 10, 10, 10);
+        assert!(
+            drive_snapshot(Some(&same), &same, Some(Duration::ZERO))
+                .read_ops_per_sec
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn drive_rates_latency_and_queue_depth_diff_the_counters() {
+        // 2s window: 200 reads taking 1ms each, 100 writes taking 4ms
+        // each. Busy time 0.6s over 2s = 0.3 operations in flight
+        let prev = counters("disk0", 1_000, 500, 0, 0, 5_000_000_000, 1_000_000_000);
+        let cur = counters(
+            "disk0",
+            1_200,
+            600,
+            4 << 20,
+            2 << 20,
+            5_000_000_000 + 200 * 1_000_000,
+            1_000_000_000 + 100 * 4_000_000,
+        );
+        let snap = drive_snapshot(Some(&prev), &cur, Some(Duration::from_secs(2)));
+        assert_eq!(snap.read_ops_per_sec, Some(100));
+        assert_eq!(snap.write_ops_per_sec, Some(50));
+        assert_eq!(snap.read_bytes_per_sec, Some(2 << 20));
+        assert_eq!(snap.write_bytes_per_sec, Some(1 << 20));
+        assert_eq!(snap.read_latency_ms, Some(1.0));
+        assert_eq!(snap.write_latency_ms, Some(4.0));
+        assert!((snap.queue_depth.unwrap() - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_window_with_no_operations_has_no_latency() {
+        let prev = counters("disk0", 1_000, 500, 0, 0, 5_000, 1_000);
+        let cur = counters("disk0", 1_000, 600, 0, 0, 5_000, 2_000);
+        let snap = drive_snapshot(Some(&prev), &cur, Some(Duration::from_secs(1)));
+        assert_eq!(snap.read_ops_per_sec, Some(0));
+        assert!(snap.read_latency_ms.is_none(), "no reads: no average");
+        assert!(snap.write_latency_ms.is_some());
+    }
+
+    #[test]
+    fn a_reattached_drive_makes_no_claim_against_its_old_life() {
+        // Every counter smaller than the baseline: this is not the same
+        // drive's history any more
+        let prev = counters("disk4", 1_000, 500, 1 << 30, 1 << 30, 9_000, 9_000);
+        let cur = counters("disk4", 10, 5, 100, 100, 50, 50);
+        let snap = drive_snapshot(Some(&prev), &cur, Some(Duration::from_secs(1)));
+        assert_eq!(snap.read_ops_per_sec, Some(0), "rate helper's wrap rule");
+        assert!(snap.read_latency_ms.is_none());
+        assert!(snap.write_latency_ms.is_none());
+        assert!(snap.queue_depth.is_none());
+    }
+
+    #[test]
+    fn swap_rates_are_segments_per_second_and_thrash_is_an_advance() {
+        let prev = SwapCounters {
+            swapins: 1_000,
+            swapouts: 2_000,
+            thrash_detected: 3,
+        };
+        let cur = SwapCounters {
+            swapins: 1_100,
+            swapouts: 2_400,
+            thrash_detected: 3,
+        };
+        assert_eq!(
+            swap_rates(prev, cur, Duration::from_secs(2)),
+            (Some(50), Some(200), Some(false))
+        );
+        let thrashed = SwapCounters {
+            thrash_detected: 4,
+            ..cur
+        };
+        assert_eq!(
+            swap_rates(prev, thrashed, Duration::from_secs(2)).2,
+            Some(true)
+        );
+        // No window, no claim
+        assert_eq!(swap_rates(prev, cur, Duration::ZERO), (None, None, None));
+        // Counters that went backwards (reboot-style reset) read as zero
+        assert_eq!(swap_rates(cur, prev, Duration::from_secs(1)).0, Some(0));
+    }
+
+    #[test]
+    fn latency_needs_operations_and_a_forward_clock() {
+        assert_eq!(latency_ms(0, 3_000_000, 0, 3), Some(1.0));
+        assert!(latency_ms(0, 3_000_000, 5, 5).is_none(), "no ops");
+        assert!(latency_ms(9, 3, 0, 3).is_none(), "time went backwards");
     }
 }

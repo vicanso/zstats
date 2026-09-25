@@ -434,6 +434,17 @@ pub enum AlertDetail {
         swap_used_bytes: u64,
         swap_total_bytes: u64,
         compressed_bytes: Option<u64>,
+        /// Compressor segments swapped in / out per second when this
+        /// fired (`MemorySnapshot::swap_ins_per_sec` and friends). The
+        /// level says the machine is tight; these say how hard it is
+        /// working to stay there — a warning with zero swap activity is
+        /// a machine that has settled, one at hundreds of segments a
+        /// second is still fighting. None where the platform has no
+        /// counters
+        #[serde(default)]
+        swap_ins_per_sec: Option<u64>,
+        #[serde(default)]
+        swap_outs_per_sec: Option<u64>,
         /// Who is holding the memory, biggest first — the actionable
         /// half of this alert. Whole applications where the collector
         /// groups them (you quit Chrome, not `Google Chrome Helper
@@ -555,12 +566,14 @@ impl AlertEvent {
                 swap_used_bytes,
                 swap_total_bytes,
                 compressed_bytes,
+                swap_ins_per_sec,
+                swap_outs_per_sec,
                 top_consumers,
             } => format!(
                 // The names come BEFORE the swap figures on purpose: a
                 // macOS banner truncates, and "what to close" is the
                 // half of this alert a person can act on
-                "{who} memory pressure: {} for {} min{} — swap {:.1}/{:.1} GiB{}",
+                "{who} memory pressure: {} for {} min{} — swap {:.1}/{:.1} GiB{}{}",
                 if *level >= 4 { "critical" } else { "warning" },
                 sustained.as_secs() / 60,
                 consumer_label(top_consumers),
@@ -569,6 +582,7 @@ impl AlertEvent {
                 compressed_bytes
                     .map(|b| format!(", compressor {:.1} GiB", b as f64 / f64::from(1 << 30)))
                     .unwrap_or_default(),
+                swap_activity_label(*swap_ins_per_sec, *swap_outs_per_sec),
             ),
         };
         if let Some(elapsed) = self.repeat_after {
@@ -647,6 +661,18 @@ fn consumer_label(consumers: &[MemoryConsumer]) -> String {
         })
         .collect();
     format!(" — top: {}", list.join(", "))
+}
+
+/// The swap-activity tail of a pressure line: `, swapping 120 out/s
+/// 40 in/s`. Empty when the platform has no counters or nothing moved:
+/// a settled machine gets no clause rather than a pair of zeros
+fn swap_activity_label(ins_per_sec: Option<u64>, outs_per_sec: Option<u64>) -> String {
+    match (ins_per_sec, outs_per_sec) {
+        (Some(ins), Some(outs)) if ins > 0 || outs > 0 => {
+            format!(", swapping {outs} out/s {ins} in/s")
+        }
+        _ => String::new(),
+    }
 }
 
 /// Who is holding the RAM at the moment the kernel called memory short.
@@ -1352,6 +1378,8 @@ impl AlertEngine {
                             swap_used_bytes: snapshot.memory.swap_used_bytes,
                             swap_total_bytes: snapshot.memory.swap_total_bytes,
                             compressed_bytes: snapshot.memory.compressed_bytes,
+                            swap_ins_per_sec: snapshot.memory.swap_ins_per_sec,
+                            swap_outs_per_sec: snapshot.memory.swap_outs_per_sec,
                             // Computed only when the alert actually
                             // fires: it is a sort over the process list,
                             // and every round that stays silent should
@@ -1800,6 +1828,10 @@ mod tests {
                 swap_used_percent: 0.0,
                 compressed_bytes: None,
                 pressure_level: None,
+                swap_ins_per_sec: None,
+                swap_outs_per_sec: None,
+                swap_thrashing: None,
+                kernel_available_percent: None,
             },
             disks: None,
             networks: None,
@@ -1807,6 +1839,8 @@ mod tests {
             process_groups: None,
             total_processes: None,
             battery: None,
+            gpus: None,
+            drives: None,
             load: LoadSnapshot {
                 load1: 0.0,
                 load5: 0.0,

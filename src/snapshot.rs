@@ -65,6 +65,21 @@ pub struct SystemSnapshot {
     #[serde(default)]
     pub battery: Option<BatterySnapshot>,
 
+    /// GPUs; None when GPU collection is disabled, the platform cannot
+    /// report them (see `capabilities.gpu`), or the registry read failed
+    /// this round. Empty means the read ran and found no accelerator.
+    /// Refreshes on its own cadence (`gpu_refresh_interval`)
+    #[serde(default)]
+    pub gpus: Option<Vec<GpuSnapshot>>,
+
+    /// Physical block devices with operation rates and service times;
+    /// None when drive collection is disabled or unsupported
+    /// (`capabilities.drive_io`). Distinct from `disks`, which is per
+    /// volume — see [`DriveSnapshot`]. Refreshes on its own cadence
+    /// (`drive_refresh_interval`)
+    #[serde(default)]
+    pub drives: Option<Vec<DriveSnapshot>>,
+
     /// Load averages
     pub load: LoadSnapshot,
 
@@ -121,6 +136,19 @@ pub struct Capabilities {
     pub memory_pressure: bool,
     /// `CpuSnapshot::perf_levels` can be reported (macOS only)
     pub cpu_perf_levels: bool,
+    /// `SystemSnapshot::gpus` can be reported (macOS only, via the
+    /// IORegistry). Field-level default so a snapshot from an older
+    /// daemon reads false — "that build could not" — rather than failing
+    /// to parse
+    #[serde(default)]
+    pub gpu: bool,
+    /// `SystemSnapshot::drives` can be reported (macOS only)
+    #[serde(default)]
+    pub drive_io: bool,
+    /// `MemorySnapshot::{swap_ins_per_sec, swap_outs_per_sec,
+    /// swap_thrashing, kernel_available_percent}` exist (macOS only)
+    #[serde(default)]
+    pub swap_rates: bool,
 }
 
 impl Capabilities {
@@ -134,6 +162,9 @@ impl Capabilities {
             )),
             memory_pressure: cfg!(target_os = "macos"),
             cpu_perf_levels: cfg!(target_os = "macos"),
+            gpu: cfg!(target_os = "macos"),
+            drive_io: cfg!(target_os = "macos"),
+            swap_rates: cfg!(target_os = "macos"),
         }
     }
 }
@@ -155,6 +186,15 @@ pub struct IoTotalsSnapshot {
     pub network_received_bytes_per_sec: Option<u64>,
     #[serde(default)]
     pub network_transmitted_bytes_per_sec: Option<u64>,
+    /// Sum of `drives[].read_ops_per_sec` — operations, not bytes, and
+    /// from the DRIVE list: the byte totals above come from the volume
+    /// list, and adding the drives' bytes to them would count every
+    /// APFS volume's traffic twice. None when drives are not collected
+    /// or every drive still has `None` rates
+    #[serde(default)]
+    pub disk_read_ops_per_sec: Option<u64>,
+    #[serde(default)]
+    pub disk_write_ops_per_sec: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -266,6 +306,117 @@ pub struct MemorySnapshot {
     /// 4 = critical. None when the platform does not report one
     #[serde(default)]
     pub pressure_level: Option<u32>,
+    /// Compressor segments swapped in per second since the previous
+    /// sample (macOS `vm.compressor.swapper.swapins_total`). The unit is
+    /// the kernel's own — a segment is a bundle of compressed pages, not
+    /// a fixed byte count — so this reads as activity, not throughput:
+    /// `pressure_level` says the machine is tight, this says how hard
+    /// it is working to stay there. None on the first sample and off
+    /// macOS
+    #[serde(default)]
+    pub swap_ins_per_sec: Option<u64>,
+    /// Segments swapped out per second; see `swap_ins_per_sec`
+    #[serde(default)]
+    pub swap_outs_per_sec: Option<u64>,
+    /// Whether the kernel's own thrash detector
+    /// (`vm.compressor_swapper_swapout_thrashing_detected`) advanced
+    /// since the previous sample — the compressor was swapping segments
+    /// out only to bring them straight back. A verdict, like
+    /// `pressure_level`, not a number to threshold. None on the first
+    /// sample and off macOS
+    #[serde(default)]
+    pub swap_thrashing: Option<bool>,
+    /// The kernel's own view of available memory as a percentage of the
+    /// machine (macOS `kern.memorystatus_level`) — the figure its
+    /// memory-status (jetsam) machinery decides on, so it is the one
+    /// `pressure_level` is actually derived from. Differs from
+    /// `available_bytes / total_bytes`, which counts purgeable and
+    /// file-backed pages the kernel does not. None off macOS
+    #[serde(default)]
+    pub kernel_available_percent: Option<u32>,
+}
+
+/// One GPU's utilisation and memory (macOS, via the accelerator driver's
+/// `PerformanceStatistics`).
+///
+/// Utilisation is the driver's instantaneous gauge, not an average over
+/// the refresh interval: a sample says "12% busy right now". There is no
+/// per-process attribution — the registry does not split GPU time by
+/// client — which is why this is a metric and deliberately not an alert
+/// rule: an alert that cannot name a culprit is not actionable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GpuSnapshot {
+    /// Marketing name where the driver publishes one (`Apple M4 Pro`),
+    /// else the driver's registry name
+    pub name: String,
+    /// GPU core count where published
+    #[serde(default)]
+    pub cores: Option<u32>,
+    /// Overall device busy, 0-100
+    pub utilization_percent: f32,
+    /// Renderer (fragment/compute) busy, 0-100, where published
+    #[serde(default)]
+    pub renderer_utilization_percent: Option<f32>,
+    /// Tiler (vertex/geometry) busy, 0-100, where published
+    #[serde(default)]
+    pub tiler_utilization_percent: Option<f32>,
+    /// System memory currently in use by the GPU. Unified memory on Apple
+    /// Silicon, so this competes with `MemorySnapshot::used_bytes`
+    #[serde(default)]
+    pub memory_in_use_bytes: Option<u64>,
+    /// System memory allocated to the GPU (in use plus cached)
+    #[serde(default)]
+    pub memory_allocated_bytes: Option<u64>,
+}
+
+/// One physical block device's IO statistics (macOS, via the
+/// `IOBlockStorageDriver` statistics the `iostat` tool reads).
+///
+/// A DRIVE is the whole disk (`disk0`), not a volume: `disks[]` is per
+/// mount point and APFS puts several volumes on one drive, so the two
+/// lists do not line up one-to-one and are deliberately not joined. This
+/// is where operations per second and service time live — `disks[]` only
+/// has byte rates, because that is all the volume layer exposes.
+///
+/// Every rate is `None` on the first sample, like the other diffed
+/// counters. The latency figures are `None` in a window with no
+/// operations of that kind, since an average over zero operations makes
+/// no claim.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DriveSnapshot {
+    /// BSD name of the whole disk (`disk0`)
+    pub name: String,
+    /// The media's model string (`APPLE SSD AP0512Z`, `Apple Disk Image`)
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub size_bytes: Option<u64>,
+    #[serde(default)]
+    pub is_removable: bool,
+    /// Completed read operations per second over the window
+    pub read_ops_per_sec: Option<u64>,
+    pub write_ops_per_sec: Option<u64>,
+    pub read_bytes_per_sec: Option<u64>,
+    pub write_bytes_per_sec: Option<u64>,
+    /// Average time from the driver receiving a read to its completion,
+    /// milliseconds, over the window's reads. Includes time queued at the
+    /// device, so under a deep queue it grows before the device itself
+    /// slows
+    pub read_latency_ms: Option<f32>,
+    pub write_latency_ms: Option<f32>,
+    /// Average number of operations in flight over the window (summed
+    /// service time / wall clock — Linux `iostat`'s `aqu-sz`). Above 1
+    /// means operations overlapped. This is the closest the driver comes
+    /// to a utilisation figure; it has no "device busy time" counter, so
+    /// a true `%util` cannot be derived
+    pub queue_depth: Option<f32>,
+    /// Errors since boot, cumulative — rare events where the count since
+    /// boot is the actionable number and a per-second rate would be
+    /// zero almost always
+    #[serde(default)]
+    pub read_errors: u64,
+    #[serde(default)]
+    pub write_errors: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

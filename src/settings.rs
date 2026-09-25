@@ -242,9 +242,10 @@ pub struct AlertsConfig {
 /// and interactive key listings
 pub const KNOWN_KEYS: &str = "interval, history, detach, process-interval, \
 disk-interval, disk-storage-interval, network-interval, temp-interval, \
-cpu-freq-interval, battery-interval, process-boost, max-processes, \
+cpu-freq-interval, battery-interval, gpu-interval, drive-interval, \
+process-boost, max-processes, \
 collect-processes, collect-disks, collect-networks, collect-temperatures, \
-collect-battery, process-disk-io, \
+collect-battery, collect-gpu, collect-drives, process-disk-io, \
 process-groups, dedupe-disks, per-core-cpu, alert-cpu, alert-mem, \
 alert-mem-bytes, alert-app-cpu, alert-app-mem, alert-app-mem-bytes, \
 alert-disk, alert-pressure, \
@@ -304,6 +305,8 @@ pub fn apply_add(config: &mut FileConfig, key: &str, value: &str) -> Result<Stri
         "network-interval" => collector_mut(config).network_refresh_interval = millis(key, value)?,
         "temp-interval" => collector_mut(config).temperature_refresh_interval = millis(key, value)?,
         "battery-interval" => collector_mut(config).battery_refresh_interval = millis(key, value)?,
+        "gpu-interval" => collector_mut(config).gpu_refresh_interval = millis(key, value)?,
+        "drive-interval" => collector_mut(config).drive_refresh_interval = millis(key, value)?,
         "cpu-freq-interval" => {
             collector_mut(config).cpu_frequency_refresh_interval = millis(key, value)?
         }
@@ -324,6 +327,8 @@ pub fn apply_add(config: &mut FileConfig, key: &str, value: &str) -> Result<Stri
         "collect-networks" => collector_mut(config).collect_networks = parse(key, value)?,
         "collect-temperatures" => collector_mut(config).collect_temperatures = parse(key, value)?,
         "collect-battery" => collector_mut(config).collect_battery = parse(key, value)?,
+        "collect-gpu" => collector_mut(config).collect_gpu = parse(key, value)?,
+        "collect-drives" => collector_mut(config).collect_drives = parse(key, value)?,
         "process-disk-io" => collector_mut(config).collect_process_disk_io = parse(key, value)?,
         "process-groups" => collector_mut(config).collect_process_groups = parse(key, value)?,
         "dedupe-disks" => collector_mut(config).dedupe_disks = parse(key, value)?,
@@ -486,6 +491,14 @@ pub fn apply_remove(
         "collect-battery" => collector_mut(config).collect_battery = defaults.collect_battery,
         "battery-interval" => {
             collector_mut(config).battery_refresh_interval = defaults.battery_refresh_interval
+        }
+        "collect-gpu" => collector_mut(config).collect_gpu = defaults.collect_gpu,
+        "gpu-interval" => {
+            collector_mut(config).gpu_refresh_interval = defaults.gpu_refresh_interval
+        }
+        "collect-drives" => collector_mut(config).collect_drives = defaults.collect_drives,
+        "drive-interval" => {
+            collector_mut(config).drive_refresh_interval = defaults.drive_refresh_interval
         }
         "process-disk-io" => {
             collector_mut(config).collect_process_disk_io = defaults.collect_process_disk_io

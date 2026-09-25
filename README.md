@@ -48,11 +48,15 @@ Collector (trait, sync) ──SystemSnapshot──▶ Scheduler ──concurrent
 
 - **`SystemSnapshot` is the single data contract**: host info (including
   uptime), CPU (overall, per-core, frequency on a slower cadence),
-  memory/swap, load averages, hardware temperatures (slow cadence; platform
-  sensors with garbage values filtered), and — each individually toggleable —
-  disks (capacity + IO rates, kind, removable; optional per-device dedupe),
-  network interfaces (rx/tx byte/packet/error rates), and processes (top-N
-  by CPU and by memory, with command lines, virtual memory, run time, and
+  memory/swap (on macOS also the compressor's swap-in/out activity, its
+  thrash verdict and the kernel's own available-memory figure), load
+  averages, hardware temperatures (slow cadence; platform sensors with
+  garbage values filtered), and — each individually toggleable — disks
+  (capacity + IO rates, kind, removable; optional per-device dedupe),
+  drives (per physical disk: IOPS, service time, queue depth, errors;
+  macOS), GPUs (utilisation and memory per accelerator; macOS), network
+  interfaces (rx/tx byte/packet/error rates), and processes (top-N by CPU
+  and by memory, with command lines, virtual memory, run time, and
   optional per-process disk IO). Serde-serializable; timestamps are RFC 3339
   (jiff). Process lists are `Arc`-shared so cloning a snapshot is cheap.
 - **Rate metrics are computed internally by diffing** cumulative counters
@@ -127,6 +131,8 @@ expensive subsystems are opt-out and throttled (`CollectorConfig`):
 | `cpu_frequency_refresh_interval` | 30s | CPU frequency refreshes on its own cadence; usage still every collect |
 | `process_refresh_interval` | 0 (every collect) | Throttle the process list; the last list is reused between refreshes |
 | `collect_battery` | `true` | Charge, health, cycles, temperature and power draw of the main battery (`None` on machines without one) |
+| `collect_gpu` / `gpu_refresh_interval` | `true` / 10s | GPU utilisation and memory per accelerator, read from the IORegistry via the stock `ioreg` tool (~13ms, the library's one child process, killed after 1s if the registry stalls). macOS only; `None` elsewhere |
+| `collect_drives` / `drive_refresh_interval` | `true` / 10s | Per physical disk: IOPS, average service time, mean queue depth, errors since boot — what the volume layer cannot report. Same `ioreg` path; rates diff across the cadence. macOS only |
 | `process_boost_cpu_cores` | auto: 30% of cores | While overall load is ≥ this many logical cores of work, the process list refreshes every collect. Unset = 30% of the machine's logical cores; explicit value pins the bar in core units; 0 = off |
 | `collect_process_disk_io` | `false` | Per-process read/write byte rates (extra refresh cost when on) |
 | `max_processes` | 50 | Kept processes; the budget is split between top-by-CPU and top-by-memory so idle memory hogs stay visible |

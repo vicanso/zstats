@@ -36,16 +36,21 @@ SystemSnapshot
 │   └── perf_levels[]    PerfLevelSnapshot  (macOS P/E clusters)
 ├── memory               MemorySnapshot     (always collected)
 │   ├── used_percent / swap_used_percent    (derived ratios)
-│   └── compressed_bytes / pressure_level   (macOS)
+│   ├── compressed_bytes / pressure_level   (macOS)
+│   └── swap_ins_per_sec / swap_outs_per_sec / swap_thrashing /
+│       kernel_available_percent            (macOS)
 ├── load                 LoadSnapshot       (always collected)
-├── disks[]              Option<…>          toggleable
+├── disks[]              Option<…>          toggleable (per volume)
+├── drives[]             Option<…>          toggleable (per physical disk; macOS)
 ├── networks[]           Option<…>          toggleable
 ├── processes[]          Option<Arc<…>>     toggleable, top-N
 ├── process_groups[]     Option<Arc<…>>     needs processes
 ├── total_processes      Option<u32>
 ├── temperatures[]       Option<…>          toggleable
 ├── battery              Option<…>          toggleable / no battery
+├── gpus[]               Option<…>          toggleable (macOS)
 ├── io_totals            IoTotalsSnapshot   pure sum of per-device rates
+├── capabilities         Capabilities       what this BUILD can measure
 └── extras               reserved
 ```
 
@@ -100,6 +105,9 @@ SystemSnapshot
 | `swap_used_percent` | 0–100 | always | Pure ratio: `swap_used / swap_total * 100` (0 if no swap) |
 | `compressed_bytes` | bytes | **macOS only** | Growth here precedes any visible trouble; the honest "pressure is building" signal |
 | `pressure_level` | 1 / 2 / 4 | **macOS only** | `1` normal, `2` warning, `4` critical — the kernel's own verdict. Map to green/amber/red; it is the single best memory indicator on macOS |
+| `swap_ins_per_sec`, `swap_outs_per_sec` | segments/s | **macOS only** | Compressor segments moved per second — the kernel's unit, **not bytes**, so show them as activity ("out 120/s") and never convert. `pressure_level` says the machine is tight; these say how hard it is working to stay there. `None` on the first sample |
+| `swap_thrashing` | bool | **macOS only** | The kernel's own thrash detector advanced since the last sample. A verdict, like `pressure_level`: paint it red, do not threshold it |
+| `kernel_available_percent` | 0–100 | **macOS only** | `kern.memorystatus_level`: the available-memory figure the kernel's pressure verdict is derived from. Lower than `available_bytes / total` because it excludes what the kernel will not reclaim; show it beside the verdict, not beside `used_percent` |
 
 ### 3.4 Disks — `disks[]` *(toggleable)*
 
@@ -142,6 +150,7 @@ disk dedupe). **No extra system calls.** Fields are independent `Option`s.
 | `disk_write_bytes_per_sec` | B/s | Same for writes |
 | `network_received_bytes_per_sec` | B/s | Sum of all interfaces when `networks` is collected; `Some(0)` is valid on a quiet first sample. `None` only when network collection is off |
 | `network_transmitted_bytes_per_sec` | B/s | Same for transmit |
+| `disk_read_ops_per_sec`, `disk_write_ops_per_sec` | ops/s | Sum of `drives[]` operation rates (macOS). Operations only — the drives' **bytes** are deliberately not added to the two byte totals above, which already come from the volume list; adding both would count every APFS volume twice. `None` when drives are off or still without a baseline |
 
 > Prefer `io_totals` for an overview "how busy is storage / the wire" tile.
 > Do not re-sum the tables in the frontend unless you intentionally filter
@@ -252,6 +261,53 @@ readable" (common on Windows/WMI) — distinct from `None` = disabled.
 
 **Deliberate:** there is no battery alert rule and there will not be one — the
 OS already warns about low battery, and a second warning is pure noise.
+
+### 3.12 GPUs — `gpus[]` *(toggleable, macOS)*
+
+Read from the IORegistry's accelerator driver (`PerformanceStatistics`)
+through the stock `ioreg` tool — no root, no private API, ~13ms per read on
+its own cadence (`gpu_refresh_interval`, default 10s). One entry per GPU.
+
+| Field | Unit | Notes |
+|---|---|---|
+| `name` | String | Marketing name where published (`Apple M4 Pro`), else the driver's registry name |
+| `cores` | count | GPU cores, where published |
+| `utilization_percent` | 0–100 | Device busy. An **instantaneous gauge**, not an average over the cadence: "12% right now". Chart it as samples, not as a smoothed rate |
+| `renderer_utilization_percent`, `tiler_utilization_percent` | 0–100 | The two halves of the pipeline, where published |
+| `memory_in_use_bytes`, `memory_allocated_bytes` | bytes | System memory the GPU holds. Unified memory on Apple Silicon — this competes with `memory.used_bytes`, and is where an Electron app's GPU process actually lives |
+
+`None` when disabled, off macOS (`capabilities.gpu` is false), or when the
+registry read failed or timed out this round — a stale "12% busy" presented
+as current would be a lie, so nothing is cached across a failure. **No alert
+rule**: the registry has no per-process split, so a GPU alert could never
+name a culprit.
+
+### 3.13 Drives — `drives[]` *(toggleable, macOS)*
+
+Per **physical disk** (`disk0`), not per volume — `disks[]` is per mount
+point, and APFS puts several volumes on one drive, so the two lists do not
+line up and are deliberately not joined. This is the list that carries
+operations, service time and queue depth; the volume layer exposes bytes
+only. Source: the `IOBlockStorageDriver` statistics `iostat` reads, via
+`ioreg`, on `drive_refresh_interval` (default 10s; rates diff across it, so
+a longer cadence smooths).
+
+| Field | Unit | Notes |
+|---|---|---|
+| `name` | String | BSD name of the whole disk (`disk0`) |
+| `model` | String | `APPLE SSD AP0512Z`, `Apple Disk Image` |
+| `size_bytes` | bytes | |
+| `is_removable` | bool | |
+| `read_ops_per_sec`, `write_ops_per_sec` | ops/s | IOPS. A drive can be saturated by small random IO while its byte rate looks idle — show these next to the byte rates, not instead of them |
+| `read_bytes_per_sec`, `write_bytes_per_sec` | B/s | Same quantity `disks[]` has, at drive granularity |
+| `read_latency_ms`, `write_latency_ms` | ms | Average time from the driver receiving an operation to its completion, over the window. Includes device queueing, so it climbs under load before the device itself slows. `None` in a window with no operations of that kind — an average over zero operations claims nothing |
+| `queue_depth` | ops | Mean operations in flight over the window (summed service time ÷ wall clock; Linux `iostat`'s `aqu-sz`). Above 1 = operations overlapped. This is the closest the driver comes to a utilisation figure — it publishes no "device busy time", so a true `%util` that stops at 100 cannot be derived, and a UI must not draw this as one |
+| `read_errors`, `write_errors` | count | **Since boot, cumulative.** Rare events where the total is the actionable number; any non-zero deserves a red mark |
+
+All rates are `None` on the first sample. A counter that went backwards (the
+drive was detached and re-attached) yields `None` for that window rather than
+a diff against the previous drive's life. `None` for the whole list when
+disabled or off macOS (`capabilities.drive_io`).
 
 ---
 
@@ -389,15 +445,18 @@ apply_remove}` — a preferences panel should go through `apply_add`, since it
 carries the validation.
 
 **Collection toggles** — `collect-processes`, `collect-disks`,
-`collect-networks`, `collect-temperatures`, `collect-battery`,
-`process-groups`, `process-disk-io`, `per-core-cpu`, `dedupe-disks`,
-`max-processes` (50), `process-boost` (default auto: 30% of the machine's logical cores; an explicit value is a bar in core units, 0 = off).
+`collect-networks`, `collect-temperatures`, `collect-battery`, `collect-gpu`,
+`collect-drives`, `process-groups`, `process-disk-io`, `per-core-cpu`,
+`dedupe-disks`, `max-processes` (50), `process-boost` (default auto: 30% of
+the machine's logical cores; an explicit value is a bar in core units, 0 =
+off).
 
 **Cadences** — `interval` (daemon sampling), `process-interval`,
 `disk-interval`, `disk-storage-interval` (60s), `network-interval`,
 `temp-interval` (15s), `cpu-freq-interval` (30s), `battery-interval` (30s),
-`history` (daemon ring buffer span). Durations accept `500ms` / `2s` / `5m` /
-`1h` or a bare integer in milliseconds.
+`gpu-interval` (10s), `drive-interval` (10s), `history` (daemon ring buffer
+span). Durations accept `500ms` / `2s` / `5m` / `1h` or a bare integer in
+milliseconds.
 
 **Alert thresholds** — `alert-cpu` (30 single-core %), `alert-mem` (25% of
 total) with `alert-mem-bytes` (4GiB ceiling, whichever is lower),
@@ -449,10 +508,10 @@ A mapping from the data above to views, as a starting point.
 | View | Primary data | Notes |
 |---|---|---|
 | **Tray / menu bar** | `cpu.usage_percent`, `memory.pressure_level`, active alert count | One glance; pressure level is the better memory signal than used% |
-| **Overview** | CPU (+ `brand`, `perf_levels`), memory (`used_percent` + compressed, pressure), load, uptime, `io_totals`, `battery.power_watts` | The tiles that answer "is anything wrong right now". Use `io_totals` for a single disk/net throughput strip |
+| **Overview** | CPU (+ `brand`, `perf_levels`), `gpus[].utilization_percent`, memory (`used_percent` + compressed, pressure, `swap_*_per_sec`, `swap_thrashing`), load, uptime, `io_totals`, `battery.power_watts` | The tiles that answer "is anything wrong right now". Use `io_totals` for a single disk/net throughput strip, with `disk_*_ops_per_sec` beside the bytes |
 | **Processes** | `processes[]` ranked by `rolling::ProcessStats` | Header shows "N of `total_processes`" |
 | **Applications** | `process_groups[]` | The row users actually think in; expand to members via `parent_pid` |
-| **Storage** | `disks[]` (+ `used_percent`, `io_totals.disk_*`) | Capacity is 60s-stale by design; IO rates are live; prefer field `used_percent` over recomputing |
+| **Storage** | `disks[]` (+ `used_percent`, `io_totals.disk_*`), `drives[]` | Capacity is 60s-stale by design; IO rates are live; prefer field `used_percent` over recomputing. Volumes answer "is it full", drives answer "is it slow" (`queue_depth`, `*_latency_ms`, `*_errors`) — two panels, not one joined table |
 | **Network** | `networks[]` (+ `io_totals.network_*`) | Fixed row count, stable ordering; machine total is already in `io_totals` |
 | **Sensors & power** | `temperatures[]`, `battery` | Both platform-flaky — design for "unavailable" as a normal state |
 | **Alerts** | `AlertEvent` stream, grouped by episode | Colour by `severity()`, icon by `kind()`, click-through via `subject` |
@@ -469,27 +528,35 @@ all need private APIs or hand-written FFI on macOS.
 
 | Metric | Why not |
 |---|---|
-| **GPU utilisation** | Needs the private IOReport API or shelling out to `powermetrics` (root). The one genuinely valuable gap left. |
-| Disk IOPS / latency / util% (busy time) | sysinfo exposes **byte** counters only (`io_totals` and per-disk B/s are those). macOS busy-time/util needs IOKit (`IOBlockStorageDriver`). Capacity `used_percent` **is** available and is not the same thing |
-| Swap in/out rates, page in/out rates | Only via Mach `host_statistics64` (unsafe FFI). The `vm.compressor.segment.*` sysctls look like counters but are gauges — deriving rates from them would print wrong numbers. `swap_used_percent` is a level, not a rate |
+| Disk **util%** (device busy time) | `IOBlockStorageDriver` publishes summed service time but no "device had an operation in flight" clock, so `drives[].queue_depth` (mean in-flight operations) is the honest figure; a `%util` that stops at 100 cannot be derived from it. Its `Latency Time` counters are also unpopulated on Apple SSDs, which is why `*_latency_ms` derives from total time ÷ operations |
+| Page in/out rates (file-backed paging) | Only via Mach `host_statistics64` (unsafe FFI). The **compressor swapper's** counters are a different thing and *are* exposed (`swap_ins_per_sec` / `swap_outs_per_sec`); the `vm.compressor.segment.*` sysctls that look like counters are gauges and stay unused |
+| Per-process GPU time | The accelerator's `PerformanceStatistics` is device-wide; per-client accounting is private IOReport. So `gpus[]` is a metric, never an alert |
 | Per-process network IO | Needs private APIs on macOS; without attribution a network alert cannot name a culprit, so it would not be actionable |
 | Thread counts | sysinfo's `tasks()` is documented Linux-only and returns nothing on macOS |
 | Per-cluster frequency / power | Root-only `powermetrics` or private IOReport. `per_core_frequency_mhz` / `frequency_mhz` are OS-reported nominal values only |
 
+Three former entries in this table — GPU utilisation, disk IOPS / service
+time, swap in/out rates — were rejected on the belief that they needed IOKit
+or Mach FFI. Probing the machine showed otherwise: the IORegistry is readable
+without root through the stock `ioreg` tool (XML plist out, ~12ms per query,
+the library's one child process, killed at a 1s deadline), and the swapper's
+`_total` counters are ordinary sysctls. They are now §3.12, §3.13 and §3.3.
+
 ### Platform coverage
 
 macOS is the reference platform. Linux and Windows compile and run, with
-gaps: `perf_levels`, `compressed_bytes` and `pressure_level` are macOS-only
-(the Linux analogues — sysfs CPU capacity, PSI — are known future work);
-Windows load averages are emulated and temperatures are usually empty (and
-so `collect_temperatures` defaults to **false** there — `sysinfo` reaches
-them through WMI, which initialises COM process-wide on the collector
-thread).
+gaps: `perf_levels`, `compressed_bytes`, `pressure_level`, the swap activity
+fields, `gpus[]` and `drives[]` are macOS-only (the Linux analogues — sysfs
+CPU capacity, PSI, `/sys/class/drm/*/gpu_busy_percent`, `/proc/diskstats` —
+are known future work); Windows load averages are emulated and temperatures
+are usually empty (and so `collect_temperatures` defaults to **false** there
+— `sysinfo` reaches them through WMI, which initialises COM process-wide on
+the collector thread).
 
 Rather than guess from its own build, a frontend should read
 `capabilities` off the snapshot — `memory_footprint`, `memory_pressure`,
-`cpu_perf_levels`, each a property of the build that produced the
-snapshot. It answers "this platform has no such concept" and nothing
+`cpu_perf_levels`, `gpu`, `drive_io`, `swap_rates`, each a property of the
+build that produced the snapshot. It answers "this platform has no such concept" and nothing
 else: a `None` that means "the kernel refused for this process" or "not
 sampled yet" still looks the same. The alert engine exposes the matching
 question for rules: `ActiveThresholds::supports(AlertKind::Pressure)` is

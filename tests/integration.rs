@@ -277,6 +277,81 @@ fn battery_is_optional_and_cached_between_refreshes() {
 }
 
 #[test]
+fn gpus_drives_and_swap_activity_follow_capabilities_and_toggles() {
+    let mut collector = LocalCollector::new(CollectorConfig {
+        collect_processes: false,
+        // Every collect, so the second sample has a drive baseline
+        gpu_refresh_interval: Duration::ZERO,
+        drive_refresh_interval: Duration::ZERO,
+        ..Default::default()
+    });
+    let first = collector.collect().expect("first collect");
+    // The first sample has no diff baseline
+    for drive in first.drives.iter().flatten() {
+        assert!(drive.read_ops_per_sec.is_none());
+        assert!(drive.queue_depth.is_none());
+    }
+    assert!(first.memory.swap_ins_per_sec.is_none());
+    assert!(first.memory.swap_thrashing.is_none());
+
+    std::thread::sleep(Duration::from_millis(200));
+    let second = collector.collect().expect("second collect");
+
+    let caps = second.capabilities;
+    // Off-platform the fields are None and the capabilities say so; on
+    // the reference platform the registry must actually answer
+    if !caps.gpu {
+        assert!(second.gpus.is_none());
+    }
+    if !caps.drive_io {
+        assert!(second.drives.is_none());
+        assert!(second.io_totals.disk_read_ops_per_sec.is_none());
+    }
+    if !caps.swap_rates {
+        assert!(second.memory.swap_ins_per_sec.is_none());
+        assert!(second.memory.kernel_available_percent.is_none());
+    }
+    #[cfg(target_os = "macos")]
+    {
+        assert!(caps.gpu && caps.drive_io && caps.swap_rates);
+        let gpus = second.gpus.as_ref().expect("ioreg answers on macOS");
+        for gpu in gpus {
+            assert!(!gpu.name.is_empty());
+            assert!((0.0..=100.0).contains(&gpu.utilization_percent));
+        }
+        let drives = second.drives.as_ref().expect("ioreg answers on macOS");
+        let internal = drives
+            .iter()
+            .find(|d| d.name == "disk0")
+            .expect("the boot drive is a whole disk");
+        assert!(internal.read_ops_per_sec.is_some());
+        assert!(internal.write_ops_per_sec.is_some());
+        assert!(internal.queue_depth.is_some());
+        assert!(internal.size_bytes.is_some());
+        assert!(second.io_totals.disk_read_ops_per_sec.is_some());
+        assert!(second.memory.swap_ins_per_sec.is_some());
+        assert!(second.memory.swap_outs_per_sec.is_some());
+        assert!(second.memory.swap_thrashing.is_some());
+        let avail = second
+            .memory
+            .kernel_available_percent
+            .expect("kern.memorystatus_level");
+        assert!(avail <= 100);
+    }
+
+    let mut collector = LocalCollector::new(CollectorConfig {
+        collect_processes: false,
+        collect_gpu: false,
+        collect_drives: false,
+        ..Default::default()
+    });
+    let snapshot = collector.collect().expect("collect");
+    assert!(snapshot.gpus.is_none());
+    assert!(snapshot.drives.is_none());
+    assert!(snapshot.io_totals.disk_read_ops_per_sec.is_none());
+}
+
+#[test]
 fn process_groups_aggregate_trees_and_respect_toggle_and_cache() {
     let max_processes = CollectorConfig::default().max_processes;
     let mut collector = LocalCollector::new(CollectorConfig {

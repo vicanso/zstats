@@ -70,6 +70,26 @@ network_refresh_interval = "0s"
 collect_battery = true
 battery_refresh_interval = "30s"
 
+# ------------------------------------------------------------------------ gpu
+# GPU utilisation (device / renderer / tiler) and the system memory it
+# holds, per GPU. macOS only today: read from the IORegistry through the
+# stock `ioreg` tool (the collector's one child process, killed after 1s
+# if the registry stalls), ~13ms per read, hence its own cadence. The
+# value is the driver's instantaneous gauge, so the cadence sets how
+# often you sample, not how much you smooth. No alert rule: the registry
+# has no per-process split, so a GPU alert could never name a culprit
+collect_gpu = true
+gpu_refresh_interval = "10s"
+
+# --------------------------------------------------------------------- drives
+# Per physical disk (disk0, not a volume): operations per second, average
+# service time, mean queue depth, errors since boot — the figures the
+# volume layer behind collect_disks cannot provide. Same ioreg path and
+# cost as the GPU read; rates diff across the cadence, so a longer one
+# smooths. macOS only today
+collect_drives = true
+drive_refresh_interval = "10s"
+
 # --------------------------------------------------------------- temperatures
 # Hardware sensors via sysinfo Components; platform-dependent, implausible
 # firmware readings are filtered out

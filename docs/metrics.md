@@ -265,8 +265,18 @@ OS already warns about low battery, and a second warning is pure noise.
 ### 3.12 GPUs — `gpus[]` *(toggleable, macOS)*
 
 Read from the IORegistry's accelerator driver (`PerformanceStatistics`)
-through the stock `ioreg` tool — no root, no private API, ~13ms per read on
-its own cadence (`gpu_refresh_interval`, default 10s). One entry per GPU.
+through the stock `ioreg` tool — no root, no private API — on its own cadence
+(`gpu_refresh_interval`, default 10s). One entry per GPU.
+
+**Cost.** A read measured 11-13 ms of CPU run back to back, but ~45 ms at a
+real cadence, reads seconds apart, child process included: the work lands on
+a core that has idled down (M4 Pro, 2026-09-25: GPU ~46 ms, drives ~41 ms,
+both in one collect ~66 ms, against ~36 ms for the process-table walk under
+the same conditions). At the 10s defaults GPU and drives together are
+~0.66% of one core. A frontend that shows them on one screen only can switch
+both at runtime with `LocalCollector::set_collect_gpu` /
+`set_collect_drives` (or the same pair on `Monitor`), keeping every other
+channel's baselines, which rebuilding the collector would discard.
 
 | Field | Unit | Notes |
 |---|---|---|
@@ -290,7 +300,7 @@ line up and are deliberately not joined. This is the list that carries
 operations, service time and queue depth; the volume layer exposes bytes
 only. Source: the `IOBlockStorageDriver` statistics `iostat` reads, via
 `ioreg`, on `drive_refresh_interval` (default 10s; rates diff across it, so
-a longer cadence smooths).
+a longer cadence smooths). Same cost as the GPU read (§3.12).
 
 | Field | Unit | Notes |
 |---|---|---|
@@ -304,10 +314,12 @@ a longer cadence smooths).
 | `queue_depth` | ops | Mean operations in flight over the window (summed service time ÷ wall clock; Linux `iostat`'s `aqu-sz`). Above 1 = operations overlapped. This is the closest the driver comes to a utilisation figure — it publishes no "device busy time", so a true `%util` that stops at 100 cannot be derived, and a UI must not draw this as one |
 | `read_errors`, `write_errors` | count | **Since boot, cumulative.** Rare events where the total is the actionable number; any non-zero deserves a red mark |
 
-All rates are `None` on the first sample. A counter that went backwards (the
-drive was detached and re-attached) yields `None` for that window rather than
-a diff against the previous drive's life. `None` for the whole list when
-disabled or off macOS (`capabilities.drive_io`).
+All rates are `None` on the first sample, and again on the first read after
+`set_collect_drives(true)`: the switch drops the old baselines, since a rate
+across the time the channel was off would be presented as current. A counter
+that went backwards (the drive was detached and re-attached) yields `None`
+for that window rather than a diff against the previous drive's life. `None`
+for the whole list when disabled or off macOS (`capabilities.drive_io`).
 
 ---
 
@@ -538,8 +550,9 @@ all need private APIs or hand-written FFI on macOS.
 Three former entries in this table — GPU utilisation, disk IOPS / service
 time, swap in/out rates — were rejected on the belief that they needed IOKit
 or Mach FFI. Probing the machine showed otherwise: the IORegistry is readable
-without root through the stock `ioreg` tool (XML plist out, ~12ms per query,
-the library's one child process, killed at a 1s deadline), and the swapper's
+without root through the stock `ioreg` tool (XML plist out, ~45 ms of CPU per
+query at a real cadence — §3.12 — the library's one child process, killed at
+a 1s deadline), and the swapper's
 `_total` counters are ordinary sysctls. They are now §3.12, §3.13 and §3.3.
 
 ### Platform coverage

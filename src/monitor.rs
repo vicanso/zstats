@@ -170,6 +170,21 @@ impl Monitor {
         &self.settings
     }
 
+    /// Switch GPU sampling on the running collector, keeping every other
+    /// channel's rate baselines; see [`LocalCollector::set_collect_gpu`].
+    ///
+    /// Not a settings change: [`Self::settings`] still reports the file,
+    /// and a `Monitor` built from it again starts from the file's value.
+    pub fn set_collect_gpu(&mut self, on: bool) {
+        self.collector.set_collect_gpu(on);
+    }
+
+    /// Switch per-drive sampling on the running collector; see
+    /// [`LocalCollector::set_collect_drives`] and [`Self::set_collect_gpu`].
+    pub fn set_collect_drives(&mut self, on: bool) {
+        self.collector.set_collect_drives(on);
+    }
+
     pub fn config_dir(&self) -> &Path {
         &self.config_dir
     }

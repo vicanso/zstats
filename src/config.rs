@@ -367,8 +367,10 @@ pub struct CollectorConfig {
     /// Whether to collect GPU utilisation and memory (macOS only today;
     /// `None` elsewhere, see `Capabilities::gpu`). Read from the
     /// IORegistry through the `ioreg` tool — the library's one child
-    /// process, bounded by a 1s kill deadline — at ~13ms per read, so it
-    /// runs on its own cadence below rather than every collect.
+    /// process, bounded by a 1s kill deadline — at ~45 ms of CPU per read
+    /// at a real cadence (11-13 ms only when run back to back), so it runs
+    /// on its own cadence below rather than every collect.
+    /// `LocalCollector::set_collect_gpu` switches it at runtime.
     pub collect_gpu: bool,
 
     /// How often to refresh the GPU sample. The value is the driver's
@@ -382,6 +384,7 @@ pub struct CollectorConfig {
     /// (macOS only today; see `Capabilities::drive_io`). Same `ioreg`
     /// path and cost as the GPU read. These are the figures `disks[]`
     /// cannot carry: the volume layer exposes bytes only.
+    /// `LocalCollector::set_collect_drives` switches it at runtime.
     pub collect_drives: bool,
 
     /// How often to refresh drive statistics. Rates are diffed across
@@ -437,9 +440,11 @@ impl Default for CollectorConfig {
             collect_temperatures: !cfg!(target_os = "windows"),
             // Temps drift over seconds/minutes, not milliseconds
             temperature_refresh_interval: Duration::from_secs(15),
-            // Two ~12ms `ioreg` runs; at 10s that is ~0.25% of one core
-            // for the daemon, the same order as the process table on its
-            // 10s serve cadence. The foreground view forces both to zero
+            // Two `ioreg` runs, ~66 ms of CPU together at a real cadence;
+            // at 10s that is ~0.66% of one core for the daemon, about
+            // twice the process table on its 10s serve cadence. (The
+            // ~0.25% first written here came from back-to-back runs.)
+            // The foreground view forces both to zero
             collect_gpu: true,
             gpu_refresh_interval: Duration::from_secs(10),
             collect_drives: true,

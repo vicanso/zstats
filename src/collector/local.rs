@@ -232,6 +232,56 @@ impl LocalCollector {
         }
     }
 
+    /// Turn GPU sampling on or off without rebuilding the collector.
+    ///
+    /// Every GPU read is an `ioreg` child process. Reads seconds apart
+    /// measured ~45 ms of CPU each on an M4 Pro, child included — more
+    /// than the ~36 ms process-table walk under the same conditions,
+    /// because the work lands on a core that has idled down. A frontend
+    /// that shows GPUs on one
+    /// screen can switch the channel on while that screen is visible and
+    /// off otherwise. Rebuilding from a changed [`CollectorConfig`] would
+    /// do the same, but also throws away every other channel's rate
+    /// baseline, so the next sample of disks, networks and processes
+    /// reads `None`.
+    ///
+    /// Off drops the cached sample, so no later snapshot presents a
+    /// reading from before the switch. On schedules a read for the very
+    /// next collect: the value is an instantaneous gauge, so that first
+    /// read is already a true sample. Setting the state it already has is
+    /// a no-op, so a caller may pass its visibility flag on every tick.
+    ///
+    /// This overrides the collector only. [`Collector::config`] reports
+    /// it; nothing is written to a settings file.
+    pub fn set_collect_gpu(&mut self, on: bool) {
+        if self.config.collect_gpu == on {
+            return;
+        }
+        self.config.collect_gpu = on;
+        self.last_gpu_refresh = None;
+        self.cached_gpus = None;
+    }
+
+    /// Turn per-drive sampling on or off without rebuilding the collector:
+    /// the same cost and purpose as [`Self::set_collect_gpu`].
+    ///
+    /// Either direction drops the drive baselines. After switching on, the
+    /// first read records counters and reports every rate as `None`, like
+    /// the collector's own first sample; rates return one
+    /// `drive_refresh_interval` later. Keeping the old baselines would make
+    /// that first rate an average over the whole time the channel was off,
+    /// presented as current. A repeat of the current state is a no-op and
+    /// keeps the baselines.
+    pub fn set_collect_drives(&mut self, on: bool) {
+        if self.config.collect_drives == on {
+            return;
+        }
+        self.config.collect_drives = on;
+        self.last_drive_refresh = None;
+        self.last_drive_counters.clear();
+        self.cached_drives = None;
+    }
+
     /// Refresh CPU usage every round; frequency only on its own cadence
     fn refresh_cpu(&mut self) {
         let freq_due = self.config.cpu_frequency_refresh_interval.is_zero()
@@ -2395,6 +2445,61 @@ mod tests {
             read_errors: 0,
             write_errors: 2,
         }
+    }
+
+    #[test]
+    fn switching_the_gpu_channel_drops_the_cached_sample() {
+        let mut collector = LocalCollector::new(CollectorConfig {
+            collect_processes: false,
+            ..Default::default()
+        });
+        collector.last_gpu_refresh = Some(Instant::now());
+        collector.cached_gpus = Some(Vec::new());
+
+        // Already on: callers pass their visibility flag every tick, so a
+        // repeat must not cost anything
+        collector.set_collect_gpu(true);
+        assert!(collector.cached_gpus.is_some());
+
+        collector.set_collect_gpu(false);
+        assert!(!collector.config().collect_gpu);
+        assert!(collector.cached_gpus.is_none());
+
+        collector.set_collect_gpu(true);
+        assert!(collector.config().collect_gpu);
+        assert!(
+            collector.last_gpu_refresh.is_none(),
+            "the next collect reads at once"
+        );
+    }
+
+    #[test]
+    fn switching_the_drive_channel_drops_its_baselines_and_a_repeat_keeps_them() {
+        let mut collector = LocalCollector::new(CollectorConfig {
+            collect_processes: false,
+            ..Default::default()
+        });
+        let baseline = counters("disk0", 10, 10, 10, 10, 10, 10);
+        collector
+            .last_drive_counters
+            .insert("disk0".into(), baseline.clone());
+        collector.last_drive_refresh = Some(Instant::now());
+        collector.cached_drives = Some(vec![drive_snapshot(None, &baseline, None)]);
+
+        collector.set_collect_drives(true);
+        assert!(collector.last_drive_counters.contains_key("disk0"));
+        assert!(collector.cached_drives.is_some());
+
+        collector.set_collect_drives(false);
+        assert!(!collector.config().collect_drives);
+        assert!(collector.cached_drives.is_none());
+
+        // Back on: a rate against counters from before the switch would
+        // be an average over the whole time the channel was off
+        collector.set_collect_drives(true);
+        assert!(collector.config().collect_drives);
+        assert!(collector.last_drive_refresh.is_none());
+        assert!(collector.last_drive_counters.is_empty());
     }
 
     #[test]

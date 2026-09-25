@@ -19,9 +19,19 @@
 //! unsafe FFI with no safe-wrapper crate, which `#![forbid(unsafe_code)]`
 //! rules out. `ioreg` is the same registry read as a stock system tool:
 //! it ships with every macOS, needs no root, and its `-a` output is an
-//! XML plist the `plist` crate parses. Measured cost is 11-13 ms per
-//! query, the same order as statfs, so both queries run on their own slow
-//! cadence.
+//! XML plist the `plist` crate parses.
+//!
+//! **What a read costs depends on how often it runs.** Back to back, a
+//! query takes 11-13 ms of CPU. At a real cadence, reads seconds apart,
+//! the same query measured ~45 ms, child process included (M4 Pro,
+//! 2026-09-25: GPU ~46 ms, drives ~41 ms, both in one collect ~66 ms). The
+//! work lands on a core that has idled down, so it takes longer. The
+//! back-to-back figure is the one first recorded here, and it made the
+//! 10s defaults look like ~0.25% of a core; the real figure for both is
+//! ~0.66%, about twice the process-table walk (~36 ms) under the same
+//! conditions. Hence the separate cadences, and the runtime switches
+//! (`LocalCollector::set_collect_gpu` / `set_collect_drives`) for a
+//! frontend that shows these figures on one screen only.
 //!
 //! This is the library's only child process. A registry that stalls
 //! (wedged USB storage is the realistic case) must not stall the collect
@@ -43,8 +53,9 @@ use std::time::{Duration, Instant};
 #[cfg(target_os = "macos")]
 use plist::{Dictionary, Value};
 
-/// Hard cap on one `ioreg` run. Normal runs finish in ~13 ms; anything
-/// near this bound is a stuck registry, and the collect must not wait
+/// Hard cap on one `ioreg` run. Normal runs finish in 10-50 ms of wall
+/// time (the upper end after the CPU has idled); anything near this bound
+/// is a stuck registry, and the collect must not wait
 #[cfg(target_os = "macos")]
 const IOREG_TIMEOUT: Duration = Duration::from_secs(1);
 

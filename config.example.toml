@@ -74,7 +74,9 @@ battery_refresh_interval = "30s"
 # GPU utilisation (device / renderer / tiler) and the system memory it
 # holds, per GPU. macOS only today: read from the IORegistry through the
 # stock `ioreg` tool (the collector's one child process, killed after 1s
-# if the registry stalls), ~13ms per read, hence its own cadence. The
+# if the registry stalls). A read costs ~45 ms of CPU at this kind of
+# cadence (11-13 ms only when run back to back), so GPU and drives
+# together at 10s are ~0.66% of one core, hence their own cadence. The
 # value is the driver's instantaneous gauge, so the cadence sets how
 # often you sample, not how much you smooth. No alert rule: the registry
 # has no per-process split, so a GPU alert could never name a culprit

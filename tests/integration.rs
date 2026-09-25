@@ -352,6 +352,61 @@ fn gpus_drives_and_swap_activity_follow_capabilities_and_toggles() {
 }
 
 #[test]
+fn gpu_and_drive_channels_switch_at_runtime_without_a_rebuild() {
+    let mut collector = LocalCollector::new(CollectorConfig {
+        collect_processes: false,
+        gpu_refresh_interval: Duration::ZERO,
+        drive_refresh_interval: Duration::ZERO,
+        ..Default::default()
+    });
+    collector.collect().expect("baseline collect");
+    std::thread::sleep(Duration::from_millis(200));
+    collector.collect().expect("collect with rates");
+
+    // Off: nothing cached from before the switch reaches a snapshot
+    collector.set_collect_gpu(false);
+    collector.set_collect_drives(false);
+    let off = collector.collect().expect("collect while off");
+    assert!(off.gpus.is_none());
+    assert!(off.drives.is_none());
+    assert!(off.io_totals.disk_read_ops_per_sec.is_none());
+    // The volume layer's rates kept their baseline through the switch,
+    // which is what a rebuild would have cost. `any`, as above: a volume
+    // mounted between samples has no baseline yet
+    let disks = off.disks.as_ref().expect("disks enabled");
+    assert!(disks.iter().any(|d| d.read_bytes_per_sec.is_some()));
+
+    collector.set_collect_gpu(true);
+    collector.set_collect_drives(true);
+    let back = collector
+        .collect()
+        .expect("first collect after switching on");
+    #[cfg(target_os = "macos")]
+    {
+        // The GPU gauge is a true sample at once; drive rates start over
+        assert!(back.gpus.is_some());
+        let drives = back.drives.as_ref().expect("ioreg answers on macOS");
+        assert!(drives.iter().all(|d| d.read_ops_per_sec.is_none()));
+
+        std::thread::sleep(Duration::from_millis(200));
+        let later = collector
+            .collect()
+            .expect("second collect after switching on");
+        let internal = later
+            .drives
+            .as_ref()
+            .and_then(|drives| drives.iter().find(|d| d.name == "disk0"))
+            .expect("the boot drive is a whole disk");
+        assert!(internal.read_ops_per_sec.is_some());
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        assert!(back.gpus.is_none());
+        assert!(back.drives.is_none());
+    }
+}
+
+#[test]
 fn process_groups_aggregate_trees_and_respect_toggle_and_cache() {
     let max_processes = CollectorConfig::default().max_processes;
     let mut collector = LocalCollector::new(CollectorConfig {

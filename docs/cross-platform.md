@@ -41,7 +41,17 @@ diffing and caching around them is platform-neutral, so the Linux
 analogues (`/sys/class/drm/*/gpu_busy_percent`, `/proc/diskstats`) would
 slot in behind the same two functions. Three cfg points live outside that file: the template selection
 (`alerts.rs`), the Windows temperature default (`config.rs`) and
-`Capabilities::current` (`snapshot.rs`). Everything else rides `sysinfo` and
+`Capabilities::current` (`snapshot.rs`). The one-shot `listeners()`
+(`src/listeners.rs`, outside the collector) is the only three-way split
+outside it: macOS parses the kernel's `pcblist_n` tables, Linux reads
+`/proc/net/*` plus `/proc/<pid>/fd`, Windows reads the owner-pid socket
+tables through the `netstat2` crate (a `cfg(windows)` dependency), and
+anything else returns `CollectError::Unsupported`. The two parsers and the
+Windows row mapping are gated `cfg(any(<os>, test))`, the
+`parse_proc_status_footprint` pattern, so the reference platform's `make
+check` tests all three. `make check-targets` only `cargo check`s the
+cross targets; the Windows and Linux branches were also linted with
+`cargo clippy --target <t> --lib --tests`. Everything else rides `sysinfo` and
 `starship-battery`, both with real Windows and Linux backends.
 
 Worth stating plainly because frontends build on it: **`cpu_time_ms` is

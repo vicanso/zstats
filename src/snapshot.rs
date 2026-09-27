@@ -149,6 +149,14 @@ pub struct Capabilities {
     /// swap_thrashing, kernel_available_percent}` exist (macOS only)
     #[serde(default)]
     pub swap_rates: bool,
+    /// [`crate::listeners()`] can answer (macOS, Linux, Windows). Not a
+    /// snapshot field — the list is one-shot and lives outside the
+    /// snapshot — but a frontend still needs to know whether to offer the
+    /// view at all. On macOS the call additionally needs an app-bundle
+    /// identity at runtime, which a build cannot promise; see
+    /// `CollectError::Restricted`
+    #[serde(default)]
+    pub listeners: bool,
 }
 
 impl Capabilities {
@@ -165,6 +173,11 @@ impl Capabilities {
             gpu: cfg!(target_os = "macos"),
             drive_io: cfg!(target_os = "macos"),
             swap_rates: cfg!(target_os = "macos"),
+            listeners: cfg!(any(
+                target_os = "macos",
+                target_os = "linux",
+                target_os = "windows"
+            )),
         }
     }
 }

@@ -35,6 +35,18 @@ pub enum CollectError {
 
     #[snafu(display("partial failure: {message}"))]
     Partial { message: String },
+
+    /// The platform has no way to answer. `Capabilities` states the same
+    /// thing up front, so a frontend can hide the control instead of
+    /// showing this
+    #[snafu(display("not supported on this platform: {what}"))]
+    Unsupported { what: String },
+
+    /// The operating system answered, but only with a view narrowed to
+    /// this process. Returning that as the whole answer would read as
+    /// "nothing else exists", so it is an error instead
+    #[snafu(display("restricted by the operating system: {message}"))]
+    Restricted { message: String },
 }
 
 #[derive(Debug, Snafu)]

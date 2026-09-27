@@ -89,6 +89,15 @@ libproc = "0.14"
 # stock `ioreg` tool instead; see `collector/ioreg.rs`
 plist = "1.10"
 
+[target.'cfg(windows)'.dependencies]
+# Owning pids for `listeners()`: GetExtendedTcpTable / GetExtendedUdpTable
+# with the *_OWNER_PID_* table classes, which name every socket's owner
+# without elevation. The FFI lives in the dependency, keeping
+# `forbid(unsafe_code)` intact; on Windows it pulls only bitflags and
+# thiserror (its bindgen build step runs for macOS/Linux targets only,
+# where this crate is not used)
+netstat2 = "0.11"
+
 [dev-dependencies]
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 

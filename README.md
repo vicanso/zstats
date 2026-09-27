@@ -85,6 +85,13 @@ Collector (trait, sync) ──SystemSnapshot──▶ Scheduler ──concurrent
   and by memory, with command lines, virtual memory, run time, and
   optional per-process disk IO). Serde-serializable; timestamps are RFC 3339
   (jiff). Process lists are `Arc`-shared so cloning a snapshot is cheap.
+- **Listening sockets are a one-shot call, not a snapshot field**:
+  `zstats::listeners()` returns every TCP/UDP socket waiting for
+  connections — address, port, owning pid, process and uid — on macOS,
+  Linux and Windows, and runs only when called. On macOS the kernel lists other
+  processes' sockets only to a caller with an app-bundle identity (such as
+  zstats.app); a bare executable gets `CollectError::Restricted`. See
+  `docs/listeners.md`.
 - **Rate metrics are computed internally by diffing** cumulative counters
   between samples, so snapshots only ever expose per-second values
   (counter wraparound handled; the first sample reports `None`/0).

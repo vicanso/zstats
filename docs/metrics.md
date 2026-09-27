@@ -555,6 +555,14 @@ query at a real cadence — §3.12 — the library's one child process, killed a
 a 1s deadline), and the swapper's
 `_total` counters are ordinary sysctls. They are now §3.12, §3.13 and §3.3.
 
+Listening sockets (which process is listening on which port) are not a
+snapshot field either, by design rather than by rejection: `zstats::listeners()`
+is a one-shot call a frontend makes while the list is on screen — macOS,
+Linux and Windows, `Capabilities::listeners` — and the daemon never runs it. On macOS it
+needs a caller with an app-bundle identity (zstats.app has one; a bare
+executable gets `CollectError::Restricted`). Shape, measurements and the
+restriction are in [`listeners.md`](listeners.md).
+
 ### Platform coverage
 
 macOS is the reference platform. Linux and Windows compile and run, with
@@ -568,7 +576,7 @@ the collector thread).
 
 Rather than guess from its own build, a frontend should read
 `capabilities` off the snapshot — `memory_footprint`, `memory_pressure`,
-`cpu_perf_levels`, `gpu`, `drive_io`, `swap_rates`, each a property of the
+`cpu_perf_levels`, `gpu`, `drive_io`, `swap_rates`, `listeners`, each a property of the
 build that produced the snapshot. It answers "this platform has no such concept" and nothing
 else: a `None` that means "the kernel refused for this process" or "not
 sampled yet" still looks the same. The alert engine exposes the matching

@@ -58,6 +58,7 @@ pub mod client;
 pub mod collector;
 pub mod config;
 pub mod error;
+pub mod listeners;
 #[cfg(feature = "frontend")]
 pub mod monitor;
 #[cfg(feature = "frontend")]
@@ -87,6 +88,8 @@ pub use config::CollectorConfig;
 #[cfg(all(feature = "client", unix))]
 pub use error::ClientError;
 pub use error::{CollectError, ConfigError, SchedulerError, SinkError};
+// Listening sockets: one-shot and outside the snapshot
+pub use listeners::{ListenerSnapshot, Listeners, OwnerCoverage, listeners};
 #[cfg(feature = "frontend")]
 pub use monitor::{Monitor, Tick};
 #[cfg(feature = "runtime")]

@@ -1,5 +1,15 @@
 # Changelog
 
+## [0.6.0](https://github.com/vicanso/zstats/compare/v0.5.8..v0.6.0) - 2026-09-27
+
+### ⛰️  Features
+
+- Listening sockets on demand, and the app identity macOS requires to see them - ([07c05a6](https://github.com/vicanso/zstats/commit/07c05a6a8bd5df5419b9cee85aa56062c06f5956))
+
+### ⚙️ Miscellaneous Tasks
+
+- Version 0.6.0 - ([64fe98e](https://github.com/vicanso/zstats/commit/64fe98ef13c00a259f2a1d59bce84ef5a4061885))
+
 ## [0.5.4](https://github.com/vicanso/zstats/compare/v0.5.2..v0.5.4) - 2026-08-23
 
 ### ⛰️  Features

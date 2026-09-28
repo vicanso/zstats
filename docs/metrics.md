@@ -181,8 +181,17 @@ rankings), returned sorted by CPU descending.
 
 ### 3.8 Applications — `process_groups[]`
 
-One entry per process tree, rooted at a direct child of init/launchd. This is
-what makes a browser with 37 helpers legible as one row.
+One entry per process tree, rooted at a direct child of init/launchd — or, on
+Linux, of the per-user service manager (`systemd --user`), whose children are
+the session's applications. Without that second boundary a systemd desktop
+reported the whole session as one application named `systemd` (Omarchy: 145
+processes, every app in one row). This is what makes a browser with 37 helpers
+legible as one row.
+
+Threads are never rows or members. On Linux sysinfo lists every thread as a
+process unless told not to, and each then carried its owner's whole RSS — one
+tree summed to 10 GB on an 11 GiB machine — so the process refresh excludes
+them (`without_tasks`); `total_processes` is a process count, not a task count.
 
 | Field | Unit | Notes |
 |---|---|---|

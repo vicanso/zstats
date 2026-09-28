@@ -311,7 +311,17 @@ impl LocalCollector {
         // fetches it exactly once per process.
         // cmd and user are immutable per process, so OnlyIfNotSet fetches
         // each exactly once per process
+        //
+        // `without_tasks`: sysinfo's `nothing()` still lists every thread
+        // as a process of its own on Linux ("tasks are considered
+        // processes on their own"). Each one then carried its owner's
+        // whole RSS and its own CPU, so a tree summed its memory once per
+        // thread — measured on an 11 GiB machine, one tree reported 18.7
+        // GB — and a named thread became an alert subject of its own:
+        // rustc's `opt cgu.0` fired a CPU alert per crate, a fresh tid each
+        // time. A process's CPU and memory already include its threads.
         let mut kind = ProcessRefreshKind::nothing()
+            .without_tasks()
             .with_memory()
             .with_cpu()
             .with_cmd(UpdateKind::OnlyIfNotSet)
@@ -846,6 +856,7 @@ impl LocalCollector {
                 pid,
                 ProcNode {
                     parent: p.parent().map(|pp| pp.as_u32()),
+                    boundary: is_service_manager(p),
                     start_time_secs: p.start_time(),
                     cpu: self.cpu_percent_for(pid),
                     mem: p.memory(),
@@ -1286,6 +1297,9 @@ fn dedupe_disks_by_name(disks: Vec<DiskSnapshot>) -> Vec<DiskSnapshot> {
 #[derive(Debug, Clone, Copy)]
 struct ProcNode {
     parent: Option<u32>,
+    /// A service manager: its children are separate applications, not
+    /// parts of it — see [`is_service_manager`]
+    boundary: bool,
     /// Seconds since the epoch, 0 when unreadable — used to reject a
     /// recycled ppid, see [`is_plausible_parent`]
     start_time_secs: u64,
@@ -1325,6 +1339,23 @@ struct GroupTotals {
 /// Pid of init / launchd — the boundary that defines application roots
 const INIT_PID: u32 = 1;
 
+/// Whether `process` is a service manager whose children are applications
+/// in their own right, the way init's are: on Linux, the per-user
+/// `systemd --user`.
+///
+/// On macOS every app is a child of launchd, pid 1, so stopping the climb
+/// at pid 1 gives one tree per application. On a systemd desktop it does
+/// not: apps a session launches are children of `systemd --user`, which is
+/// itself a child of pid 1, so the climb stopped one level too high and
+/// the whole session became one application named `systemd` — measured on
+/// Omarchy, 174 of 230 processes, every per-app figure and rule answering
+/// for all of them at once. The user manager is `systemd` by name, as pid
+/// 1 is; treating any `systemd` as a boundary covers both without a
+/// second rule for init.
+fn is_service_manager(process: &Process) -> bool {
+    cfg!(target_os = "linux") && process.name() == "systemd"
+}
+
 /// Whether `parent` can really be `child`'s parent, i.e. whether the
 /// recorded ppid still refers to the process that spawned it.
 ///
@@ -1354,7 +1385,8 @@ fn is_plausible_parent(table: &HashMap<u32, ProcNode>, child: u32, parent: u32) 
 }
 
 /// Resolve every process to the root of its tree (the ancestor whose
-/// parent is init/launchd, missing from the table, or absent) and sum
+/// parent is init/launchd or a service manager, missing from the table, or
+/// absent) and sum
 /// CPU/memory per root. Returns at most `max` groups ranked by CPU
 /// (memory, then pid, as tie-breaks).
 fn aggregate_process_groups(table: &HashMap<u32, ProcNode>, max: usize) -> Vec<GroupTotals> {
@@ -1373,6 +1405,7 @@ fn aggregate_process_groups(table: &HashMap<u32, ProcNode>, max: usize) -> Vec<G
                 // happen, but a corrupt table must not hang collection)
                 Some(parent)
                     if parent != INIT_PID
+                        && !table.get(&parent).is_some_and(|node| node.boundary)
                         && parent != current
                         && path.len() < 512
                         && is_plausible_parent(table, current, parent) =>
@@ -1799,6 +1832,7 @@ mod tests {
     fn node(parent: Option<u32>, cpu: f32, mem: u64) -> ProcNode {
         ProcNode {
             parent,
+            boundary: false,
             // 0 = unknown, which never rejects a parent link — the
             // grouping tests are about topology, not pid reuse
             start_time_secs: 0,
@@ -1887,6 +1921,74 @@ mod tests {
         assert_eq!(by_root[&1].process_count, 1);
         // Ranked by CPU: the app tree first
         assert_eq!(groups[0].root_pid, 10);
+    }
+
+    #[test]
+    fn a_service_manager_bounds_trees_like_init() {
+        // init(1) → systemd --user(889) → foot(900) → zsh(901) → cargo(902)
+        //                               → firefox(910) → content(911)
+        // Without the boundary this was one tree rooted at 889
+        let manager = ProcNode {
+            boundary: true,
+            ..node(Some(1), 0.1, 10)
+        };
+        let table = HashMap::from([
+            (1, node(None, 0.0, 10)),
+            (889, manager),
+            (900, node(Some(889), 1.0, 100)),
+            (901, node(Some(900), 1.0, 100)),
+            (902, node(Some(901), 50.0, 400)),
+            (910, node(Some(889), 5.0, 300)),
+            (911, node(Some(910), 5.0, 300)),
+        ]);
+        let groups = aggregate_process_groups(&table, 50);
+        let by_root: HashMap<u32, GroupTotals> = groups.iter().map(|g| (g.root_pid, *g)).collect();
+
+        // Each app launched by the manager is its own tree
+        assert_eq!(
+            by_root[&900].process_count, 3,
+            "a terminal owns its shell and build"
+        );
+        assert_eq!(by_root[&910].process_count, 2);
+        // The manager is left holding only itself
+        assert_eq!(by_root[&889].process_count, 1);
+        assert_eq!(by_root[&889].mem, 10);
+    }
+
+    /// Threads are not processes: on Linux sysinfo lists every thread as a
+    /// process unless told otherwise, and each carried its owner's RSS
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn threads_are_not_listed_as_processes() {
+        let (stop, parked) = std::sync::mpsc::channel::<()>();
+        let worker = std::thread::Builder::new()
+            .name("zstats-probe".into())
+            .spawn(move || {
+                let _ = parked.recv();
+            })
+            .expect("spawn");
+        let own = std::process::id();
+        let tids: Vec<u32> = std::fs::read_dir("/proc/self/task")
+            .expect("our own tasks are readable")
+            .filter_map(|e| e.ok()?.file_name().to_str()?.parse().ok())
+            .filter(|tid| *tid != own)
+            .collect();
+        assert!(!tids.is_empty(), "the probe thread is a task");
+
+        let mut collector = LocalCollector::new(CollectorConfig {
+            max_processes: usize::MAX,
+            ..Default::default()
+        });
+        let snapshot = collector.collect().expect("collect");
+        let processes = snapshot.processes.expect("processes on");
+        let pids: std::collections::HashSet<u32> = processes.iter().map(|p| p.pid).collect();
+        assert!(pids.contains(&own));
+        for tid in &tids {
+            assert!(!pids.contains(tid), "thread {tid} listed as a process");
+        }
+        assert!(processes.iter().all(|p| p.name != "zstats-probe"));
+        let _ = stop.send(());
+        worker.join().expect("join");
     }
 
     #[test]

@@ -64,6 +64,11 @@ pub struct ListenerSnapshot {
     pub port: u16,
     pub pid: Option<u32>,
     pub process: Option<String>,
+    /// Seconds the owner has been running, as of the call, from the one
+    /// process entry read per pid for the name too. `None` when the OS
+    /// will not give the start time (another user's process on macOS) —
+    /// sysinfo's 0 there would read as "started just now".
+    pub run_time_secs: Option<u64>,
     pub uid: Option<u32>,
 }
 

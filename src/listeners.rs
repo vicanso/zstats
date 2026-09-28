@@ -91,6 +91,16 @@ pub struct ListenerSnapshot {
     /// carries for that pid. `None` when the pid is unknown or the
     /// process exited before its name was read
     pub process: Option<String>,
+    /// How long the owner has been running, in seconds, as of this call —
+    /// the same figure `ProcessSnapshot::run_time_secs` carries, from the
+    /// same process entry the name is read from. A server that restarted a
+    /// minute ago and one up for weeks hold the same port; this is what
+    /// tells them apart. `None` when the OS would not give the start time:
+    /// on macOS another user's process has a name but no readable start
+    /// (`launchd`, `mDNSResponder`), and sysinfo reports that as 0 — which
+    /// would read as "started just now", the one claim it cannot support
+    #[serde(default)]
+    pub run_time_secs: Option<u64>,
     /// The socket's user id — known for every socket on macOS and Linux,
     /// including the ones whose process is not
     pub uid: Option<u32>,
@@ -219,6 +229,7 @@ pub fn listeners() -> Result<Listeners, CollectError> {
             port: row.port,
             pid: owners.get(&row.inode).copied(),
             process: None,
+            run_time_secs: None,
             uid: Some(row.uid),
         })
         .collect();
@@ -278,6 +289,7 @@ fn owner_table_row(
         port,
         pid: pids.iter().copied().filter(|pid| *pid != 0).min(),
         process: None,
+        run_time_secs: None,
         uid: None,
     })
 }
@@ -316,9 +328,11 @@ fn read_table(name: &str) -> Result<Vec<u8>, CollectError> {
 /// Name the owners, then put the list in its documented order
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn finish(mut sockets: Vec<ListenerSnapshot>, coverage: OwnerCoverage) -> Listeners {
-    let names = process_names(sockets.iter().filter_map(|s| s.pid));
+    let owners = process_owners(sockets.iter().filter_map(|s| s.pid));
     for socket in &mut sockets {
-        socket.process = socket.pid.and_then(|pid| names.get(&pid).cloned());
+        let owner = socket.pid.and_then(|pid| owners.get(&pid));
+        socket.process = owner.map(|o| o.name.clone());
+        socket.run_time_secs = owner.and_then(|o| o.run_time_secs);
     }
     sockets.sort_by(|a, b| {
         (a.protocol, a.port, a.address, a.pid).cmp(&(b.protocol, b.port, b.address, b.pid))
@@ -327,10 +341,18 @@ fn finish(mut sockets: Vec<ListenerSnapshot>, coverage: OwnerCoverage) -> Listen
     Listeners { sockets, coverage }
 }
 
-/// Process names for exactly these pids, through the same sysinfo lookup
-/// the collector uses, so a listener's name matches the PROC table's
+/// What one process entry says about a listener's owner
+struct Owner {
+    name: String,
+    run_time_secs: Option<u64>,
+}
+
+/// Name and run time for exactly these pids, through the same sysinfo
+/// lookup the collector uses, so a listener's name and age match the PROC
+/// table's. One entry read per pid serves both: the start time rides the
+/// same process record the name comes from
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-fn process_names(pids: impl Iterator<Item = u32>) -> std::collections::HashMap<u32, String> {
+fn process_owners(pids: impl Iterator<Item = u32>) -> std::collections::HashMap<u32, Owner> {
     use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
     let mut pids: Vec<Pid> = pids.map(Pid::from_u32).collect();
@@ -347,8 +369,15 @@ fn process_names(pids: impl Iterator<Item = u32>) -> std::collections::HashMap<u
     );
     pids.iter()
         .filter_map(|pid| {
-            let name = system.process(*pid)?.name().to_string_lossy().into_owned();
-            Some((pid.as_u32(), name))
+            let process = system.process(*pid)?;
+            let owner = Owner {
+                name: process.name().to_string_lossy().into_owned(),
+                // A zero start is sysinfo's "could not read it" (measured:
+                // pid 1 as an unprivileged user on macOS reads start 0 and
+                // run time 0), not a process born this second
+                run_time_secs: (process.start_time() > 0).then(|| process.run_time()),
+            };
+            Some((pid.as_u32(), owner))
         })
         .collect()
 }
@@ -472,6 +501,12 @@ mod tests {
                 socket.process.as_deref().is_some_and(|n| !n.is_empty()),
                 "{addr} has no process name"
             );
+            // Our own process: its start is always readable, and recent
+            let run_time = socket.run_time_secs.expect("our own start is readable");
+            assert!(
+                run_time < 24 * 60 * 60,
+                "{addr}: {run_time}s is not this test"
+            );
         }
 
         // Windows' UDP table has no remote end to tell a connected socket by
@@ -488,6 +523,17 @@ mod tests {
             (a.protocol, a.port, a.address, a.pid).cmp(&(b.protocol, b.port, b.address, b.pid))
         });
         assert_eq!(sorted, list.sockets, "documented order");
+    }
+
+    /// An owner whose start the OS will not give has no age — never "0",
+    /// which would claim it started just now. pid 1 is the case at hand on
+    /// macOS; where its start is readable (Linux), it is simply not zero
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn an_unreadable_start_is_no_age_not_a_new_process() {
+        let owners = process_owners([1].into_iter());
+        let init = owners.get(&1).expect("pid 1 exists and has a name");
+        assert_ne!(init.run_time_secs, Some(0), "{:?}", init.run_time_secs);
     }
 
     /// A view narrowed to this process must never come back as a list: it
@@ -524,6 +570,7 @@ mod tests {
                 port: 5353,
                 pid: None,
                 process: None,
+                run_time_secs: None,
                 uid: Some(65),
             }],
             coverage: OwnerCoverage::OwnProcessesOnly,

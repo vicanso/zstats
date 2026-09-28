@@ -276,6 +276,7 @@ fn classify(
         port,
         pid: owner,
         process: None,
+        run_time_secs: None,
         uid: read_u32(socket, SO_UID),
     };
     Ok(Some((owner, Some(listener))))
@@ -467,6 +468,7 @@ mod tests {
                     port: 4226,
                     pid: Some(15482),
                     process: None,
+                    run_time_secs: None,
                     uid: Some(501),
                 },
                 ListenerSnapshot {
@@ -475,6 +477,7 @@ mod tests {
                     port: 8021,
                     pid: Some(1),
                     process: None,
+                    run_time_secs: None,
                     uid: Some(501),
                 },
             ]

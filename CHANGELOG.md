@@ -1,5 +1,11 @@
 # Changelog
 
+## [0.7.0](https://github.com/vicanso/zstats/compare/v0.6.1..v0.7.0) - 2026-10-01
+
+### ⛰️  Features
+
+- Per-process cumulative socket bytes on demand, on macOS and Linux - ([e4df5ae](https://github.com/vicanso/zstats/commit/e4df5aee3b91d4556c2a60762a3974c96df0808d))
+
 ## [0.6.1](https://github.com/vicanso/zstats/compare/v0.5.8..v0.6.1) - 2026-09-28
 
 ### ⛰️  Features

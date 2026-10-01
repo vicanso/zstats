@@ -263,6 +263,83 @@ per call** (median ≈ 3.5 ms), no child process, both tables plus owner names.
 That is the whole call — a frontend refreshing every 15 s while a tab is on
 screen spends about 0.02% of a core.
 
+### 3.6 Per-process byte counters
+
+**Status: implemented** as `zstats::process_traffic()` (`src/listeners.rs`),
+on macOS and Linux. Windows returns `Unsupported`.
+`Capabilities::process_traffic` says so up front. Same one-shot shape on
+both: cumulative bytes, the caller diffs two calls, nothing is kept
+between calls, and it does not run unless something asks.
+
+**macOS.** Same tables, same restriction: a bare executable gets
+`CollectError::Restricted`.
+
+`xsockstat_n` (kind `0x08`, 136 bytes) is 8 bytes of header plus
+`data_stats xst_tc_stats[4]`. Each class is `rxpackets`, `rxbytes`,
+`txpackets`, `txbytes` as `u64`, 32 bytes under `pack(4)`. The function
+sums `rxbytes` and `txbytes` across the four classes and across every TCP
+and UDP socket a pid owns — the columns `netstat -anv` prints, checked
+against that output on a live table (313 sockets, the 10 that disagreed
+had moved between the two reads).
+
+The offsets were located by sending a known payload (macOS 27.0, arm64):
+`txbytes` of the sending socket increased by exactly that many bytes, on
+loopback and to `1.1.1.1`. `rxbytes` is the same column netstat prints; it
+moves when data arrives and by *more* than the payload `recv` returned
+(1000 bytes read back showed 2052 on loopback). Report it as that counter.
+Do not scale it back to the payload — the gap is not a fixed header.
+
+One call returns cumulative bytes, not a rate. The caller diffs two
+results per pid. Three rules, or the number lies:
+
+- the first time a pid appears, keep the total and show no rate — it is
+  cumulative since the sockets were created;
+- a pid whose `run_time_secs` went backwards was reused; start over;
+- a total that fell lost a socket (its bytes left with it). That sample
+  has no rate. A connection that opens and closes between two calls never
+  appears at all.
+
+The pid is `so_last_pid`, the same owner `listeners()` reports. A handoff
+moves that socket's whole total onto the new pid. A process talking to
+itself sums both sockets into its one row.
+
+The cost is the §3.5 read. Summing the fields adds nothing measurable on
+top of it.
+
+**Linux.** TCP only, through a netlink `SOCK_DIAG` dump of `tcp_info`
+(what `ss -i` reads), not through `/proc/net/tcp`. UDP diagnostics
+publish queue lengths and no cumulative counter, so a UDP-only process
+has no row.
+
+`received_bytes` is `tcpi_bytes_received`, payload octets TCP has
+accepted. `transmitted_bytes` is `tcpi_bytes_sent` (data octets
+transmitted, retransmissions included) when `tcp_info` is long enough to
+carry it, which it has been since Linux 4.19. A shorter struct that still
+reaches `tcpi_bytes_received` reports `tcpi_bytes_acked` — octets the peer
+has acknowledged — for every row of that call. One kernel, one definition.
+A `tcp_info` shorter than `tcpi_bytes_received` refuses the call with
+`Unsupported`. A TCP socket that has an inode but no `tcp_info` refuses
+it with `System`; a partial sum is never returned as the machine. TIME_WAIT
+and SYN_RECV rows have inode 0 and no `tcp_info`, and are skipped.
+
+The inode is mapped to a pid by the same `/proc/<pid>/fd` walk as
+`listeners()`. A socket that walk cannot name is omitted. Coverage is
+`OwnProcessesOnly` when an fd directory was refused and a wanted inode
+stayed unowned. The counters themselves were visible, so this is not the
+macOS `Restricted` error: on a single-user desktop the user's own apps
+attribute, and root daemons do not unless the caller is privileged.
+
+The three diff rules above apply unchanged. A process talking to itself
+sums both sockets into one row. The pid is whoever holds the inode (the
+lowest pid when several share it).
+
+The read is one dump of `AF_INET` and one of `AF_INET6`, then the fd walk.
+A dump the kernel marks `NLM_F_DUMP_INTR` is retried; if it stays torn, the
+last finished dump is kept. IPv6 disabled (`EAFNOSUPPORT` /
+`EPROTONOSUPPORT`) is an empty family. The socket IO goes through `nix`
+so the FFI stays out of this crate; the parser (`listeners/sockdiag.rs`)
+is fixture-tested on every host. Cost on Linux was not measured here.
+
 ## 4. Linux and Windows
 
 - **Linux — implemented.** `/proc/net/{tcp,tcp6,udp,udp6}` list every
@@ -276,7 +353,9 @@ screen spends about 0.02% of a core.
   by several processes goes to the lowest pid, normally a pre-fork server's
   parent. Plain file reads; no dependency. Covered by fixture tests on every
   platform and compiled by `make check-targets`, but not run on a Linux
-  machine here.
+  machine here. Per-process byte counters come from the TCP `SOCK_DIAG`
+  read in §3.6. `tx_queue:rx_queue` in these tables is a queue depth, and
+  UDP has no cumulative counter.
 - **Windows — implemented through `netstat2`** (user decision; a
   Windows-target dependency, MIT/Apache-2.0, which pulls only `bitflags` and
   `thiserror` there and keeps the FFI out of this crate).

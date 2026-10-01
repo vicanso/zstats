@@ -89,6 +89,12 @@ libproc = "0.14"
 # stock `ioreg` tool instead; see `collector/ioreg.rs`
 plist = "1.10"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+# Safe netlink sockets for `process_traffic()`: a SOCK_DIAG dump of
+# `tcp_info`. The FFI stays in the dependency so `forbid(unsafe_code)`
+# holds. Default features are empty; only the socket module is used
+nix = { version = "0.30.1", default-features = false, features = ["socket"] }
+
 [target.'cfg(windows)'.dependencies]
 # Owning pids for `listeners()`: GetExtendedTcpTable / GetExtendedUdpTable
 # with the *_OWNER_PID_* table classes, which name every socket's owner

@@ -552,7 +552,7 @@ all need private APIs or hand-written FFI on macOS.
 | Disk **util%** (device busy time) | `IOBlockStorageDriver` publishes summed service time but no "device had an operation in flight" clock, so `drives[].queue_depth` (mean in-flight operations) is the honest figure; a `%util` that stops at 100 cannot be derived from it. Its `Latency Time` counters are also unpopulated on Apple SSDs, which is why `*_latency_ms` derives from total time ÷ operations |
 | Page in/out rates (file-backed paging) | Only via Mach `host_statistics64` (unsafe FFI). The **compressor swapper's** counters are a different thing and *are* exposed (`swap_ins_per_sec` / `swap_outs_per_sec`); the `vm.compressor.segment.*` sysctls that look like counters are gauges and stay unused |
 | Per-process GPU time | The accelerator's `PerformanceStatistics` is device-wide; per-client accounting is private IOReport. So `gpus[]` is a metric, never an alert |
-| Per-process network IO | Needs private APIs on macOS; without attribution a network alert cannot name a culprit, so it would not be actionable |
+| Per-process network **alert** | The counters themselves are a one-shot, not a snapshot field: `zstats::process_traffic()`. On macOS it sums `netstat -anv`'s `rxbytes` / `txbytes` per process from the same `pcblist_n` read as `listeners()`. On Linux it sums TCP `tcp_info` (`tcpi_bytes_received`, and `tcpi_bytes_sent` or, on a kernel whose struct stops short of that field, `tcpi_bytes_acked`); UDP has no cumulative counter. A rate is the caller's diff of two calls. No alert — a socket that opens and closes between calls never appears, and the figure is a kernel counter rather than the bytes `recv` returned |
 | Thread counts | sysinfo's `tasks()` is documented Linux-only and returns nothing on macOS |
 | Per-cluster frequency / power | Root-only `powermetrics` or private IOReport. `per_core_frequency_mhz` / `frequency_mhz` are OS-reported nominal values only |
 
@@ -585,7 +585,7 @@ the collector thread).
 
 Rather than guess from its own build, a frontend should read
 `capabilities` off the snapshot — `memory_footprint`, `memory_pressure`,
-`cpu_perf_levels`, `gpu`, `drive_io`, `swap_rates`, `listeners`, each a property of the
+`cpu_perf_levels`, `gpu`, `drive_io`, `swap_rates`, `listeners`, `process_traffic`, each a property of the
 build that produced the snapshot. It answers "this platform has no such concept" and nothing
 else: a `None` that means "the kernel refused for this process" or "not
 sampled yet" still looks the same. The alert engine exposes the matching

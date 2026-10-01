@@ -313,7 +313,7 @@ fn gpus_drives_and_swap_activity_follow_capabilities_and_toggles() {
     }
     #[cfg(target_os = "macos")]
     {
-        assert!(caps.gpu && caps.drive_io && caps.swap_rates);
+        assert!(caps.gpu && caps.drive_io && caps.swap_rates && caps.process_traffic);
         let gpus = second.gpus.as_ref().expect("ioreg answers on macOS");
         for gpu in gpus {
             assert!(!gpu.name.is_empty());
@@ -338,6 +338,10 @@ fn gpus_drives_and_swap_activity_follow_capabilities_and_toggles() {
             .expect("kern.memorystatus_level");
         assert!(avail <= 100);
     }
+    #[cfg(target_os = "linux")]
+    assert!(caps.process_traffic);
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    assert!(!caps.process_traffic);
 
     let mut collector = LocalCollector::new(CollectorConfig {
         collect_processes: false,

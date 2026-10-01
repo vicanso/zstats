@@ -89,7 +89,10 @@ pub use config::CollectorConfig;
 pub use error::ClientError;
 pub use error::{CollectError, ConfigError, SchedulerError, SinkError};
 // Listening sockets: one-shot and outside the snapshot
-pub use listeners::{ListenerSnapshot, Listeners, OwnerCoverage, listeners};
+pub use listeners::{
+    ListenerSnapshot, Listeners, OwnerCoverage, ProcessTraffic, ProcessTrafficSnapshot, listeners,
+    process_traffic,
+};
 #[cfg(feature = "frontend")]
 pub use monitor::{Monitor, Tick};
 #[cfg(feature = "runtime")]

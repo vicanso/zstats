@@ -46,7 +46,14 @@ slot in behind the same two functions. Three cfg points live outside that file: 
 outside it: macOS parses the kernel's `pcblist_n` tables, Linux reads
 `/proc/net/*` plus `/proc/<pid>/fd`, Windows reads the owner-pid socket
 tables through the `netstat2` crate (a `cfg(windows)` dependency), and
-anything else returns `CollectError::Unsupported`. The two parsers and the
+anything else returns `CollectError::Unsupported`. `process_traffic()`
+sits beside it. On macOS the counters are `pcblist_n`'s `xsockstat_n`.
+On Linux they are a netlink `SOCK_DIAG` dump of TCP `tcp_info`
+(`listeners/sockdiag.rs`, parsed on every host via `cfg(any(linux, test))`;
+the socket itself is `nix`, a `cfg(target_os = "linux")` dependency, so
+the FFI stays out of this crate) joined to the same inode walk, and UDP
+has no cumulative counter there. Windows has no such counters and returns
+`Unsupported`. The listener parsers, the `tcp_info` parser and the
 Windows row mapping are gated `cfg(any(<os>, test))`, the
 `parse_proc_status_footprint` pattern, so the reference platform's `make
 check` tests all three. `make check-targets` only `cargo check`s the

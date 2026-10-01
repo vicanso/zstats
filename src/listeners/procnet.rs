@@ -119,7 +119,7 @@ fn address_words(hex: &str, count: usize) -> Result<Vec<u32>, String> {
 
 /// `socket:[12345]` → 12345; any other fd target is not a socket
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn socket_inode(link: &str) -> Option<u64> {
+pub(super) fn socket_inode(link: &str) -> Option<u64> {
     link.strip_prefix("socket:[")?
         .strip_suffix(']')?
         .parse()

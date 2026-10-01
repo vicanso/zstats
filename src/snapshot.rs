@@ -157,6 +157,13 @@ pub struct Capabilities {
     /// `CollectError::Restricted`
     #[serde(default)]
     pub listeners: bool,
+    /// [`crate::process_traffic()`] can answer (macOS and Linux). Not a
+    /// snapshot field. On macOS the call still needs an app-bundle
+    /// identity at runtime. On Linux the totals are TCP only, and a
+    /// socket whose process cannot be read is omitted
+    /// (`OwnerCoverage::OwnProcessesOnly`) rather than refused
+    #[serde(default)]
+    pub process_traffic: bool,
 }
 
 impl Capabilities {
@@ -178,6 +185,7 @@ impl Capabilities {
                 target_os = "linux",
                 target_os = "windows"
             )),
+            process_traffic: cfg!(any(target_os = "macos", target_os = "linux")),
         }
     }
 }

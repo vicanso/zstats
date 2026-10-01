@@ -92,6 +92,14 @@ Collector (trait, sync) ──SystemSnapshot──▶ Scheduler ──concurrent
   processes' sockets only to a caller with an app-bundle identity (such as
   zstats.app); a bare executable gets `CollectError::Restricted`. See
   `docs/listeners.md`.
+- **Per-process network bytes are the same kind of call** (macOS and Linux):
+  `zstats::process_traffic()` returns each process's cumulative received
+  and transmitted bytes. On macOS that is `netstat -anv`'s `rxbytes` /
+  `txbytes`, summed across that process's TCP and UDP sockets, and the
+  same app-bundle rule as `listeners()` applies. On Linux it is TCP only
+  (`tcp_info`); a process whose `/proc/<pid>/fd` cannot be read is omitted
+  and `coverage` says so. One call is not a rate; diff two results.
+  Windows returns `Unsupported`.
 - **Rate metrics are computed internally by diffing** cumulative counters
   between samples, so snapshots only ever expose per-second values
   (counter wraparound handled; the first sample reports `None`/0).

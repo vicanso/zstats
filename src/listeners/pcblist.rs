@@ -18,7 +18,12 @@
 //! them, every socket is a run of records, each starting with `u32 len,
 //! u32 kind`: `xinpcb_n` (kind 0x10, which starts a socket), `xsocket_n`
 //! (0x01), the receive and send `xsockbuf_n` (0x02, 0x04), `xsockstat_n`
-//! (0x08) and, for TCP, `xtcpcb_n` (0x20). Records are 8-byte aligned, so
+//! (0x08) and, for TCP, `xtcpcb_n` (0x20). `xsockstat_n` is 8 bytes of
+//! header plus `data_stats xst_tc_stats[4]` (`rxpackets`, `rxbytes`,
+//! `txpackets`, `txbytes` per traffic class, 32 bytes each under
+//! `pack(4)`): those `rxbytes` / `txbytes` are the columns `netstat -anv`
+//! prints, located by sending a known payload and finding it at offset
+//! 32 of the record (tx) on macOS 27.0. Records are 8-byte aligned, so
 //! the stride is `len` rounded up to 8 — stepping by the raw `len` falls
 //! out of step at the first 204-byte `xtcpcb_n`.
 //!
@@ -64,6 +69,14 @@ const XSO_STATS: u32 = 0x08;
 const XSO_INPCB: u32 = 0x10;
 const XSO_TCPCB: u32 = 0x20;
 
+/// `so_tc_stats[SO_TC_STATS_MAX]`: four traffic classes, each a
+/// `data_stats` of four `u64`s. `rxbytes` / `txbytes` sit at +8 / +24
+/// inside a class; class 0 therefore starts at byte 8 of `xsockstat_n`.
+const TC_STATS_MAX: usize = 4;
+const DATA_STATS_LEN: usize = 32;
+const RX_BYTES_AT: usize = 8;
+const TX_BYTES_AT: usize = 24;
+
 // `xinpcb_n` (104 bytes)
 const INP_FPORT: usize = 16; // u16, network order
 const INP_LPORT: usize = 18; // u16, network order
@@ -106,7 +119,22 @@ fn expected_len(kind: u32) -> Option<usize> {
 struct Run<'a> {
     inpcb: Option<&'a [u8]>,
     socket: Option<&'a [u8]>,
+    stats: Option<&'a [u8]>,
     tcpcb: Option<&'a [u8]>,
+}
+
+/// One attached socket's cumulative byte counters, summed across the
+/// kernel's four traffic classes. `local_port` is how a test finds the
+/// socket it just wrote to; the public function folds these by pid
+#[derive(Debug)]
+pub(super) struct FlowBytes {
+    pub pid: u32,
+    /// How the live test finds the socket it just wrote. The public
+    /// function folds by pid and never reads this
+    #[cfg(test)]
+    pub local_port: u16,
+    pub received_bytes: u64,
+    pub transmitted_bytes: u64,
 }
 
 /// One table, walked
@@ -121,6 +149,8 @@ pub(super) struct Parsed {
     pub sockets: usize,
     /// Owning pids of every attached socket in the table, listening or not
     pub owners: std::collections::HashSet<u32>,
+    /// Byte counters of every attached socket that has an owner
+    pub flows: Vec<FlowBytes>,
 }
 
 impl Parsed {
@@ -136,12 +166,49 @@ impl Parsed {
 
     fn take(&mut self, run: Run, protocol: Protocol) -> Result<(), String> {
         self.sockets += 1;
+        let stats = run.stats;
+        #[cfg(test)]
+        let local_port = run
+            .inpcb
+            .and_then(|inp| read_u16_be(inp, INP_LPORT))
+            .unwrap_or(0);
+        // `None` is a PCB with no socket attached: no owner, no counters
         if let Some((owner, listener)) = classify(run, protocol)? {
+            // Every attached socket is written with an xsockstat_n. A table
+            // that dropped it has moved, and a zero there must not be
+            // mistaken for a socket that transferred nothing
+            let stats = stats.ok_or("a socket is missing its xsockstat_n record")?;
+            let (received_bytes, transmitted_bytes) = traffic_bytes(stats)?;
+            if let Some(pid) = owner {
+                self.flows.push(FlowBytes {
+                    pid,
+                    #[cfg(test)]
+                    local_port,
+                    received_bytes,
+                    transmitted_bytes,
+                });
+            }
             self.owners.extend(owner);
             self.listeners.extend(listener);
         }
         Ok(())
     }
+}
+
+/// Sum `rxbytes` / `txbytes` across the four traffic classes. One class
+/// is the usual case; the others stay zero until the kernel uses them,
+/// and leaving them out would undercount the day it does
+fn traffic_bytes(stats: &[u8]) -> Result<(u64, u64), String> {
+    let mut received = 0u64;
+    let mut transmitted = 0u64;
+    for class in 0..TC_STATS_MAX {
+        let base = RECORD_HEADER_LEN + class * DATA_STATS_LEN;
+        let rx = read_u64(stats, base + RX_BYTES_AT).ok_or("short xsockstat_n")?;
+        let tx = read_u64(stats, base + TX_BYTES_AT).ok_or("short xsockstat_n")?;
+        received = received.saturating_add(rx);
+        transmitted = transmitted.saturating_add(tx);
+    }
+    Ok((received, transmitted))
 }
 
 /// Walk one table. `Err` carries why it was refused
@@ -200,8 +267,10 @@ pub(super) fn parse(table: &[u8], protocol: Protocol) -> Result<Parsed, String> 
                     .ok_or_else(|| format!("record kind {kind:#x} before the first socket"))?;
                 let slot = match kind {
                     XSO_SOCKET => Some(&mut current.socket),
+                    XSO_STATS => Some(&mut current.stats),
                     XSO_TCPCB => Some(&mut current.tcpcb),
-                    // Buffer and statistics records: framing only
+                    // Buffer records: framing only. Their lengths are the
+                    // current occupancy of the socket buffers, not a total
                     _ => None,
                 };
                 if let Some(slot) = slot
@@ -319,6 +388,10 @@ fn read_u16_be(buf: &[u8], at: usize) -> Option<u16> {
     Some(u16::from_be_bytes(buf.get(at..at + 2)?.try_into().ok()?))
 }
 
+fn read_u64(buf: &[u8], at: usize) -> Option<u64> {
+    Some(u64::from_ne_bytes(buf.get(at..at + 8)?.try_into().ok()?))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -337,6 +410,9 @@ mod tests {
         state: i32,
         pid: i32,
         uid: u32,
+        /// Class-0 `rxbytes` / `txbytes` to plant in `xsockstat_n`
+        rx: u64,
+        tx: u64,
     }
 
     impl Sock {
@@ -355,6 +431,8 @@ mod tests {
                 state: TCPS_LISTEN,
                 pid,
                 uid: 501,
+                rx: 0,
+                tx: 0,
             }
         }
     }
@@ -410,12 +488,26 @@ mod tests {
         put(&mut so, SO_UID, &s.uid.to_ne_bytes());
         put(&mut so, SO_LAST_PID, &s.pid.to_ne_bytes());
 
+        let mut stats = record(XSO_STATS, 136);
+        // Class 0: rxbytes at 16, txbytes at 32. The other three classes
+        // stay zero here; a test that wants them writes them itself
+        put(
+            &mut stats,
+            RECORD_HEADER_LEN + RX_BYTES_AT,
+            &s.rx.to_ne_bytes(),
+        );
+        put(
+            &mut stats,
+            RECORD_HEADER_LEN + TX_BYTES_AT,
+            &s.tx.to_ne_bytes(),
+        );
+
         let mut out = [
             inpcb,
             so,
             record(XSO_RCVBUF, 32),
             record(XSO_SNDBUF, 32),
-            record(XSO_STATS, 136),
+            stats,
         ]
         .concat();
         if protocol == Protocol::Tcp {
@@ -625,6 +717,68 @@ mod tests {
         assert_eq!(parsed.listeners[0].port, 81);
         assert_eq!(parsed.sockets, 2);
         assert_eq!(parsed.owners, [2].into());
+    }
+
+    #[test]
+    fn byte_counters_sum_across_sockets_and_traffic_classes() {
+        let mut first = Sock::listening(localhost(), 80, 7);
+        first.rx = 100;
+        first.tx = 40;
+        let mut second = Sock::listening(localhost(), 81, 7);
+        second.rx = 5;
+        second.tx = 1;
+        let mut other = Sock::listening(localhost(), 82, 9);
+        other.tx = 8;
+
+        // Plant a non-zero second traffic class on `first` (rx at +48)
+        let mut records = socket_records(&first, Protocol::Tcp);
+        let class1_rx = RECORD_HEADER_LEN + DATA_STATS_LEN + RX_BYTES_AT;
+        // stats begins after inpcb + socket + two 32-byte buffers
+        let stats_at = 104 + 104 + 32 + 32;
+        put(&mut records, stats_at + class1_rx, &25u64.to_ne_bytes());
+
+        let mut t = header();
+        t.extend(records);
+        t.extend(socket_records(&second, Protocol::Tcp));
+        t.extend(socket_records(&other, Protocol::Tcp));
+        t.extend(header());
+        let parsed = parse(&t, Protocol::Tcp).unwrap();
+
+        let of = |pid: u32| -> (u64, u64) {
+            parsed
+                .flows
+                .iter()
+                .filter(|f| f.pid == pid)
+                .fold((0, 0), |(rx, tx), f| {
+                    (rx + f.received_bytes, tx + f.transmitted_bytes)
+                })
+        };
+        assert_eq!(of(7), (130, 41), "both sockets, both classes");
+        assert_eq!(of(9), (0, 8));
+        assert!(
+            parsed
+                .flows
+                .iter()
+                .any(|f| f.local_port == 80 && f.pid == 7)
+        );
+        assert!(
+            parsed
+                .flows
+                .iter()
+                .any(|f| f.local_port == 82 && f.pid == 9)
+        );
+    }
+
+    #[test]
+    fn a_socket_without_its_stats_record_is_refused() {
+        let mut records = socket_records(&Sock::listening(localhost(), 80, 1), Protocol::Tcp);
+        // Drop the 136-byte xsockstat_n that sits immediately before xtcpcb_n
+        let tcpcb = align8(204);
+        let start = records.len() - tcpcb - 136;
+        records.drain(start..start + 136);
+        let t = [header(), records, header()].concat();
+        let err = parse(&t, Protocol::Tcp).unwrap_err();
+        assert!(err.contains("missing its xsockstat_n"), "{err}");
     }
 
     #[test]

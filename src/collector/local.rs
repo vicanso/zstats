@@ -649,6 +649,10 @@ impl LocalCollector {
         let mut counters = HashMap::new();
 
         for (interface, data) in self.networks.iter() {
+            // Addresses ride the same refresh as the counters (sysinfo
+            // reads them on every platform's `refresh`), so this costs no
+            // extra system call
+            let is_loopback = has_loopback_address(data.ip_networks().iter().map(|n| n.addr));
             let current = NetCounters {
                 received_bytes: data.total_received(),
                 transmitted_bytes: data.total_transmitted(),
@@ -661,6 +665,7 @@ impl LocalCollector {
             let snapshot = match (elapsed, self.last_net_counters.get(interface)) {
                 (Some(elapsed), Some(prev)) => NetworkSnapshot {
                     interface: interface.clone(),
+                    is_loopback,
                     received_bytes_per_sec: rate_per_sec(
                         prev.received_bytes,
                         current.received_bytes,
@@ -694,6 +699,7 @@ impl LocalCollector {
                 },
                 _ => NetworkSnapshot {
                     interface: interface.clone(),
+                    is_loopback,
                     received_bytes_per_sec: 0,
                     transmitted_bytes_per_sec: 0,
                     received_packets_per_sec: None,
@@ -1070,21 +1076,28 @@ fn io_totals_from(
     };
     let (network_received_bytes_per_sec, network_transmitted_bytes_per_sec) = match networks {
         // Network rates are plain u64 (0 on the first sample), so a present
-        // list always yields a total — including 0 on the baseline frame
-        Some(networks) => (
-            Some(
-                networks
-                    .iter()
-                    .map(|n| n.received_bytes_per_sec)
-                    .fold(0u64, u64::saturating_add),
-            ),
-            Some(
-                networks
-                    .iter()
-                    .map(|n| n.transmitted_bytes_per_sec)
-                    .fold(0u64, u64::saturating_add),
-            ),
-        ),
+        // list always yields a total — including 0 on the baseline frame.
+        //
+        // Loopback is left out. It is processes on this machine talking to
+        // each other, at memory-copy speed, and it swamped everything a
+        // "network" figure is read for: measured over 14.5h, lo0 moved 628
+        // GB against 0.88 GB on the real interface, and a build cache
+        // talking to itself put a 5 GB/s spike on a throughput chart
+        Some(networks) => {
+            let wire = || networks.iter().filter(|n| !n.is_loopback);
+            (
+                Some(
+                    wire()
+                        .map(|n| n.received_bytes_per_sec)
+                        .fold(0u64, u64::saturating_add),
+                ),
+                Some(
+                    wire()
+                        .map(|n| n.transmitted_bytes_per_sec)
+                        .fold(0u64, u64::saturating_add),
+                ),
+            )
+        }
         None => (None, None),
     };
     IoTotalsSnapshot {
@@ -1095,6 +1108,16 @@ fn io_totals_from(
         disk_read_ops_per_sec,
         disk_write_ops_per_sec,
     }
+}
+
+/// Whether an interface carrying these addresses is a loopback one: any
+/// address in `127.0.0.0/8`, or `::1`. By address rather than by name —
+/// `lo0`, `lo` and Windows' "Loopback Pseudo-Interface 1" share nothing
+/// else — and an interface with no addresses is not loopback. Its
+/// link-local `fe80::1` is not what marks it: every interface has one of
+/// those
+fn has_loopback_address(addresses: impl IntoIterator<Item = std::net::IpAddr>) -> bool {
+    addresses.into_iter().any(|address| address.is_loopback())
 }
 
 fn gpu_snapshot(sample: GpuSample) -> GpuSnapshot {
@@ -2486,6 +2509,7 @@ mod tests {
         let nets = [
             NetworkSnapshot {
                 interface: "en0".into(),
+                is_loopback: false,
                 received_bytes_per_sec: 100,
                 transmitted_bytes_per_sec: 50,
                 received_packets_per_sec: None,
@@ -2495,8 +2519,11 @@ mod tests {
             },
             NetworkSnapshot {
                 interface: "lo0".into(),
-                received_bytes_per_sec: 3,
-                transmitted_bytes_per_sec: 3,
+                is_loopback: true,
+                // A build cache talking to itself over 127.0.0.1: the
+                // spike that used to become the "network" total
+                received_bytes_per_sec: 5_000_000_000,
+                transmitted_bytes_per_sec: 5_000_000_000,
                 received_packets_per_sec: None,
                 transmitted_packets_per_sec: None,
                 received_errors_per_sec: None,
@@ -2515,13 +2542,42 @@ mod tests {
         let totals = io_totals_from(Some(&disks), Some(&nets), Some(&drives));
         assert_eq!(totals.disk_read_bytes_per_sec, Some(15));
         assert_eq!(totals.disk_write_bytes_per_sec, Some(20));
-        assert_eq!(totals.network_received_bytes_per_sec, Some(103));
-        assert_eq!(totals.network_transmitted_bytes_per_sec, Some(53));
+        // Loopback is not network throughput: only en0 counts
+        assert_eq!(totals.network_received_bytes_per_sec, Some(100));
+        assert_eq!(totals.network_transmitted_bytes_per_sec, Some(50));
+        // A list holding nothing but loopback is still a collected list:
+        // the total is a real zero, not "not collected"
+        let only_loopback = io_totals_from(None, Some(&nets[1..]), None);
+        assert_eq!(only_loopback.network_received_bytes_per_sec, Some(0));
+        assert_eq!(only_loopback.network_transmitted_bytes_per_sec, Some(0));
         assert_eq!(totals.disk_read_ops_per_sec, Some(50));
         assert_eq!(totals.disk_write_ops_per_sec, Some(20));
         let none = io_totals_from(None, None, None);
         assert!(none.disk_read_bytes_per_sec.is_none());
         assert!(none.disk_read_ops_per_sec.is_none());
+    }
+
+    #[test]
+    fn loopback_is_told_by_address_not_by_name() {
+        use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+        let v4 = |a, b, c, d| IpAddr::V4(Ipv4Addr::new(a, b, c, d));
+        let link_local: IpAddr = "fe80::1".parse().unwrap();
+
+        // macOS lo0 as sysinfo reports it
+        assert!(has_loopback_address([
+            link_local,
+            v4(127, 0, 0, 1),
+            IpAddr::V6(Ipv6Addr::LOCALHOST),
+        ]));
+        // Anywhere in 127.0.0.0/8, or ::1 alone
+        assert!(has_loopback_address([v4(127, 0, 0, 53)]));
+        assert!(has_loopback_address([IpAddr::V6(Ipv6Addr::LOCALHOST)]));
+        // A real interface, a tunnel, and one with only its link-local
+        assert!(!has_loopback_address([v4(172, 20, 10, 12), link_local]));
+        assert!(!has_loopback_address([v4(198, 18, 0, 1)]));
+        assert!(!has_loopback_address([link_local]));
+        // No addresses reported: not loopback
+        assert!(!has_loopback_address([]));
     }
 
     fn counters(

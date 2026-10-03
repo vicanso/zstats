@@ -130,14 +130,24 @@ SystemSnapshot
 | Field | Unit | Notes |
 |---|---|---|
 | `interface` | String | |
+| `is_loopback` | bool | The interface carries a loopback address (`127.0.0.0/8`, `::1`) — `lo0`, `lo`, Windows' loopback pseudo-interface; decided by address, never by name. Its traffic is processes on this machine talking to each other, at memory-copy speed. **`io_totals` leaves these out**; the row itself keeps its real rates, so label it ("local") rather than hide it |
 | `received_bytes_per_sec`, `transmitted_bytes_per_sec` | B/s | |
 | `received_packets_per_sec`, `transmitted_packets_per_sec` | pkt/s | Optional |
 | `received_errors_per_sec`, `transmitted_errors_per_sec` | err/s | Optional; `None` on the first sample |
 
 > A machine has many interfaces and most are idle. The CLI keeps a **fixed**
-> row count (top N by traffic, idle slots filled with `en*`/`lo*`) so the
-> layout below it never jumps. A GUI list has the same problem in a milder
+> row count (top N by traffic, idle slots filled with `en*` and loopback) so
+> the layout below it never jumps. A GUI list has the same problem in a milder
 > form — prefer a stable ordering to a "only active interfaces" filter.
+
+> **Tunnels are still counted twice.** With a VPN or proxy tunnel up, the
+> same traffic appears on the tunnel interface (`utun*`, `tun*`, `wg*`) and
+> again on the physical one that carries it, so both rows are real and
+> `io_totals` adds them — measured live, a total of 44.4 KiB/s that was en0's
+> 29.6 plus utun10's 14.8. This is known and deliberately not "fixed" by
+> guessing: `sysinfo` exposes no interface flags, macOS masks hardware
+> addresses, and the one signal available — no link-layer address — also
+> describes a raw-IP cellular modem, which is a machine's only real uplink.
 
 ### 3.6 Machine-wide IO totals — `io_totals` *(always present)*
 
@@ -148,14 +158,19 @@ disk dedupe). **No extra system calls.** Fields are independent `Option`s.
 |---|---|---|
 | `disk_read_bytes_per_sec` | B/s | Sum of `disks[].read_bytes_per_sec`. `None` when disks are disabled or every disk still has `None` rates (first sample) |
 | `disk_write_bytes_per_sec` | B/s | Same for writes |
-| `network_received_bytes_per_sec` | B/s | Sum of all interfaces when `networks` is collected; `Some(0)` is valid on a quiet first sample. `None` only when network collection is off |
+| `network_received_bytes_per_sec` | B/s | Sum of every interface **except loopback** (`networks[].is_loopback`) when `networks` is collected; `Some(0)` is valid on a quiet first sample or a machine whose only interface is loopback. `None` only when network collection is off |
 | `network_transmitted_bytes_per_sec` | B/s | Same for transmit |
 | `disk_read_ops_per_sec`, `disk_write_ops_per_sec` | ops/s | Sum of `drives[]` operation rates (macOS). Operations only — the drives' **bytes** are deliberately not added to the two byte totals above, which already come from the volume list; adding both would count every APFS volume twice. `None` when drives are off or still without a baseline |
 
 > Prefer `io_totals` for an overview "how busy is storage / the wire" tile.
-> Do not re-sum the tables in the frontend unless you intentionally filter
-> interfaces (e.g. exclude `lo*`) — the library sums **every** collected
-> device after its own dedupe rules.
+> Do not re-sum the tables in the frontend — the library sums every collected
+> device after its own rules: disk dedupe, and loopback left out of the
+> network figures.
+>
+> Loopback was once included, and it made the figure useless: over 14.5 hours
+> one machine's `lo0` moved 628 GB against 0.88 GB on its real interface (a
+> local proxy, a build cache), and a single burst between two local processes
+> drew a 5 GB/s spike that set a throughput chart's scale for half an hour.
 
 ### 3.7 Processes — `processes[]` *(toggleable, top-N)*
 

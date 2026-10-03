@@ -70,6 +70,35 @@ fn local_collector_produces_sane_snapshot() {
         // Error rates should be Some (possibly 0) from the second sample on
         n.received_errors_per_sec.is_some() && n.transmitted_errors_per_sec.is_some()
     }));
+    // The machine-wide network total is the wire, not the loopback: it
+    // equals the sum over the interfaces not flagged loopback, taken from
+    // this very snapshot
+    let wire = |pick: fn(&zstats::NetworkSnapshot) -> u64| -> u64 {
+        networks.iter().filter(|n| !n.is_loopback).map(pick).sum()
+    };
+    assert_eq!(
+        second.io_totals.network_received_bytes_per_sec,
+        Some(wire(|n| n.received_bytes_per_sec))
+    );
+    assert_eq!(
+        second.io_totals.network_transmitted_bytes_per_sec,
+        Some(wire(|n| n.transmitted_bytes_per_sec))
+    );
+    // Every unix has exactly the interface the flag is for (`lo0`, `lo`),
+    // found by its address; nothing else on the machine carries one
+    #[cfg(unix)]
+    {
+        let loopbacks: Vec<&str> = networks
+            .iter()
+            .filter(|n| n.is_loopback)
+            .map(|n| n.interface.as_str())
+            .collect();
+        assert!(!loopbacks.is_empty(), "no loopback among {networks:?}");
+        assert!(
+            loopbacks.iter().all(|name| name.starts_with("lo")),
+            "{loopbacks:?}"
+        );
+    }
     for p in processes.iter() {
         // Disk IO off by default
         assert!(p.read_bytes_per_sec.is_none());

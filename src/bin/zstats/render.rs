@@ -598,10 +598,10 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
         // Idle fill prefers meaningful interfaces: physical NICs (en* on
         // macOS and modern Linux) and loopback before the anpi/awdl/ap
         // house-keeping ones
-        let class = |name: &str| {
-            if name.starts_with("en") {
+        let class = |n: &zstats::NetworkSnapshot| {
+            if n.interface.starts_with("en") {
                 0
-            } else if name.starts_with("lo") {
+            } else if n.is_loopback {
                 1
             } else {
                 2
@@ -611,7 +611,7 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
         ranked.sort_by(|a, b| {
             total_rate(b)
                 .cmp(&total_rate(a))
-                .then_with(|| class(&a.interface).cmp(&class(&b.interface)))
+                .then_with(|| class(a).cmp(&class(b)))
                 .then_with(|| a.interface.cmp(&b.interface))
         });
         let rows: Vec<Vec<String>> = ranked
@@ -625,8 +625,17 @@ fn render_with(s: &SystemSnapshot, proc_averages: Option<&ProcAverages>, theme: 
                 } else {
                     "-".to_string()
                 };
+                // The IO line's network total leaves loopback out, so
+                // say which row that is — otherwise the busiest row in
+                // this table is missing from the sum above it with no
+                // explanation
+                let interface = if n.is_loopback {
+                    format!("{} (local)", n.interface)
+                } else {
+                    n.interface.clone()
+                };
                 vec![
-                    n.interface.clone(),
+                    interface,
                     human_rate(Some(n.received_bytes_per_sec)),
                     human_rate(Some(n.transmitted_bytes_per_sec)),
                     errs,

@@ -93,6 +93,8 @@ pub struct SystemSnapshot {
     /// lists after collection (and after disk dedupe when enabled). Pure
     /// aggregation — no extra system calls. Fields are None when the
     /// subsystem is disabled or rates are not yet available (first sample).
+    /// The network figures leave loopback interfaces out; see
+    /// [`NetworkSnapshot::is_loopback`]
     #[serde(default)]
     pub io_totals: IoTotalsSnapshot,
 
@@ -196,7 +198,9 @@ impl Default for Capabilities {
     }
 }
 
-/// Summed disk/network throughput for the whole machine.
+/// Summed disk/network throughput for the whole machine. "Network" means
+/// traffic that leaves or enters the machine: loopback interfaces are not
+/// part of it (see [`NetworkSnapshot::is_loopback`]).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct IoTotalsSnapshot {
     #[serde(default)]
@@ -465,6 +469,18 @@ pub struct DiskSnapshot {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NetworkSnapshot {
     pub interface: String,
+    /// Whether this is a loopback interface (`lo0`, `lo`, Windows'
+    /// loopback pseudo-interface): one that carries a loopback address
+    /// (`127.0.0.0/8` or `::1`) — decided by address, never by name.
+    ///
+    /// Its traffic is processes on this machine talking to each other (a
+    /// local proxy, a build cache, a database on 127.0.0.1). None of it
+    /// reaches a wire, and it moves at memory-copy speed, so
+    /// `io_totals`' network figures leave it out; the interface itself
+    /// stays in this list with its real rates. False when the platform
+    /// reports no addresses for the interface
+    #[serde(default)]
+    pub is_loopback: bool,
     pub received_bytes_per_sec: u64,
     pub transmitted_bytes_per_sec: u64,
     pub received_packets_per_sec: Option<u64>,
